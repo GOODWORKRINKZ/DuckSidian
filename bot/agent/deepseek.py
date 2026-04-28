@@ -25,10 +25,31 @@ class DeepSeekClient:
         await self._client.aclose()
 
     async def describe_image(self, base64_data: str, mime: str = "image/jpeg") -> str:
-        """Описание изображения — vision API недоступен в текущих моделях DeepSeek."""
-        # deepseek-v4-flash / deepseek-v4-pro не поддерживают image_url.
-        # Возвращаем заглушку без HTTP-запроса.
-        return "(изображение — vision API недоступен)"
+        """Описание изображения через локальную Ollama moondream (нативный API)."""
+        payload: dict[str, Any] = {
+            "model": "moondream",
+            "prompt": (
+                "Describe this image briefly in Russian. "
+                "What is shown? Is there text, diagrams, tables? "
+                "If it's a UI screenshot — what is displayed?"
+            ),
+            "images": [base64_data],
+            "stream": False,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    "http://localhost:11434/api/generate",
+                    json=payload,
+                )
+            if resp.status_code >= 400:
+                log.warning("Ollama moondream HTTP %s: %s", resp.status_code, resp.text[:200])
+                return f"(vision error {resp.status_code})"
+            data = resp.json()
+            return data.get("response", "(пустой ответ)")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Ollama moondream failed: %s", exc)
+            return f"(vision unavailable: {exc})"
 
     async def chat(
         self,

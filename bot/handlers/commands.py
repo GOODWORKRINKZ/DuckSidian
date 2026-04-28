@@ -172,6 +172,42 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             results.append(f"[{chat_cfg.name}] {out}")
         await msg.reply(f"✅ {chr(10).join(results)}"[:3500])
 
+    @router.message(Command("ingestfiles"))
+    async def cmd_ingest_files(msg: Message, command: CommandObject) -> None:
+        """Инжест уже готовых raw/daily/*.md (не из БД).
+
+        /ingestfiles           — следующие 5 необработанных дней
+        /ingestfiles 10        — следующие 10 дней
+        /ingestfiles 2025-05-01 — конкретная дата
+        """
+        if not _is_admin(msg.from_user.id if msg.from_user else None):
+            await msg.reply("⛔ только для админов")
+            return
+        args = (command.args or "").strip().split()
+        arg = args[0] if args else ""
+        chat_name_filter = args[1] if len(args) > 1 else None
+        chats = settings.get_chats()
+        if chat_name_filter:
+            chats = [c for c in chats if c.name == chat_name_filter]
+            if not chats:
+                await msg.reply(f"Чат '{chat_name_filter}' не найден.")
+                return
+        await msg.reply("⏳ ingest-files запущен…")
+        results = []
+        for chat_cfg in chats:
+            if not arg or arg.isdigit():
+                limit = int(arg) if arg.isdigit() else 5
+                out = await orch.ingest_raw_pending(chat_cfg, limit=limit)
+            else:
+                try:
+                    datetime.strptime(arg, "%Y-%m-%d")
+                except ValueError:
+                    await msg.reply("Использование: /ingest-files [N|YYYY-MM-DD] [chat_name]")
+                    return
+                out = await orch.ingest_raw_file(arg, chat_cfg)
+            results.append(f"[{chat_cfg.name}] {out}")
+        await msg.reply(f"✅ {chr(10).join(results)}"[:3500])
+
     @router.message(Command("lint"))
     async def cmd_lint(msg: Message) -> None:
         if not _is_admin(msg.from_user.id if msg.from_user else None):

@@ -228,6 +228,76 @@ class Orchestrator:
             commit_and_push(f"ingest adhoc {cfg.name}: last {n} msgs")
         return run.summary or "Ingest завершён."
 
+    async def ingest_raw_file(
+        self, date_iso: str, chat_cfg: ChatConfig | None = None
+    ) -> str:
+        """Запустить ingest для уже готового raw/daily/<date>.md (без БД)."""
+        cfg = chat_cfg or settings.get_chats()[0]
+        wiki = _chat_wiki(cfg)
+        raw_file = wiki.root / "raw" / "daily" / f"{date_iso}.md"
+        if not raw_file.exists():
+            return f"Файл не найден: raw/daily/{date_iso}.md"
+        content = raw_file.read_text(encoding="utf-8")
+        # Считаем строки с сообщениями (начинаются с "###")
+        n_msgs = content.count("\n### ")
+        rel = f"raw/daily/{date_iso}.md"
+        executor = self._make_executor(wiki, cfg)
+        user_prompt = (
+            f"Сделай ingest батча из файла `{rel}`. "
+            f"Дата: {date_iso}. Чат: {cfg.name}. "
+            f"В файле примерно {n_msgs} сообщений. "
+            f"Следуй процедуре ingest из AGENTS.md."
+        )
+        try:
+            run = await run_agent(
+                client=self.client,
+                executor=executor,
+                system_prompt=INGEST_SYSTEM,
+                user_prompt=user_prompt,
+                max_steps=40,
+            )
+            status = "ok" if run.finished else "partial"
+            self._append_log(
+                wiki,
+                f"ingest-file | {date_iso} | ~{n_msgs} сообщений | "
+                f"{run.steps} шагов | {status}",
+            )
+            if settings.git_autocommit:
+                commit_and_push(f"ingest-file {cfg.name} {date_iso}")
+            return run.summary or "Ingest завершён."
+        except Exception as exc:  # noqa: BLE001
+            log.exception("ingest_raw_file failed")
+            return f"Ошибка ingest: {exc}"
+
+    async def ingest_raw_pending(
+        self, chat_cfg: ChatConfig | None = None, limit: int = 5
+    ) -> str:
+        """Инжестировать первые N не-обработанных raw/daily/*.md файлов.
+
+        «Обработанный» — рядом с ним существует wiki/daily/<date>.md.
+        """
+        cfg = chat_cfg or settings.get_chats()[0]
+        wiki = _chat_wiki(cfg)
+        raw_dir = wiki.root / "raw" / "daily"
+        wiki_dir = wiki.root / "wiki" / "daily"
+        if not raw_dir.exists():
+            return "Нет raw/daily/ директории."
+        all_dates = sorted(p.stem for p in raw_dir.glob("*.md"))
+        pending = [d for d in all_dates if not (wiki_dir / f"{d}.md").exists()]
+        if not pending:
+            return "Все raw/daily/*.md уже обработаны — wiki/daily/ актуальна."
+        batch = pending[:limit]
+        results: list[str] = []
+        for date_iso in batch:
+            log.info("ingest_raw_pending: %s", date_iso)
+            res = await self.ingest_raw_file(date_iso, cfg)
+            results.append(f"**{date_iso}**: {res[:120]}")
+        remaining = len(pending) - len(batch)
+        summary = "\n".join(results)
+        if remaining:
+            summary += f"\n\n_Ещё {remaining} дней в очереди. Запусти /ingest-files снова._"
+        return summary
+
     # --- QUERY ---
 
     async def query(self, question: str, chat_cfg: ChatConfig | None = None) -> str:

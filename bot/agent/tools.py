@@ -334,7 +334,10 @@ class ToolExecutor:
         import asyncio
 
         def _sync() -> list[dict]:
-            from duckduckgo_search import DDGS  # type: ignore[import]
+            try:
+                from ddgs import DDGS  # type: ignore[import]
+            except ImportError:
+                from duckduckgo_search import DDGS  # type: ignore[import]
 
             with DDGS() as ddgs:
                 return list(ddgs.text(query, max_results=max_results))
