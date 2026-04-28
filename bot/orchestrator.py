@@ -1,14 +1,18 @@
 """Высокоуровневые операции: ingest / query / lint / summary.
 
-Здесь же реализован ask_user pipeline: агент задаёт вопрос → бот постит в
-forum-топик с inline-кнопками → ждёт ответ из БД → возвращает агенту.
+Поддержка нескольких чатов: каждый чат имеет свою поддиректорию vault'а
+(vault/<chat_name>/) и изолированный Wiki-экземпляр.
+
+ask_user pipeline: агент → bot posts в forum-топик → ждёт ответ → агенту.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from aiogram import Bot
@@ -26,7 +30,7 @@ from .agent.prompts import (
     SUMMARY_SYSTEM,
 )
 from .agent.tools import ToolExecutor
-from .config import settings
+from .config import ChatConfig, settings
 from .db import DB
 from .git_sync import commit_and_push
 from .wiki import Wiki
@@ -34,11 +38,34 @@ from .wiki import Wiki
 log = logging.getLogger(__name__)
 
 
+def _chat_wiki(chat_cfg: ChatConfig) -> Wiki:
+    """Вернуть Wiki для конкретного чата (vault/<name>/)."""
+    root = settings.vault_path / chat_cfg.name
+    root.mkdir(parents=True, exist_ok=True)
+    # Если AGENTS.md отсутствует — скопируем из глобального vault-template
+    if not (root / "AGENTS.md").exists():
+        tmpl = settings.vault_path / "AGENTS.md"
+        if tmpl.exists():
+            shutil.copy2(tmpl, root / "AGENTS.md")
+        # Базовые директории
+        for subdir in (
+            "raw/daily", "raw/notes", "raw/assets",
+            "wiki/entities", "wiki/concepts", "wiki/sources",
+            "wiki/daily", "wiki/queries",
+        ):
+            (root / subdir).mkdir(parents=True, exist_ok=True)
+        for fname in ("index.md", "log.md"):
+            p = root / fname
+            if not p.exists():
+                p.write_text(f"# {fname}\n", encoding="utf-8")
+    return Wiki(root)
+
+
 class Orchestrator:
     def __init__(self, bot: Bot, db: DB, wiki: Wiki):
         self.bot = bot
         self.db = db
-        self.wiki = wiki
+        self.wiki = wiki  # глобальный wiki (для /ask, /search, /lint, /summary)
         self.client = DeepSeekClient()
         self._waiters: dict[int, asyncio.Future[str]] = {}
 
@@ -48,10 +75,11 @@ class Orchestrator:
     # --- ask_user pipeline ---
 
     async def _ask_user(
-        self, question: str, options: list[str] | None
+        self, question: str, options: list[str] | None,
+        chat_cfg: ChatConfig | None = None,
     ) -> str:
-        topic_id = settings.telegram_topic_id
-        chat_id = settings.telegram_chat_id
+        topic_id = (chat_cfg.topic_id if chat_cfg else None) or settings.telegram_topic_id
+        chat_id = (chat_cfg.chat_id if chat_cfg else None) or settings.telegram_chat_id
 
         qid = await self.db.add_question(
             batch_id=None,
@@ -88,7 +116,7 @@ class Orchestrator:
         fut: asyncio.Future[str] = loop.create_future()
         self._waiters[qid] = fut
         try:
-            return await asyncio.wait_for(fut, timeout=60 * 30)  # 30 минут
+            return await asyncio.wait_for(fut, timeout=60 * 30)
         except asyncio.TimeoutError:
             return "(timeout: команда не ответила за 30 минут, делай по умолчанию)"
         finally:
@@ -102,34 +130,34 @@ class Orchestrator:
             return True
         return False
 
-    def _make_executor(self) -> ToolExecutor:
-        return ToolExecutor(self.wiki, self._ask_user)
+    def _make_executor(self, wiki: Wiki, chat_cfg: ChatConfig | None = None) -> ToolExecutor:
+        async def ask_user_cb(question: str, options: list[str] | None) -> str:
+            return await self._ask_user(question, options, chat_cfg)
+        return ToolExecutor(wiki, ask_user_cb)
 
     # --- INGEST ---
 
-    async def ingest_for_date(self, date_iso: str) -> str:
-        """Сформировать дневной батч и запустить агентский ingest."""
-        rows = await self.db.fetch_messages_for_date(
-            settings.telegram_chat_id, date_iso
-        )
-        msgs = [dict(r) for r in rows]
-        # Не тащим в raw сообщения из служебного forum-топика бота.
-        if settings.telegram_topic_id is not None:
-            msgs = [
-                m for m in msgs
-                if m.get("topic_id") != settings.telegram_topic_id
-            ]
-        if not msgs:
-            return f"Нет сообщений за {date_iso}."
+    async def ingest_for_date(
+        self, date_iso: str, chat_cfg: ChatConfig | None = None
+    ) -> str:
+        cfg = chat_cfg or settings.get_chats()[0]
+        wiki = _chat_wiki(cfg)
 
-        rel = self.wiki.write_daily_raw(date_iso, msgs)
+        rows = await self.db.fetch_messages_for_date(cfg.chat_id, date_iso)
+        msgs = [dict(r) for r in rows]
+        if cfg.topic_id is not None:
+            msgs = [m for m in msgs if m.get("topic_id") != cfg.topic_id]
+        if not msgs:
+            return f"Нет сообщений за {date_iso} в чате [{cfg.name}]."
+
+        rel = wiki.write_daily_raw(date_iso, msgs)
         batch_id = await self.db.create_batch(date_iso)
         await self.db.mark_processed([m["id"] for m in msgs], batch_id)
 
-        executor = self._make_executor()
+        executor = self._make_executor(wiki, cfg)
         user_prompt = (
             f"Сделай ingest нового дневного батча: `{rel}`. "
-            f"Дата: {date_iso}. В батче {len(msgs)} сообщений. "
+            f"Дата: {date_iso}. Чат: {cfg.name}. В батче {len(msgs)} сообщений. "
             f"Следуй процедуре ingest из AGENTS.md."
         )
         try:
@@ -142,38 +170,42 @@ class Orchestrator:
             )
             status = "ok" if run.finished else "partial"
             await self.db.finish_batch(
-                batch_id, status, len(msgs),
-                notes=run.summary[:500],
+                batch_id, status, len(msgs), notes=run.summary[:500],
             )
             self._append_log(
+                wiki,
                 f"ingest | {date_iso} | {len(msgs)} сообщений | "
-                f"{run.steps} шагов | {status}"
+                f"{run.steps} шагов | {status}",
             )
             if settings.git_autocommit:
-                commit_and_push(f"ingest {date_iso}: {len(msgs)} msgs")
+                commit_and_push(f"ingest {cfg.name} {date_iso}: {len(msgs)} msgs")
             return run.summary or "Ingest завершён."
         except Exception as exc:  # noqa: BLE001
             log.exception("ingest failed")
             await self.db.finish_batch(batch_id, "error", len(msgs), str(exc))
             return f"Ошибка ingest: {exc}"
 
-    async def ingest_today(self) -> str:
+    async def ingest_today(self, chat_cfg: ChatConfig | None = None) -> str:
         today = datetime.now(timezone.utc).date().isoformat()
-        return await self.ingest_for_date(today)
+        return await self.ingest_for_date(today, chat_cfg)
 
-    async def ingest_last_n(self, n: int) -> str:
-        """Внеплановый ingest последних N сообщений (помечаем 'adhoc')."""
-        rows = await self.db.fetch_last_messages(settings.telegram_chat_id, n)
+    async def ingest_last_n(
+        self, n: int, chat_cfg: ChatConfig | None = None
+    ) -> str:
+        cfg = chat_cfg or settings.get_chats()[0]
+        wiki = _chat_wiki(cfg)
+
+        rows = await self.db.fetch_last_messages(cfg.chat_id, n)
         msgs = [dict(r) for r in rows]
         if not msgs:
             return "Нет сообщений в БД."
         date_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d_adhoc-%H%M%S")
-        rel = self.wiki.write_daily_raw(date_iso, msgs)
+        rel = wiki.write_daily_raw(date_iso, msgs)
         batch_id = await self.db.create_batch(date_iso)
-        executor = self._make_executor()
+        executor = self._make_executor(wiki, cfg)
         user_prompt = (
             f"Внеплановый ingest. Файл: `{rel}` ({len(msgs)} сообщений). "
-            f"Следуй процедуре ingest из AGENTS.md."
+            f"Чат: {cfg.name}. Следуй процедуре ingest из AGENTS.md."
         )
         run = await run_agent(
             client=self.client,
@@ -185,15 +217,17 @@ class Orchestrator:
         await self.db.finish_batch(
             batch_id, "ok" if run.finished else "partial", len(msgs)
         )
-        self._append_log(f"ingest-adhoc | last {n} | {run.steps} шагов")
+        self._append_log(wiki, f"ingest-adhoc | last {n} | {run.steps} шагов")
         if settings.git_autocommit:
-            commit_and_push(f"ingest adhoc: last {n} msgs")
+            commit_and_push(f"ingest adhoc {cfg.name}: last {n} msgs")
         return run.summary or "Ingest завершён."
 
     # --- QUERY ---
 
-    async def query(self, question: str) -> str:
-        executor = self._make_executor()
+    async def query(self, question: str, chat_cfg: ChatConfig | None = None) -> str:
+        cfg = chat_cfg or settings.get_chats()[0]
+        wiki = _chat_wiki(cfg)
+        executor = self._make_executor(wiki, cfg)
         run = await run_agent(
             client=self.client,
             executor=executor,
@@ -205,8 +239,10 @@ class Orchestrator:
 
     # --- LINT ---
 
-    async def lint(self) -> str:
-        executor = self._make_executor()
+    async def lint(self, chat_cfg: ChatConfig | None = None) -> str:
+        cfg = chat_cfg or settings.get_chats()[0]
+        wiki = _chat_wiki(cfg)
+        executor = self._make_executor(wiki, cfg)
         run = await run_agent(
             client=self.client,
             executor=executor,
@@ -214,15 +250,19 @@ class Orchestrator:
             user_prompt="Сделай health-check вики. Верни отчёт.",
             max_steps=20,
         )
-        self._append_log(f"lint | {run.steps} шагов")
+        self._append_log(wiki, f"lint | {run.steps} шагов")
         if settings.git_autocommit:
-            commit_and_push("lint pass")
+            commit_and_push(f"lint {cfg.name}")
         return run.summary or "Lint завершён."
 
     # --- SUMMARY ---
 
-    async def summary(self, period: str) -> str:
-        executor = self._make_executor()
+    async def summary(
+        self, period: str, chat_cfg: ChatConfig | None = None
+    ) -> str:
+        cfg = chat_cfg or settings.get_chats()[0]
+        wiki = _chat_wiki(cfg)
+        executor = self._make_executor(wiki, cfg)
         run = await run_agent(
             client=self.client,
             executor=executor,
@@ -234,9 +274,9 @@ class Orchestrator:
 
     # --- helpers ---
 
-    def _append_log(self, line: str) -> None:
+    def _append_log(self, wiki: Wiki, line: str) -> None:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
         try:
-            self.wiki.append_file("log.md", f"## [{ts}] {line}")
+            wiki.append_file("log.md", f"## [{ts}] {line}")
         except Exception as exc:  # noqa: BLE001
             log.warning("append log failed: %s", exc)

@@ -27,9 +27,11 @@ INGEST_SYSTEM = """Ты — куратор LLM-Wiki в стиле Karpathy LLM W
 QUERY_SYSTEM = """Ты — поисковик-аналитик по LLM-Wiki. Найди релевантные
 страницы (через index.md и search_wiki), прочитай их, синтезируй ответ
 с inline-цитатами в виде wikilinks `[[wiki/...]]`. Не пиши новые файлы.
+Если по вики нет информации — можно воспользоваться web_search, но явно пометить
+в ответе, что источник — внешний интернет.
 В конце вызови finish(answer_for_user) — этот текст уйдёт в чат.
 
-Доступные инструменты: read_file, list_dir, search_wiki, finish.
+Доступные инструменты: read_file, list_dir, search_wiki, web_search, finish.
 Лимит шагов: 15.
 """
 

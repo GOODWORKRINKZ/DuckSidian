@@ -1,4 +1,8 @@
-"""Хэндлер слушающий ВСЕ сообщения целевой группы и записывающий их в SQLite.
+"""Хэндлер слушающий ВСЕ сообщения отслеживаемых групп и записывающий их в SQLite.
+
+Поддерживает несколько чатов (ChatConfig). Медиафайлы (фото, видео,
+документы, аудио, голосовые) скачиваются в raw/assets/<chat>/<date>/ и
+сохраняются в БД.
 
 Также ловит ответы (reply / callback) на вопросы агента и доставляет их
 в Orchestrator._waiters.
@@ -8,11 +12,12 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, Message
 
-from ..config import settings
+from ..config import ChatConfig, settings
 from ..db import DB
 from ..orchestrator import Orchestrator
 
@@ -21,8 +26,88 @@ log = logging.getLogger(__name__)
 router = Router(name="listener")
 
 
-def setup(db: DB, orch: Orchestrator) -> Router:
-    target_chat = settings.telegram_chat_id
+def _today() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+async def _download_media(
+    bot: Bot, msg: Message, vault_root: Path, chat_name: str
+) -> tuple[str | None, str | None]:
+    """Определить тип медиа и скачать файл.
+
+    Возвращает (media_type, rel_path_in_vault) или (None, None).
+    """
+    date = (msg.date or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+    assets_dir = vault_root / "raw" / "assets" / chat_name / date
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    file_id: str | None = None
+    media_type: str | None = None
+    filename: str | None = None
+
+    if msg.photo:
+        ph = msg.photo[-1]
+        file_id = ph.file_id
+        media_type = "photo"
+        filename = f"photo_{msg.message_id}.jpg"
+    elif msg.video:
+        file_id = msg.video.file_id
+        media_type = "video"
+        ext = (msg.video.mime_type or "video/mp4").split("/")[-1]
+        filename = msg.video.file_name or f"video_{msg.message_id}.{ext}"
+    elif msg.document:
+        file_id = msg.document.file_id
+        media_type = "document"
+        filename = msg.document.file_name or f"doc_{msg.message_id}.bin"
+    elif msg.audio:
+        file_id = msg.audio.file_id
+        media_type = "audio"
+        filename = msg.audio.file_name or f"audio_{msg.message_id}.mp3"
+    elif msg.voice:
+        file_id = msg.voice.file_id
+        media_type = "voice"
+        filename = f"voice_{msg.message_id}.ogg"
+    elif msg.video_note:
+        file_id = msg.video_note.file_id
+        media_type = "video_note"
+        filename = f"vidnote_{msg.message_id}.mp4"
+    elif msg.sticker:
+        file_id = msg.sticker.file_id
+        media_type = "sticker"
+        filename = f"sticker_{msg.message_id}.webp"
+    elif msg.animation:
+        file_id = msg.animation.file_id
+        media_type = "animation"
+        filename = msg.animation.file_name or f"anim_{msg.message_id}.gif"
+
+    if not file_id or not filename:
+        return media_type, None
+
+    # Санируем имя файла
+    safe_filename = "".join(
+        c for c in filename
+        if c.isalnum() or c in "._-"
+    ) or f"file_{msg.message_id}.bin"
+
+    dst = assets_dir / safe_filename
+    try:
+        tg_file = await bot.get_file(file_id)
+        await bot.download_file(tg_file.file_path, destination=str(dst))  # type: ignore[arg-type]
+        rel = str(dst.relative_to(vault_root)).replace("\\", "/")
+        return media_type, rel
+    except Exception as exc:  # noqa: BLE001
+        log.warning("media download failed: %s", exc)
+        return media_type, None
+
+
+def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
+    chat_ids: set[int] = {cfg.chat_id for cfg in settings.get_chats()}
+    chat_name_by_id: dict[int, str] = {
+        cfg.chat_id: cfg.name for cfg in settings.get_chats()
+    }
+    topic_by_id: dict[int, int | None] = {
+        cfg.chat_id: cfg.topic_id for cfg in settings.get_chats()
+    }
 
     @router.callback_query(F.data.startswith("ans:"))
     async def on_callback(cb: CallbackQuery) -> None:
@@ -56,10 +141,13 @@ def setup(db: DB, orch: Orchestrator) -> Router:
 
     @router.message()
     async def on_any_message(msg: Message) -> None:
-        if msg.chat.id != target_chat:
+        if msg.chat.id not in chat_ids:
             return
 
-        # Reply на вопрос агента в служебном топике → доставка.
+        chat_name = chat_name_by_id[msg.chat.id]
+        topic_id = topic_by_id[msg.chat.id]
+
+        # Reply на вопрос агента → доставка ответа
         if (
             msg.reply_to_message
             and msg.reply_to_message.from_user
@@ -80,18 +168,29 @@ def setup(db: DB, orch: Orchestrator) -> Router:
                         await msg.reply("✅ ответ передан агенту")
                         return
 
-        # Команды обрабатываются commands-роутером — не пишем их в архив.
+        # Команды обрабатываются commands-роутером
         if msg.text and msg.text.startswith("/"):
             return
 
-        # Сообщения из служебного forum-топика бота не архивируем.
+        # Сообщения из служебного forum-топика бота не архивируем
         if (
-            settings.telegram_topic_id is not None
-            and msg.message_thread_id == settings.telegram_topic_id
+            topic_id is not None
+            and msg.message_thread_id == topic_id
         ):
             return
 
         ts = msg.date or datetime.now(timezone.utc)
+
+        # Скачиваем медиа
+        media_type: str | None = None
+        media_path: str | None = None
+        if not msg.text or (msg.photo or msg.video or msg.document
+                            or msg.audio or msg.voice or msg.video_note
+                            or msg.sticker or msg.animation):
+            media_type, media_path = await _download_media(
+                bot, msg, settings.vault_path, chat_name
+            )
+
         user = msg.from_user
         await db.save_message(
             chat_id=msg.chat.id,
@@ -101,8 +200,12 @@ def setup(db: DB, orch: Orchestrator) -> Router:
             username=user.username if user else None,
             full_name=user.full_name if user else None,
             text=msg.text or msg.caption,
+            media_type=media_type,
+            media_path=media_path,
             reply_to_message_id=(
                 msg.reply_to_message.message_id if msg.reply_to_message else None
             ),
             ts=ts,
         )
+
+    return router

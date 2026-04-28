@@ -11,6 +11,12 @@ from typing import Iterable
 
 WRITABLE_PREFIXES = ("raw/", "wiki/")
 
+# Расширения, которым разрешена запись агентом в wiki/sources/ (вдруг нужно).
+# Для raw/ запись всегда запрещена агенту, но боту — разрешена через save_asset.
+_SAFE_ASSET_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
 
 class WikiPathError(ValueError):
     pass
@@ -104,6 +110,23 @@ class Wiki:
                         return hits
         return hits
 
+    # ----- asset saver (вызывается ботом, не агентом) -----
+
+    def save_asset(self, data: bytes, filename: str, date_iso: str) -> str:
+        """Сохранить медиафайл в raw/assets/<date_iso>/<filename>.
+
+        Возвращает rel-путь. Имя файла санируется — только безопасные символы.
+        Вызывается слушателем бота, path-traversal проверяется через resolve().
+        """
+        safe = "".join(c for c in filename if c in _SAFE_ASSET_CHARS)
+        if not safe:
+            safe = "file.bin"
+        rel = f"raw/assets/{date_iso}/{safe}"
+        p = self.resolve(rel)  # только guard path-traversal, без write-check
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return rel
+
     # ----- daily batch builder -----
 
     def write_daily_raw(
@@ -132,6 +155,13 @@ class Wiki:
             if text:
                 for ln in text.splitlines():
                     lines.append(f"> {ln}")
+            elif m.get("media_type"):
+                media_type = m["media_type"]
+                media_path = m.get("media_path")
+                if media_path:
+                    lines.append(f"> 📎 *{media_type}*: `[[{media_path}]]`")
+                else:
+                    lines.append(f"> 📎 *{media_type}* (файл не скачан)")
             else:
                 lines.append("> *(non-text content)*")
             lines.append(f"^msg-{mid}")

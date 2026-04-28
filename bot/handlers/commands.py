@@ -1,4 +1,4 @@
-"""Команды бота: /ask /ingest /lint /summary /note /search /log /pause /resume /help."""
+"""Команды бота: /ask /ingest /lint /summary /note /search /log /pause /resume /help /chats."""
 from __future__ import annotations
 
 import logging
@@ -29,7 +29,8 @@ HELP_TEXT = (
     "/summary day|week — сводка\n"
     "/log — последние записи log.md\n"
     "/note <текст> — ручная заметка в raw/notes/\n"
-    "/ingest [today|N|<YYYY-MM-DD>] — внеплановый ingest *(admin)*\n"
+    "/chats — список отслеживаемых чатов\n"
+    "/ingest [today|N|<YYYY-MM-DD>] [<chat>] — внеплановый ingest *(admin)*\n"
     "/lint — health-check *(admin)*\n"
     "/pause /resume — авто-ingest *(admin)*\n"
 )
@@ -40,6 +41,15 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
     @router.message(Command("help", "start"))
     async def cmd_help(msg: Message) -> None:
         await msg.reply(HELP_TEXT, parse_mode="Markdown")
+
+    @router.message(Command("chats"))
+    async def cmd_chats(msg: Message) -> None:
+        chats = settings.get_chats()
+        lines = ["*Отслеживаемые чаты:*"]
+        for c in chats:
+            lines.append(f"• `{c.name}` — chat\_id `{c.chat_id}`" +
+                         (f", topic `{c.topic_id}`" if c.topic_id else ""))
+        await msg.reply("\n".join(lines), parse_mode="Markdown")
 
     @router.message(Command("ask"))
     async def cmd_ask(msg: Message, command: CommandObject) -> None:
@@ -108,20 +118,32 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
         if not _is_admin(msg.from_user.id if msg.from_user else None):
             await msg.reply("⛔ только для админов")
             return
-        arg = (command.args or "today").strip()
-        await msg.reply(f"⏳ ingest: {arg}…")
-        if arg == "today":
-            out = await orch.ingest_today()
-        elif arg.isdigit():
-            out = await orch.ingest_last_n(int(arg))
-        else:
-            try:
-                datetime.strptime(arg, "%Y-%m-%d")
-            except ValueError:
-                await msg.reply("Использование: /ingest [today|N|YYYY-MM-DD]")
+        args = (command.args or "today").strip().split()
+        arg = args[0]
+        # Опциональный слаг чата: /ingest today sales
+        chat_name_filter = args[1] if len(args) > 1 else None
+        chats = settings.get_chats()
+        if chat_name_filter:
+            chats = [c for c in chats if c.name == chat_name_filter]
+            if not chats:
+                await msg.reply(f"Чат '{chat_name_filter}' не найден. /chats — список.")
                 return
-            out = await orch.ingest_for_date(arg)
-        await msg.reply(f"✅ {out[:3500]}")
+        await msg.reply(f"⏳ ingest: {arg} {'('+ chat_name_filter +')' if chat_name_filter else '(все чаты)'}…")
+        results = []
+        for chat_cfg in chats:
+            if arg == "today":
+                out = await orch.ingest_today(chat_cfg)
+            elif arg.isdigit():
+                out = await orch.ingest_last_n(int(arg), chat_cfg)
+            else:
+                try:
+                    datetime.strptime(arg, "%Y-%m-%d")
+                except ValueError:
+                    await msg.reply("Использование: /ingest [today|N|YYYY-MM-DD] [chat_name]")
+                    return
+                out = await orch.ingest_for_date(arg, chat_cfg)
+            results.append(f"[{chat_cfg.name}] {out}")
+        await msg.reply(f"✅ {chr(10).join(results)}"[:3500])
 
     @router.message(Command("lint"))
     async def cmd_lint(msg: Message) -> None:

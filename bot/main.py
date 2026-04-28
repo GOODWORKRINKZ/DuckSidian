@@ -62,6 +62,10 @@ async def main() -> None:
     )
 
     _ensure_vault_initialised(settings.vault_path)
+    # Сеять поддиректории для каждого зарегистрированного чата
+    for chat_cfg in settings.get_chats():
+        from .orchestrator import _chat_wiki  # noqa: PLC0415
+        _chat_wiki(chat_cfg)  # вызов создаёт директории
     ensure_repo(settings.vault_path)
 
     db = DB(settings.data_path / "bot.sqlite3")
@@ -77,7 +81,7 @@ async def main() -> None:
 
     dp = Dispatcher()
     dp.include_router(cmd_router_mod.setup(db, wiki, orch))
-    dp.include_router(listener_mod.setup(db, orch))
+    dp.include_router(listener_mod.setup(db, orch, bot))
 
     scheduler = build_scheduler(db, orch)
     scheduler.start()

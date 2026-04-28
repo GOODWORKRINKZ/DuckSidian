@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS messages (
     username TEXT,
     full_name TEXT,
     text TEXT,
+    media_type TEXT,
+    media_path TEXT,
     reply_to_message_id INTEGER,
     ts TEXT NOT NULL,
     processed_batch_id INTEGER,
@@ -63,6 +65,15 @@ class DB:
     async def init(self) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.executescript(SCHEMA)
+            # Migration: добавить медиа-колонки в существующие БД
+            for col in ("media_type", "media_path"):
+                try:
+                    await db.execute(
+                        f"ALTER TABLE messages ADD COLUMN {col} TEXT"
+                    )
+                    await db.commit()
+                except Exception:  # noqa: BLE001
+                    pass  # колонка уже существует
             await db.commit()
 
     @asynccontextmanager
@@ -83,6 +94,8 @@ class DB:
         username: str | None,
         full_name: str | None,
         text: str | None,
+        media_type: str | None = None,
+        media_path: str | None = None,
         reply_to_message_id: int | None,
         ts: datetime,
     ) -> None:
@@ -90,8 +103,8 @@ class DB:
             await db.execute(
                 """INSERT OR IGNORE INTO messages
                 (chat_id, message_id, topic_id, user_id, username, full_name,
-                 text, reply_to_message_id, ts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 text, media_type, media_path, reply_to_message_id, ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     chat_id,
                     message_id,
@@ -100,6 +113,8 @@ class DB:
                     username,
                     full_name,
                     text,
+                    media_type,
+                    media_path,
                     reply_to_message_id,
                     ts.astimezone(timezone.utc).isoformat(),
                 ),

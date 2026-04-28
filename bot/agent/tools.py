@@ -115,6 +115,29 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Поиск в интернете через DuckDuckGo. Используй для проверки фактов, "
+                "поиска документации, уточнения терминов. "
+                "Возвращает список {title, href, body} (до max_results результатов)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Максимум результатов (1–10). По умолчанию 5.",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -154,9 +177,33 @@ class ToolExecutor:
                 opts = arguments.get("options") or None
                 ans = await self.ask_user(arguments["question"], opts)
                 return ans or "(no answer / timeout)"
+            if name == "web_search":
+                return await self._web_search(
+                    arguments["query"],
+                    min(int(arguments.get("max_results", 5)), 10),
+                )
             return f"ERROR: unknown tool {name}"
         except WikiPathError as exc:
             return f"ERROR: {exc}"
         except Exception as exc:  # noqa: BLE001
             log.exception("tool %s failed", name)
             return f"ERROR: {exc}"
+
+    @staticmethod
+    async def _web_search(query: str, max_results: int = 5) -> str:
+        """DuckDuckGo text search, запускается в thread-pool (синх. либа)."""
+        import asyncio
+
+        def _sync() -> list[dict]:
+            from duckduckgo_search import DDGS  # type: ignore[import]
+
+            with DDGS() as ddgs:
+                return list(ddgs.text(query, max_results=max_results))
+
+        try:
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(None, _sync)
+            return json.dumps(results, ensure_ascii=False, indent=2)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("web_search failed: %s", exc)
+            return f"ERROR web_search: {exc}"

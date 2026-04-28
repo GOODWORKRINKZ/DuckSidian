@@ -7,3 +7,4 @@ pydantic-settings>=2.2
 python-dotenv>=1.0
 GitPython>=3.1
 aiohttp>=3.9
+duckduckgo-search>=6.2

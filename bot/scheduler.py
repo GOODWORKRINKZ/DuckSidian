@@ -22,12 +22,13 @@ def build_scheduler(db: DB, orch: Orchestrator) -> AsyncIOScheduler:
             log.info("ingest paused, skipping")
             return
         date_iso = datetime.now(timezone.utc).date().isoformat()
-        log.info("scheduled ingest for %s", date_iso)
-        try:
-            out = await orch.ingest_for_date(date_iso)
-            log.info("ingest done: %s", out[:200])
-        except Exception:  # noqa: BLE001
-            log.exception("scheduled ingest failed")
+        for chat_cfg in settings.get_chats():
+            log.info("scheduled ingest for %s / %s", chat_cfg.name, date_iso)
+            try:
+                out = await orch.ingest_for_date(date_iso, chat_cfg)
+                log.info("ingest done [%s]: %s", chat_cfg.name, out[:200])
+            except Exception:  # noqa: BLE001
+                log.exception("scheduled ingest failed for %s", chat_cfg.name)
 
     parts = settings.ingest_cron.split()
     if len(parts) != 5:
