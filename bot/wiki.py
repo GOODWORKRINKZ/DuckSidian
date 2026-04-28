@@ -1,0 +1,143 @@
+"""Безопасные FS-обёртки над vault'ом.
+
+Все пути, приходящие от агента, валидируются против `vault_root`. Запись
+разрешена только в `raw/` и `wiki/`. Чтение — везде внутри vault.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Iterable
+
+
+WRITABLE_PREFIXES = ("raw/", "wiki/")
+
+
+class WikiPathError(ValueError):
+    pass
+
+
+class Wiki:
+    def __init__(self, root: Path):
+        self.root = root.resolve()
+        if not self.root.exists():
+            self.root.mkdir(parents=True, exist_ok=True)
+
+    # ----- path helpers -----
+
+    def resolve(self, rel: str, *, for_write: bool = False) -> Path:
+        rel = (rel or "").strip().lstrip("/")
+        if not rel:
+            raise WikiPathError("empty path")
+        if ".." in Path(rel).parts:
+            raise WikiPathError(f"path traversal: {rel}")
+        target = (self.root / rel).resolve()
+        try:
+            target.relative_to(self.root)
+        except ValueError as exc:
+            raise WikiPathError(f"path escapes vault: {rel}") from exc
+        if for_write:
+            rel_norm = str(target.relative_to(self.root)).replace("\\", "/")
+            if not any(
+                rel_norm.startswith(p) or rel_norm == p.rstrip("/")
+                for p in WRITABLE_PREFIXES
+            ) and rel_norm not in {"index.md", "log.md"}:
+                raise WikiPathError(
+                    f"write outside writable area: {rel_norm}"
+                )
+        return target
+
+    # ----- read / write -----
+
+    def read_file(self, rel: str, max_bytes: int = 200_000) -> str:
+        p = self.resolve(rel)
+        if not p.is_file():
+            raise WikiPathError(f"not a file: {rel}")
+        data = p.read_bytes()[:max_bytes]
+        return data.decode("utf-8", errors="replace")
+
+    def write_file(self, rel: str, content: str) -> str:
+        p = self.resolve(rel, for_write=True)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return str(p.relative_to(self.root))
+
+    def append_file(self, rel: str, content: str) -> str:
+        p = self.resolve(rel, for_write=True)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            if not content.endswith("\n"):
+                content += "\n"
+            f.write(content)
+        return str(p.relative_to(self.root))
+
+    def list_dir(self, rel: str = "") -> list[str]:
+        p = self.resolve(rel) if rel else self.root
+        if not p.exists():
+            return []
+        out: list[str] = []
+        for child in sorted(p.iterdir()):
+            if child.name.startswith("."):
+                continue
+            rel_path = str(child.relative_to(self.root)).replace("\\", "/")
+            out.append(rel_path + ("/" if child.is_dir() else ""))
+        return out
+
+    def search(self, query: str, max_hits: int = 20) -> list[dict]:
+        """Простой grep: подстрока, без regex, кейс-инсенситив."""
+        if not query.strip():
+            return []
+        q = query.lower()
+        hits: list[dict] = []
+        for md in self.root.rglob("*.md"):
+            try:
+                rel = str(md.relative_to(self.root)).replace("\\", "/")
+            except ValueError:
+                continue
+            try:
+                text = md.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for i, line in enumerate(text.splitlines(), start=1):
+                if q in line.lower():
+                    hits.append({"path": rel, "line": i, "text": line.strip()})
+                    if len(hits) >= max_hits:
+                        return hits
+        return hits
+
+    # ----- daily batch builder -----
+
+    def write_daily_raw(
+        self, date_iso: str, messages: Iterable[dict]
+    ) -> str:
+        """Сформировать raw/daily/<date>.md из сообщений и вернуть rel-путь."""
+        lines: list[str] = [
+            f"# Raw daily batch — {date_iso}",
+            "",
+            "Дамп сообщений из рабочего чата за сутки. Read-only для агента.",
+            "Каждое сообщение помечено якорем `^msg-<id>` для citation.",
+            "",
+        ]
+        count = 0
+        for m in messages:
+            count += 1
+            who = m.get("full_name") or m.get("username") or f"user{m.get('user_id')}"
+            ts = m.get("ts", "")
+            mid = m.get("message_id")
+            text = (m.get("text") or "").strip()
+            reply = m.get("reply_to_message_id")
+            head = f"### [{ts}] {who}"
+            if reply:
+                head += f" (reply → ^msg-{reply})"
+            lines.append(head)
+            if text:
+                for ln in text.splitlines():
+                    lines.append(f"> {ln}")
+            else:
+                lines.append("> *(non-text content)*")
+            lines.append(f"^msg-{mid}")
+            lines.append("")
+        lines.insert(4, f"Всего сообщений: **{count}**.")
+        lines.insert(5, "")
+        rel = f"raw/daily/{date_iso}.md"
+        self.write_file(rel, "\n".join(lines))
+        return rel

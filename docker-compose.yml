@@ -1,0 +1,37 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.bot
+    container_name: ducksidian-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      VAULT_PATH: /vault
+      DATA_PATH: /data
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./vault:/vault
+      - ./bot/data:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - obsidian
+
+  obsidian:
+    image: lscr.io/linuxserver/obsidian:latest
+    container_name: ducksidian-obsidian
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: ${TZ:-UTC}
+      CUSTOM_USER: ${OBSIDIAN_USER:-admin}
+      PASSWORD: ${OBSIDIAN_PASSWORD:-changeme}
+      TITLE: DuckSidian
+    volumes:
+      - ./vault:/config/vault
+      - ./obsidian-config:/config
+    ports:
+      - "${OBSIDIAN_PORT:-3000}:3000"
+    shm_size: "1gb"

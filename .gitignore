@@ -1,0 +1,11 @@
+.env
+vault/
+bot/data/
+obsidian-config/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/browse.vc.db*

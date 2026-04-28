@@ -1,0 +1,34 @@
+FROM python:3.12-slim AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ripgrep git tini ca-certificates tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 -s /bin/bash app
+
+WORKDIR /app
+
+COPY bot/requirements.txt /app/bot/requirements.txt
+RUN pip install -r /app/bot/requirements.txt
+
+COPY bot /app/bot
+COPY vault-template /app/vault-template
+
+RUN chown -R app:app /app
+USER app
+
+ENV PYTHONPATH=/app
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request,sys; \
+sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status==200 else 1)"
+
+ENTRYPOINT ["tini", "--"]
+CMD ["python", "-m", "bot.main"]
