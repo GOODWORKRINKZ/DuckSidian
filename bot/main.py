@@ -17,6 +17,7 @@ from .handlers import commands as cmd_router_mod
 from .handlers import listener as listener_mod
 from .orchestrator import Orchestrator
 from .scheduler import build_scheduler
+from .topic_manager import ensure_bot_topic
 from .wiki import Wiki
 
 log = logging.getLogger(__name__)
@@ -78,6 +79,10 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=None),
     )
     orch = Orchestrator(bot, db, wiki)
+
+    # Инициализировать форум-топик бота для каждого чата
+    for chat_cfg in settings.get_chats():
+        await ensure_bot_topic(bot, db, chat_cfg.chat_id)
 
     dp = Dispatcher()
     dp.include_router(cmd_router_mod.setup(db, wiki, orch))

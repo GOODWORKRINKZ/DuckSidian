@@ -2,6 +2,7 @@
 их исполнение через Wiki/DB + ask_user pipeline."""
 from __future__ import annotations
 
+import base64
 import json
 import logging
 from typing import Any, Awaitable, Callable
@@ -106,6 +107,24 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "describe_media",
+            "description": (
+                "Проанализировать медиафайл из vault и вернуть его описание. "
+                "Для изображений (jpg, png, webp, gif) использует DeepSeek VL. "
+                "Для текстовых файлов возвращает первые 2000 символов. "
+                "Для остальных — метаданные (тип, размер). "
+                "path — относительный путь внутри vault, например raw/assets/..."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "finish",
             "description": "Завершить работу. Аргумент — итоговый отчёт/ответ.",
             "parameters": {
@@ -148,9 +167,10 @@ class ToolExecutor:
     """Исполняет вызовы инструментов от LLM. Сохраняет write-режим: агент
     не может писать в raw/."""
 
-    def __init__(self, wiki: Wiki, ask_user: AskUserFn):
+    def __init__(self, wiki: Wiki, ask_user: AskUserFn, deepseek_client: Any = None):
         self.wiki = wiki
         self.ask_user = ask_user
+        self._ds = deepseek_client
 
     async def call(self, name: str, arguments: dict[str, Any]) -> str:
         try:
@@ -182,12 +202,51 @@ class ToolExecutor:
                     arguments["query"],
                     min(int(arguments.get("max_results", 5)), 10),
                 )
+            if name == "describe_media":
+                return await self._describe_media(arguments["path"])
             return f"ERROR: unknown tool {name}"
         except WikiPathError as exc:
             return f"ERROR: {exc}"
         except Exception as exc:  # noqa: BLE001
             log.exception("tool %s failed", name)
             return f"ERROR: {exc}"
+
+    async def _describe_media(self, rel_path: str) -> str:
+        """Анализ медиафайла: vision для изображений, STT/parse для остальных."""
+        from ..media_parser import AUDIO_EXTENSIONS, extract_text_from_file
+
+        try:
+            file_path = self.wiki.resolve(rel_path)
+        except WikiPathError as exc:
+            return f"ERROR: {exc}"
+        if not file_path.is_file():
+            return f"ERROR: файл не найден: {rel_path}"
+
+        ext = file_path.suffix.lower()
+        size_kb = file_path.stat().st_size // 1024
+
+        # Изображения — vision через DeepSeek VL
+        if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
+            if self._ds is None:
+                return f"[изображение {ext}, {size_kb} KB — vision API недоступен]"
+            mime_map = {
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".png": "image/png", ".webp": "image/webp",
+                ".gif": "image/gif", ".bmp": "image/bmp",
+            }
+            mime = mime_map.get(ext, "image/jpeg")
+            raw = file_path.read_bytes()
+            b64 = base64.b64encode(raw).decode()
+            description = await self._ds.describe_image(b64, mime)
+            return f"[изображение {ext}, {size_kb} KB]\n{description}"
+
+        # PDF, DOCX, XLSX, текст, аудио/голосовые — через media_parser
+        extracted = await extract_text_from_file(file_path)
+        if extracted is not None:
+            label = "голосовое/аудио (STT)" if ext in AUDIO_EXTENSIONS else f"файл {ext}"
+            return f"[{label}, {size_kb} KB]\n{extracted}"
+
+        return f"[файл {ext}, {size_kb} KB — бинарный, анализ недоступен]"
 
     @staticmethod
     async def _web_search(query: str, max_results: int = 5) -> str:

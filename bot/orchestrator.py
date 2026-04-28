@@ -33,6 +33,7 @@ from .agent.tools import ToolExecutor
 from .config import ChatConfig, settings
 from .db import DB
 from .git_sync import commit_and_push
+from .topic_manager import ensure_bot_topic
 from .wiki import Wiki
 
 log = logging.getLogger(__name__)
@@ -74,11 +75,16 @@ class Orchestrator:
 
     # --- ask_user pipeline ---
 
+    async def _bot_topic_id(self, chat_cfg: ChatConfig | None) -> int | None:
+        """Получить thread_id бот-топика (или None если не форум)."""
+        chat_id = (chat_cfg.chat_id if chat_cfg else None) or settings.telegram_chat_id
+        return await ensure_bot_topic(self.bot, self.db, chat_id)
+
     async def _ask_user(
         self, question: str, options: list[str] | None,
         chat_cfg: ChatConfig | None = None,
     ) -> str:
-        topic_id = (chat_cfg.topic_id if chat_cfg else None) or settings.telegram_topic_id
+        topic_id = await self._bot_topic_id(chat_cfg)
         chat_id = (chat_cfg.chat_id if chat_cfg else None) or settings.telegram_chat_id
 
         qid = await self.db.add_question(
@@ -133,7 +139,7 @@ class Orchestrator:
     def _make_executor(self, wiki: Wiki, chat_cfg: ChatConfig | None = None) -> ToolExecutor:
         async def ask_user_cb(question: str, options: list[str] | None) -> str:
             return await self._ask_user(question, options, chat_cfg)
-        return ToolExecutor(wiki, ask_user_cb)
+        return ToolExecutor(wiki, ask_user_cb, deepseek_client=self.client)
 
     # --- INGEST ---
 

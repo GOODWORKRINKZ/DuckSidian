@@ -129,6 +129,19 @@ class Wiki:
 
     # ----- daily batch builder -----
 
+    @staticmethod
+    def _tg_link(chat_id: int | None, message_id: int | None) -> str | None:
+        """Сгенерировать ссылку на сообщение в Telegram.
+
+        Для супергрупп chat_id имеет вид -100XXXXXXXXXX.
+        Ссылка: https://t.me/c/{channel_id}/{message_id}
+        """
+        if not chat_id or not message_id:
+            return None
+        s = str(abs(chat_id))
+        channel_id = s[3:] if s.startswith("100") else s
+        return f"https://t.me/c/{channel_id}/{message_id}"
+
     def write_daily_raw(
         self, date_iso: str, messages: Iterable[dict]
     ) -> str:
@@ -138,6 +151,7 @@ class Wiki:
             "",
             "Дамп сообщений из рабочего чата за сутки. Read-only для агента.",
             "Каждое сообщение помечено якорем `^msg-<id>` для citation.",
+            "Поле `tg:` — прямая ссылка на сообщение в Telegram для цитирования.",
             "",
         ]
         count = 0
@@ -146,12 +160,18 @@ class Wiki:
             who = m.get("full_name") or m.get("username") or f"user{m.get('user_id')}"
             ts = m.get("ts", "")
             mid = m.get("message_id")
+            chat_id = m.get("chat_id")
             text = (m.get("text") or "").strip()
             reply = m.get("reply_to_message_id")
+            tg_link = self._tg_link(chat_id, mid)
             head = f"### [{ts}] {who}"
             if reply:
-                head += f" (reply → ^msg-{reply})"
+                tg_reply_link = self._tg_link(chat_id, reply)
+                reply_ref = f"[^msg-{reply}]({tg_reply_link})" if tg_reply_link else f"^msg-{reply}"
+                head += f" (reply → {reply_ref})"
             lines.append(head)
+            if tg_link:
+                lines.append(f"> tg: [{mid}]({tg_link})")
             if text:
                 for ln in text.splitlines():
                     lines.append(f"> {ln}")
@@ -166,8 +186,8 @@ class Wiki:
                 lines.append("> *(non-text content)*")
             lines.append(f"^msg-{mid}")
             lines.append("")
-        lines.insert(4, f"Всего сообщений: **{count}**.")
-        lines.insert(5, "")
+        lines.insert(5, f"Всего сообщений: **{count}**.")
+        lines.insert(6, "")
         rel = f"raw/daily/{date_iso}.md"
         self.write_file(rel, "\n".join(lines))
         return rel

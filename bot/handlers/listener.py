@@ -19,7 +19,9 @@ from aiogram.types import CallbackQuery, Message
 
 from ..config import ChatConfig, settings
 from ..db import DB
+from ..media_parser import AUDIO_EXTENSIONS, extract_text_from_file
 from ..orchestrator import Orchestrator
+from ..topic_manager import ensure_bot_topic
 
 log = logging.getLogger(__name__)
 
@@ -105,9 +107,6 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
     chat_name_by_id: dict[int, str] = {
         cfg.chat_id: cfg.name for cfg in settings.get_chats()
     }
-    topic_by_id: dict[int, int | None] = {
-        cfg.chat_id: cfg.topic_id for cfg in settings.get_chats()
-    }
 
     @router.callback_query(F.data.startswith("ans:"))
     async def on_callback(cb: CallbackQuery) -> None:
@@ -152,9 +151,11 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             return
 
         chat_name = chat_name_by_id[msg.chat.id]
-        topic_id = topic_by_id[msg.chat.id]
 
-        # Reply на вопрос агента → доставка ответа
+        # Сообщения из бот-топика не архивируем
+        bot_topic_id = await ensure_bot_topic(bot, db, msg.chat.id)
+        if bot_topic_id and msg.message_thread_id == bot_topic_id:
+            return
         if (
             msg.reply_to_message
             and msg.reply_to_message.from_user
@@ -179,26 +180,34 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         if msg.text and msg.text.startswith("/"):
             return
 
-        # Сообщения из служебного forum-топика бота не архивируем
-        if (
-            topic_id is not None
-            and msg.message_thread_id == topic_id
-        ):
-            return
-
         ts = msg.date or datetime.now(timezone.utc)
 
         # Скачиваем медиа
         media_type: str | None = None
         media_path: str | None = None
+        extracted_text: str | None = None
         if not msg.text or (msg.photo or msg.video or msg.document
                             or msg.audio or msg.voice or msg.video_note
                             or msg.sticker or msg.animation):
             media_type, media_path = await _download_media(
                 bot, msg, settings.vault_path, chat_name
             )
+            # Авто-извлечение текста: STT для голосовых, парсинг для документов
+            if media_path and media_type in {"voice", "audio", "document"}:
+                abs_path = settings.vault_path / media_path
+                try:
+                    extracted_text = await extract_text_from_file(abs_path)
+                    if extracted_text:
+                        log.info(
+                            "extracted text from %s (%s): %r...",
+                            media_path, media_type, extracted_text[:80],
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("media parse failed for %s: %s", media_path, exc)
 
         user = msg.from_user
+        # Если текста нет, но удалось распознать/распарсить медиа — сохраняем как text
+        text_to_save = msg.text or msg.caption or extracted_text
         await db.save_message(
             chat_id=msg.chat.id,
             message_id=msg.message_id,
@@ -206,7 +215,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             user_id=user.id if user else None,
             username=user.username if user else None,
             full_name=user.full_name if user else None,
-            text=msg.text or msg.caption,
+            text=text_to_save,
             media_type=media_type,
             media_path=media_path,
             reply_to_message_id=(
