@@ -33,5 +33,5 @@ services:
       - ./vault:/config/vault
       - ./obsidian-config:/config
     ports:
-      - "${OBSIDIAN_PORT:-3000}:3000"
+      - "${OBSIDIAN_PORT:-3001}:3000"
     shm_size: "1gb"

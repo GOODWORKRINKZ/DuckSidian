@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     telegram_topic_id: int | None = None
     telegram_admins: List[int] = Field(default_factory=list)
 
+    @field_validator("telegram_topic_id", mode="before")
+    @classmethod
+    def _parse_topic_id(cls, v):
+        if v == "" or v is None:
+            return None
+        return v
+
     # Многочатовый режим: "chat_id:name[:topic_id]|chat_id:name[:topic_id]|..."
     # Пример: "-100123:main:456|-100456:sales:"
     # Если пусто — единственный чат из telegram_chat_id / telegram_topic_id.
@@ -53,6 +60,8 @@ class Settings(BaseSettings):
             if not v:
                 return []
             return [int(x.strip()) for x in v.split(",") if x.strip()]
+        if isinstance(v, int):
+            return [v]
         return v
 
     def get_chats(self) -> list[ChatConfig]:

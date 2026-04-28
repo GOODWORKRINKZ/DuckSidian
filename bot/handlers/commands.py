@@ -40,6 +40,11 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
 
     @router.message(Command("help", "start"))
     async def cmd_help(msg: Message) -> None:
+        log.info(
+            "CMD chat_id=%s title=%r thread=%s user=%s",
+            msg.chat.id, msg.chat.title, msg.message_thread_id,
+            msg.from_user.username if msg.from_user else None,
+        )
         await msg.reply(HELP_TEXT, parse_mode="Markdown")
 
     @router.message(Command("chats"))

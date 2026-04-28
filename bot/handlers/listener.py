@@ -141,6 +141,13 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
 
     @router.message()
     async def on_any_message(msg: Message) -> None:
+        # DEBUG: всегда логируем входящие чтобы можно было найти chat_id
+        log.info(
+            "MSG chat_id=%s title=%r thread=%s user=%s text=%r",
+            msg.chat.id, msg.chat.title, msg.message_thread_id,
+            msg.from_user.username if msg.from_user else None,
+            (msg.text or msg.caption or "")[:60],
+        )
         if msg.chat.id not in chat_ids:
             return
 
