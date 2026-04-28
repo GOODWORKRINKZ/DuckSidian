@@ -37,10 +37,13 @@ async def _download_media(
 ) -> tuple[str | None, str | None]:
     """Определить тип медиа и скачать файл.
 
-    Возвращает (media_type, rel_path_in_vault) или (None, None).
+    Возвращает (media_type, rel_path относительно chat wiki root) или (None, None).
+    Медиа сохраняется в vault/<chat_name>/raw/assets/<date>/.
     """
     date = (msg.date or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
-    assets_dir = vault_root / "raw" / "assets" / chat_name / date
+    # Путь внутри chat wiki root (vault/<chat_name>/)
+    chat_wiki_root = vault_root / chat_name
+    assets_dir = chat_wiki_root / "raw" / "assets" / date
     assets_dir.mkdir(parents=True, exist_ok=True)
 
     file_id: str | None = None
@@ -95,7 +98,8 @@ async def _download_media(
     try:
         tg_file = await bot.get_file(file_id)
         await bot.download_file(tg_file.file_path, destination=str(dst))  # type: ignore[arg-type]
-        rel = str(dst.relative_to(vault_root)).replace("\\", "/")
+        # rel — относительно chat wiki root (vault/<chat_name>/)
+        rel = str(dst.relative_to(chat_wiki_root)).replace("\\", "/")
         return media_type, rel
     except Exception as exc:  # noqa: BLE001
         log.warning("media download failed: %s", exc)
@@ -192,7 +196,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             media_type, media_path = await _download_media(
                 bot, msg, settings.vault_path, chat_name
             )
-            # Авто-извлечение текста: STT для голосовых, парсинг для документов
+            # Авто-извлечение текста: STT для голосовых и аудио, парсинг для документов
+            # Видео анализируется позже агентом через describe_media (STT + кейфреймы)
             if media_path and media_type in {"voice", "audio", "document"}:
                 abs_path = settings.vault_path / media_path
                 try:

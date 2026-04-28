@@ -11,6 +11,7 @@ from aiogram.types import Message
 from ..config import settings
 from ..db import DB
 from ..orchestrator import Orchestrator
+from ..topic_manager import ensure_bot_topic, reset_bot_topic
 from ..wiki import Wiki
 
 log = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ HELP_TEXT = (
     "/chats — список отслеживаемых чатов\n"
     "/ingest [today|N|<YYYY-MM-DD>] [<chat>] — внеплановый ingest *(admin)*\n"
     "/lint — health-check *(admin)*\n"
+    "/topic — создать/пересоздать служебный топик *(admin)*\n"
     "/pause /resume — авто-ingest *(admin)*\n"
 )
 
@@ -45,7 +47,23 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             msg.chat.id, msg.chat.title, msg.message_thread_id,
             msg.from_user.username if msg.from_user else None,
         )
+        # При /start в группе — попробовать создать бот-топик
+        if msg.chat.type in ("group", "supergroup"):
+            await ensure_bot_topic(msg.bot, db, msg.chat.id)  # type: ignore[arg-type]
         await msg.reply(HELP_TEXT, parse_mode="Markdown")
+
+    @router.message(Command("topic"))
+    async def cmd_topic(msg: Message) -> None:
+        """Пересоздать служебный топик бота."""
+        if not _is_admin(msg.from_user.id if msg.from_user else None):
+            await msg.reply("⛔ только для админов")
+            return
+        await reset_bot_topic(db, msg.chat.id)
+        tid = await ensure_bot_topic(msg.bot, db, msg.chat.id)  # type: ignore[arg-type]
+        if tid:
+            await msg.reply(f"✅ Топик создан: thread\_id=`{tid}`", parse_mode="Markdown")
+        else:
+            await msg.reply("❌ Не удалось создать топик. Проверь права бота (Manage Topics).")
 
     @router.message(Command("chats"))
     async def cmd_chats(msg: Message) -> None:
@@ -63,8 +81,12 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             await msg.reply("Использование: /ask <вопрос>")
             return
         await msg.chat.do("typing")
-        answer = await orch.query(q)
-        await msg.reply(answer[:4000] or "(пусто)")
+        try:
+            answer = await orch.query(q)
+            await msg.reply(answer[:4000] or "(пусто)")
+        except Exception as exc:  # noqa: BLE001
+            log.error("query failed: %s", exc)
+            await msg.reply("⚠️ Ошибка при обращении к DeepSeek, попробуй ещё раз.")
 
     @router.message(Command("search"))
     async def cmd_search(msg: Message, command: CommandObject) -> None:

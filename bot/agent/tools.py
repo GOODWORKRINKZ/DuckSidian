@@ -110,9 +110,11 @@ TOOL_SCHEMAS: list[dict] = [
             "name": "describe_media",
             "description": (
                 "Проанализировать медиафайл из vault и вернуть его описание. "
-                "Для изображений (jpg, png, webp, gif) использует DeepSeek VL. "
-                "Для текстовых файлов возвращает первые 2000 символов. "
-                "Для остальных — метаданные (тип, размер). "
+                "Для изображений (jpg, png, webp) — DeepSeek VL vision. "
+                "Для видео (mp4, mov, avi, mkv) — транскрипция аудио (STT) + "
+                "описание 4 равномерных кейфреймов через vision. "
+                "Для голосовых/аудио — STT транскрипция через Whisper. "
+                "Для документов (PDF, DOCX, XLSX) — извлечение текста. "
                 "path — относительный путь внутри vault, например raw/assets/..."
             ),
             "parameters": {
@@ -213,7 +215,7 @@ class ToolExecutor:
 
     async def _describe_media(self, rel_path: str) -> str:
         """Анализ медиафайла: vision для изображений, STT/parse для остальных."""
-        from ..media_parser import AUDIO_EXTENSIONS, extract_text_from_file
+        from ..media_parser import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, extract_text_from_file, analyze_video
 
         try:
             file_path = self.wiki.resolve(rel_path)
@@ -239,6 +241,13 @@ class ToolExecutor:
             b64 = base64.b64encode(raw).decode()
             description = await self._ds.describe_image(b64, mime)
             return f"[изображение {ext}, {size_kb} KB]\n{description}"
+
+        # Видео — STT + keyframes
+        if ext in VIDEO_EXTENSIONS:
+            if self._ds is None:
+                return f"[видео {ext}, {size_kb} KB — vision API недоступен]"
+            result = await analyze_video(file_path, self._ds.describe_image)
+            return f"[видео {ext}, {size_kb} KB]\n{result}"
 
         # PDF, DOCX, XLSX, текст, аудио/голосовые — через media_parser
         extracted = await extract_text_from_file(file_path)

@@ -27,7 +27,7 @@ async def ensure_bot_topic(bot: Bot, db: DB, chat_id: int) -> int | None:
     stored = await db.get_state(state_key)
     if stored:
         tid = int(stored)
-        log.info("bot topic for chat %s: thread_id=%s (cached)", chat_id, tid)
+        log.debug("bot topic for chat %s: thread_id=%s (cached)", chat_id, tid)
         return tid
 
     try:
@@ -41,7 +41,14 @@ async def ensure_bot_topic(bot: Bot, db: DB, chat_id: int) -> int | None:
         log.info("created bot topic thread_id=%s in chat %s", topic_id, chat_id)
         return topic_id
     except TelegramAPIError as exc:
-        log.warning(
-            "can't create forum topic in chat %s (not a forum?): %s", chat_id, exc
-        )
+        err = str(exc).lower()
+        if "not a forum" in err or "supergroup" in err:
+            # Не форум — кэшируем чтобы не ломиться каждый раз
+            await db.set_state(state_key, "0")
+        log.warning("can't create forum topic in chat %s: %s", chat_id, exc)
         return None
+
+
+async def reset_bot_topic(db: DB, chat_id: int) -> None:
+    """Сбросить кэш топика (для пересоздания)."""
+    await db.set_state(f"bot_topic_{chat_id}", "")

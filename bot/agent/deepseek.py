@@ -1,6 +1,7 @@
 """DeepSeek client (OpenAI-compatible chat completions с tool-calling)."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -85,14 +86,26 @@ class DeepSeekClient:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
         url = f"{self.base_url}/v1/chat/completions"
-        resp = await self._client.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            content=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        )
+        _RETRYABLE = (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadTimeout,
+                      httpx.ConnectTimeout, httpx.NetworkError)
+        for attempt in range(3):
+            try:
+                resp = await self._client.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    content=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                )
+                break
+            except _RETRYABLE as exc:
+                if attempt == 2:
+                    log.error("DeepSeek request failed after 3 attempts: %s", exc)
+                    raise
+                wait = 2 ** attempt
+                log.warning("DeepSeek transient error (attempt %d): %s — retry in %ds", attempt + 1, exc, wait)
+                await asyncio.sleep(wait)
         if resp.status_code >= 400:
             log.error("DeepSeek HTTP %s: %s", resp.status_code, resp.text[:500])
             resp.raise_for_status()
