@@ -7,6 +7,8 @@ import json
 import logging
 from typing import Any, Awaitable, Callable
 
+import httpx
+
 from ..wiki import Wiki, WikiPathError
 
 log = logging.getLogger(__name__)
@@ -159,6 +161,25 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": (
+                "Загрузить содержимое веб-страницы по URL и вернуть очищенный текст. "
+                "Используй для конкретных ссылок из сообщений чата (YouTube, GitHub, "
+                "статьи, документация и т.п.) — чтобы понять о чём ссылка. "
+                "Возвращает заголовок страницы + основной текст (до 3000 символов)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Полный URL включая https://"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
 ]
 
 
@@ -204,6 +225,8 @@ class ToolExecutor:
                     arguments["query"],
                     min(int(arguments.get("max_results", 5)), 10),
                 )
+            if name == "fetch_url":
+                return await self._fetch_url(arguments["url"])
             if name == "describe_media":
                 return await self._describe_media(arguments["path"])
             return f"ERROR: unknown tool {name}"
@@ -256,6 +279,54 @@ class ToolExecutor:
             return f"[{label}, {size_kb} KB]\n{extracted}"
 
         return f"[файл {ext}, {size_kb} KB — бинарный, анализ недоступен]"
+
+    @staticmethod
+    async def _fetch_url(url: str) -> str:
+        """Загрузить страницу и вернуть очищенный текст (до 3000 символов)."""
+        import re
+        import urllib.parse
+
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return f"ERROR: неподдерживаемая схема '{parsed.scheme}' (только http/https)"
+
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (compatible; DuckSidian/1.0)",
+                "Accept-Language": "ru,en;q=0.9",
+            }
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                ct = resp.headers.get("content-type", "")
+                if "text/html" not in ct and "text/plain" not in ct:
+                    return f"[бинарный контент: {ct}]"
+                html = resp.text
+        except Exception as exc:  # noqa: BLE001
+            log.warning("fetch_url %s failed: %s", url, exc)
+            return f"ERROR fetch_url: {exc}"
+
+        try:
+            from bs4 import BeautifulSoup  # type: ignore[import]
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                tag.decompose()
+            title = soup.title.string.strip() if soup.title else ""
+            body = soup.find("article") or soup.find("main") or soup.body
+            text = body.get_text(separator="\n", strip=True) if body else soup.get_text()
+        except ImportError:
+            text = re.sub(r"<[^>]+>", " ", html)
+            m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+            title = m.group(1).strip() if m else ""
+
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        max_chars = 3000
+        truncated = "" if len(text) <= max_chars else f"\n...(обрезано, всего {len(text)} символов)"
+        text = text[:max_chars] + truncated
+
+        result = f"URL: {url}\nЗаголовок: {title}\n\n{text}"
+        log.info("fetch_url %s → %d символов", url, len(result))
+        return result
 
     @staticmethod
     async def _web_search(query: str, max_results: int = 5) -> str:
