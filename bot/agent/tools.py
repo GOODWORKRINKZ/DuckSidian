@@ -205,13 +205,17 @@ class ToolExecutor:
                 hits = self.wiki.search(arguments["query"])
                 return json.dumps(hits, ensure_ascii=False, indent=2)
             if name == "write_file":
-                path = arguments["path"]
+                path = arguments.get("path") or arguments.get("filename") or arguments.get("file_path") or arguments.get("filepath")
+                if not path:
+                    return "ERROR: missing 'path' argument"
                 if path.startswith("raw/"):
                     return "ERROR: raw/ is read-only for the agent"
                 rel = self.wiki.write_file(path, arguments["content"])
                 return f"OK: wrote {rel}"
             if name == "append_file":
-                path = arguments["path"]
+                path = arguments.get("path") or arguments.get("filename") or arguments.get("file_path") or arguments.get("filepath")
+                if not path:
+                    return "ERROR: missing 'path' argument"
                 if path.startswith("raw/"):
                     return "ERROR: raw/ is read-only for the agent"
                 rel = self.wiki.append_file(path, arguments["content"])
