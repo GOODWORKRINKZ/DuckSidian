@@ -27,6 +27,7 @@ from .agent.prompts import (
     INGEST_SYSTEM,
     LINT_SYSTEM,
     QUERY_SYSTEM,
+    REVISE_SYSTEM,
     SUMMARY_SYSTEM,
     TRIZ_SYSTEM,
 )
@@ -537,6 +538,35 @@ class Orchestrator:
             max_steps=15,
         )
         return run.summary or "Не нашёл ответа."
+
+    async def revise_query(
+        self,
+        question: str,
+        original_answer: str,
+        correction: str,
+        chat_cfg: ChatConfig | None = None,
+    ) -> str:
+        """Перегенерировать ответ /ask с учётом правок пользователя.
+
+        Правки = ground truth, перевешивают wiki/git.
+        """
+        cfg = chat_cfg or settings.get_chats()[0]
+        wiki = _chat_wiki(cfg)
+        executor = self._make_executor(wiki, cfg)
+        user_prompt = (
+            f"ИСХОДНЫЙ ВОПРОС:\n{question}\n\n"
+            f"ЧЕРНОВОЙ ОТВЕТ (есть ошибки):\n{original_answer}\n\n"
+            f"ПРАВКИ ПОЛЬЗОВАТЕЛЯ (ИСТОЧНИК ПРАВДЫ):\n{correction}\n\n"
+            "Перепиши ответ так, чтобы факты соответствовали правкам."
+        )
+        run = await run_agent(
+            client=self.client,
+            executor=executor,
+            system_prompt=REVISE_SYSTEM,
+            user_prompt=user_prompt,
+            max_steps=8,
+        )
+        return run.summary or original_answer
 
     # --- LINT ---
 

@@ -37,6 +37,28 @@ _pending_saves: dict[str, tuple[str, str, int]] = {}
 _PENDING_SAVES_MAX = 200
 
 
+# Кэш ответов /ask, ожидающих пользовательских правок (кнопка ✏️ Поправить).
+# Ключ — тот же save_id, что и в _pending_saves, чтобы при нажатии «Поправить»
+# можно было отдать пользователю исходный (q, answer) и попросить написать
+# правки реплаем. После того как мы прислали бот-сообщение с просьбой,
+# его message_id записывается в _fix_prompt_to_save_id, чтобы reply-handler
+# нашёл нужную запись.
+_pending_fixes: dict[str, tuple[str, str, int]] = {}
+_fix_prompt_to_save_id: dict[int, str] = {}
+_PENDING_FIXES_MAX = 200
+
+
+def _trim_pending_fixes() -> None:
+    if len(_pending_fixes) <= _PENDING_FIXES_MAX:
+        return
+    for key in list(_pending_fixes.keys())[: len(_pending_fixes) - _PENDING_FIXES_MAX]:
+        _pending_fixes.pop(key, None)
+    # Подчистим обратный индекс от ссылок на удалённые save_id.
+    stale = [mid for mid, sid in _fix_prompt_to_save_id.items() if sid not in _pending_fixes]
+    for mid in stale:
+        _fix_prompt_to_save_id.pop(mid, None)
+
+
 def _trim_pending_saves() -> None:
     """Грубая защита от утечки: держим не больше _PENDING_SAVES_MAX записей."""
     if len(_pending_saves) <= _PENDING_SAVES_MAX:
@@ -277,7 +299,9 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             if answer:
                 save_id = uuid.uuid4().hex[:12]
                 _pending_saves[save_id] = (q, answer, msg.chat.id)
+                _pending_fixes[save_id] = (q, answer, msg.chat.id)
                 _trim_pending_saves()
+                _trim_pending_fixes()
                 kb = InlineKeyboardMarkup(inline_keyboard=[[
                     InlineKeyboardButton(
                         text="💾 Сохранить",
@@ -586,6 +610,9 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             log.error("qsave write failed: %s", exc)
             await cb.answer("❌ не удалось сохранить", show_alert=True)
             return
+        # На всякий случай выкидываем эту же запись из fix-кэша,
+        # чтобы потом не висели битые reply-промпты.
+        _pending_fixes.pop(save_id, None)
         # Убираем кнопку, чтобы повторно не нажали.
         try:
             if cb.message:
@@ -593,5 +620,107 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
         except Exception as exc:  # noqa: BLE001
             log.warning("qsave edit_text failed: %s", exc)
         await cb.answer("Сохранено ✅")
+
+    @router.callback_query(F.data.startswith("qfix:"))
+    async def cb_fix_request(cb: CallbackQuery) -> None:
+        """Пользователь нажал «✏️ Поправить» — просим написать правки реплаем."""
+        save_id = (cb.data or "").split(":", 1)[1] if cb.data else ""
+        if save_id not in _pending_fixes:
+            await cb.answer("⌛ устарело, спроси заново", show_alert=False)
+            return
+        if not cb.message:
+            await cb.answer("не могу ответить тут", show_alert=True)
+            return
+        try:
+            prompt_msg = await cb.message.answer(
+                "✏️ Окей, ответь <b>реплаем на это сообщение</b> — напиши, "
+                "что в ответе не так и как правильно. Я перепишу с учётом твоих "
+                "правок и сохраню в <code>wiki/queries/</code>.",
+                parse_mode="HTML",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("qfix prompt send failed: %s", exc)
+            await cb.answer("❌ не получилось", show_alert=True)
+            return
+        _fix_prompt_to_save_id[prompt_msg.message_id] = save_id
+        # Убираем кнопки у исходного сообщения, чтобы не нажимали повторно.
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        await cb.answer("жду правки 👀")
+
+    @router.message(F.reply_to_message)
+    async def on_correction_reply(msg: Message) -> None:
+        """Реплай на бот-сообщение «жду правки» — переписываем ответ и сохраняем."""
+        if not msg.reply_to_message:
+            return
+        target_id = msg.reply_to_message.message_id
+        save_id = _fix_prompt_to_save_id.pop(target_id, None)
+        if not save_id:
+            return  # это не наш промпт — отдаём дальше другим хендлерам
+        entry = _pending_fixes.pop(save_id, None)
+        if not entry:
+            await msg.reply("⌛ устарело, спроси заново через /ask")
+            return
+        # Если этот же save_id ещё лежал в _pending_saves — тоже выкидываем,
+        # черновой ответ больше неактуален.
+        _pending_saves.pop(save_id, None)
+        question, original_answer, chat_id = entry
+        correction = (msg.text or msg.caption or "").strip()
+        if not correction:
+            await msg.reply("Пустые правки — нечего применять.")
+            return
+
+        await msg.chat.do("typing")
+        try:
+            cfg: ChatConfig | None = None
+            for c in settings.get_chats():
+                if c.chat_id == chat_id:
+                    cfg = c
+                    break
+            revised = await orch.revise_query(
+                question, original_answer, correction, chat_cfg=cfg
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("revise_query failed: %s", exc)
+            await msg.reply("⚠️ Не получилось переписать ответ, попробуй ещё раз.")
+            return
+
+        # Отправим переписанный ответ пользователю.
+        try:
+            await _reply_html(msg, revised or "(пусто)")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("revise: send failed: %s", exc)
+
+        # И сразу сохраняем в wiki/queries как revised.
+        cfg = cfg or settings.get_chats()[0]
+        chat_wiki = _chat_wiki(cfg)
+        now = datetime.now(timezone.utc)
+        ts = now.strftime("%Y%m%dT%H%M%SZ")
+        slug = _slugify_query(question)
+        rel = f"wiki/queries/{ts}-{slug}-revised.md"
+        author = msg.from_user.full_name if msg.from_user else "anon"
+        body = (
+            f"---\n"
+            f"type: query\n"
+            f"revised: true\n"
+            f"created: {now.strftime('%Y-%m-%d')}\n"
+            f"author: {author}\n"
+            f"original_chars: {len(original_answer)}\n"
+            f"---\n\n"
+            f"# {question}\n\n"
+            f"## Ответ (с учётом правок пользователя)\n\n"
+            f"{revised}\n\n"
+            f"## Правки от пользователя\n\n"
+            f"{correction}\n"
+        )
+        try:
+            chat_wiki.write_file(rel, body)
+        except Exception as exc:  # noqa: BLE001
+            log.error("revise: write failed: %s", exc)
+            await msg.reply("⚠️ Ответ переписан, но сохранить в wiki не удалось.")
+            return
+        await msg.reply(f"✅ Сохранено с правками: <code>{rel}</code>", parse_mode="HTML")
 
     return router
