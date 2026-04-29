@@ -76,6 +76,7 @@ async def run_agent(
                 run.summary = str(args.get("summary", ""))
                 run.finished = True
                 finish_called = True
+                log.info("agent step %d: finish(summary=%r)", step, run.summary[:120])
                 messages.append(
                     {
                         "role": "tool",
@@ -86,7 +87,10 @@ async def run_agent(
                 )
                 continue
 
+            log.info("agent step %d: tool=%s args=%s", step, name, str(args)[:200])
             result = await executor.call(name, args)
+            log.info("agent step %d: tool=%s result_len=%d head=%r",
+                     step, name, len(result), result[:120])
             # Trim too-large tool outputs to keep context window sane.
             if len(result) > 12_000:
                 result = result[:12_000] + "\n...[truncated]"
