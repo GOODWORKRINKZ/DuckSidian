@@ -60,6 +60,7 @@ async def _reply_html(msg: Message, markdown_text: str) -> None:
 HELP_TEXT = (
     "<b>DuckSidian — команды</b>\n\n"
     "/ask &lt;вопрос&gt; — спросить wiki\n"
+    "/triz [проблема] — ТРИЗ-разбор и идеи по обсуждениям\n"
     "/search &lt;строка&gt; — поиск по vault\n"
     "/summary day|week — сводка\n"
     "/log — последние записи log.md\n"
@@ -146,6 +147,19 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
         period = (command.args or "day").strip()
         await msg.chat.do("typing")
         out = await orch.summary(period)
+        await _reply_html(msg, out or "(пусто)")
+
+    @router.message(Command("triz"))
+    async def cmd_triz(msg: Message, command: CommandObject) -> None:
+        problem = (command.args or "").strip()
+        cfg = _chat_for_msg(msg)
+        await msg.reply("🧠 ТРИЗ-разбор запущен, жди минуту…")
+        try:
+            out = await orch.triz(problem, cfg)
+        except Exception as exc:  # noqa: BLE001
+            log.error("triz failed: %s", exc)
+            await msg.reply("⚠️ Ошибка ТРИЗ-агента.")
+            return
         await _reply_html(msg, out or "(пусто)")
 
     @router.message(Command("note"))

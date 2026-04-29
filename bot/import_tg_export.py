@@ -109,7 +109,10 @@ def parse_html_file(html_path: Path) -> list[dict]:
             continue
 
         msg_id_str = div.get("id", "")
-        msg_id = int(msg_id_str.replace("message-", "").replace("-", "")) if msg_id_str else 0
+        # id может быть "message-12345" или служебное "message2" — извлекаем цифры
+        import re as _re
+        _digits = _re.findall(r"\d+", msg_id_str)
+        msg_id = int(_digits[-1]) if _digits else 0
 
         body = div.find(class_="body")
         if not body:
@@ -291,6 +294,22 @@ def main() -> None:
         msgs = parse_html_file(html_path)
         print(f"Parsed {html_path.name}: {len(msgs)} сообщений")
         all_messages.extend(msgs)
+
+    # Дедуп по message id (на случай повторов между файлами / сшитых экспортов)
+    seen_ids: set[int] = set()
+    deduped: list[dict] = []
+    dup_count = 0
+    for m in all_messages:
+        mid = m.get("id") or 0
+        if mid and mid in seen_ids:
+            dup_count += 1
+            continue
+        if mid:
+            seen_ids.add(mid)
+        deduped.append(m)
+    if dup_count:
+        print(f"Дубликатов по id отброшено: {dup_count}")
+    all_messages = deduped
 
     # Группируем по дате
     by_date: dict[str, list[dict]] = defaultdict(list)

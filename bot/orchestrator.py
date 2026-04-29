@@ -28,6 +28,7 @@ from .agent.prompts import (
     LINT_SYSTEM,
     QUERY_SYSTEM,
     SUMMARY_SYSTEM,
+    TRIZ_SYSTEM,
 )
 from .agent.tools import ToolExecutor
 from .config import ChatConfig, settings
@@ -331,6 +332,30 @@ class Orchestrator:
         if settings.git_autocommit:
             commit_and_push(f"lint {cfg.name}")
         return run.summary or "Lint завершён."
+
+    # --- TRIZ ---
+
+    async def triz(
+        self, problem: str, chat_cfg: ChatConfig | None = None
+    ) -> str:
+        """ТРИЗ-разбор проблемы из чата (read-only, ответ в чат)."""
+        cfg = chat_cfg or settings.get_chats()[0]
+        wiki = _chat_wiki(cfg)
+        executor = self._make_executor(wiki, cfg)
+        user_prompt = (
+            f"Проблема для ТРИЗ-разбора: {problem}"
+            if problem.strip()
+            else "Проблема не задана. Возьми 1\u20133 самые активные темы "
+            "из последних wiki/daily/ и сделай ТРИЗ-разбор по каждой."
+        )
+        run = await run_agent(
+            client=self.client,
+            executor=executor,
+            system_prompt=TRIZ_SYSTEM,
+            user_prompt=user_prompt,
+            max_steps=20,
+        )
+        return run.summary or "ТРИЗ-разбор не получился."
 
     # --- SUMMARY ---
 
