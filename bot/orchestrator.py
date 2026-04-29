@@ -482,8 +482,18 @@ class Orchestrator:
                 log_text = log_file.read_text(encoding="utf-8")
             except OSError:
                 log_text = ""
+        # Маркеры обработки в log.md: поддерживаем три исторических формата:
+        #   1) `ingest-day | YYYY-MM-DD |`        — текущий
+        #   2) `ingest-file | YYYY-MM-DD |`       — промежуточный
+        #   3) `## [YYYY-MM-DD HH:MM] ingest |`   — самый старый (заголовок-дата)
         done_in_log: set[str] = set(
             re.findall(r"ingest-day \| (\d{4}-\d{2}-\d{2}) \|", log_text)
+        )
+        done_in_log.update(
+            re.findall(r"ingest-file \| (\d{4}-\d{2}-\d{2}) \|", log_text)
+        )
+        done_in_log.update(
+            re.findall(r"^## \[(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}\] ingest \|", log_text, re.MULTILINE)
         )
         all_dates = sorted(p.stem for p in raw_dir.glob("*.md"))
         pending = [

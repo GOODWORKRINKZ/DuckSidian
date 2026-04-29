@@ -2,11 +2,20 @@
 from __future__ import annotations
 
 import logging
+import re
+import uuid
 from datetime import datetime, timezone
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    Message,
+)
 
 from ..config import ChatConfig, settings
 from ..db import DB
@@ -18,6 +27,95 @@ from ..wiki import Wiki
 log = logging.getLogger(__name__)
 
 router = Router(name="commands")
+
+
+# Кэш ответов /ask, ожидающих кнопки "Сохранить".
+# Ключ — короткий id (пихается в callback_data, лимит 64 байта),
+# значение — (question, answer_markdown, chat_id). Хранится в памяти процесса:
+# после рестарта бота кнопки протухнут — это ок, они одноразовые.
+_pending_saves: dict[str, tuple[str, str, int]] = {}
+_PENDING_SAVES_MAX = 200
+
+
+def _trim_pending_saves() -> None:
+    """Грубая защита от утечки: держим не больше _PENDING_SAVES_MAX записей."""
+    if len(_pending_saves) <= _PENDING_SAVES_MAX:
+        return
+    # Удаляем самые старые (dict сохраняет порядок вставки).
+    for key in list(_pending_saves.keys())[: len(_pending_saves) - _PENDING_SAVES_MAX]:
+        _pending_saves.pop(key, None)
+
+
+def _slugify_query(text: str, max_len: int = 40) -> str:
+    """Сделать slug для имени файла из вопроса. Кириллицу сохраняем."""
+    s = (text or "").strip().lower()
+    s = re.sub(r"[^\w\s-]", "", s, flags=re.UNICODE)
+    s = re.sub(r"[\s_-]+", "-", s).strip("-")
+    if not s:
+        s = "query"
+    if len(s) > max_len:
+        s = s[:max_len].rstrip("-")
+    return s
+
+
+# Расширения, которые Telegram умеет показывать как фото в media group.
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def _extract_image_refs(answer: str, wiki_root, max_n: int = 10) -> list:
+    """Найти картинки в финальном блоке IMAGES: ответа агента.
+
+    Формат, который агент обязан использовать (см. QUERY_SYSTEM):
+
+        ...текст ответа...
+
+        IMAGES:
+        raw/assets/2026-04-28/photo_1.jpg
+        raw/assets/2026-04-28/photo_2.png
+
+    Любые `raw/assets/...` упоминания вне этого блока игнорируются —
+    они часто оказываются левыми (агент копирует из wiki-источников).
+    Файл должен реально существовать в vault'е чата; jpg/jpeg/png/webp.
+    """
+    if not answer:
+        return []
+    # Берём всё после последнего "IMAGES:" (case-insensitive), до конца.
+    m = re.search(r"(?im)^\s*IMAGES\s*:\s*$", answer)
+    if not m:
+        return []
+    tail = answer[m.end():]
+    rels: list[str] = []
+    seen: set[str] = set()
+    line_re = re.compile(r"raw/assets/[^\s\)\]\}\"'<>|]+", re.UNICODE)
+    for raw_line in tail.splitlines():
+        line = raw_line.strip().lstrip("-*•").strip().strip("`").strip()
+        if not line:
+            # пустая строка завершает блок IMAGES
+            if rels:
+                break
+            continue
+        # Если строка явно не путь — выходим (блок закончился).
+        lm = line_re.search(line)
+        if not lm:
+            break
+        rel = lm.group(0).rstrip(".,;:!?")
+        ext = rel.lower().rsplit(".", 1)
+        if len(ext) != 2 or "." + ext[1] not in _IMG_EXTS:
+            continue
+        if rel in seen:
+            continue
+        seen.add(rel)
+        try:
+            target = (wiki_root / rel).resolve()
+            target.relative_to(wiki_root)  # safety
+        except Exception:  # noqa: BLE001
+            continue
+        if not target.is_file():
+            continue
+        rels.append(str(target))
+        if len(rels) >= max_n:
+            break
+    return rels
 
 
 def _is_admin(user_id: int | None) -> bool:
@@ -154,7 +252,49 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
         await msg.chat.do("typing")
         try:
             answer = await orch.query(q)
-            await _reply_html(msg, answer or "(пусто)")
+            # Отрезаем технический блок IMAGES: — пользователю он не нужен
+            # (картинки прикрепим отдельно через _extract_image_refs).
+            display = answer or ""
+            _img_marker = re.search(r"(?im)^\s*IMAGES\s*:\s*$", display)
+            if _img_marker:
+                display = display[: _img_marker.start()].rstrip()
+            await _reply_html(msg, display or "(пусто)")
+            # Прикрепить картинки из ответа (если агент сослался на raw/assets/*.jpg|png|...)
+            try:
+                chat_wiki = _wiki_for_msg(msg)
+                img_paths = _extract_image_refs(answer or "", chat_wiki.root)
+                if img_paths:
+                    if len(img_paths) == 1:
+                        await msg.answer_photo(FSInputFile(img_paths[0]))
+                    else:
+                        media = [InputMediaPhoto(media=FSInputFile(p)) for p in img_paths[:10]]
+                        await msg.answer_media_group(media)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("ask: attach images failed: %s: %r", type(exc).__name__, exc)
+            # Кнопка "Сохранить" — кладём ответ в in-memory кэш под коротким id
+            # и шлём отдельное сообщение с inline-клавиатурой. callback_data
+            # ограничено 64 байтами, поэтому нельзя пихать туда сам текст.
+            if answer:
+                save_id = uuid.uuid4().hex[:12]
+                _pending_saves[save_id] = (q, answer, msg.chat.id)
+                _trim_pending_saves()
+                kb = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="💾 Сохранить",
+                        callback_data=f"qsave:{save_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="✏️ Поправить",
+                        callback_data=f"qfix:{save_id}",
+                    ),
+                ]])
+                try:
+                    await msg.answer(
+                        "Сохранить как заметку или поправить ответ?",
+                        reply_markup=kb,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("ask: send save-button failed: %s", exc)
         except Exception as exc:  # noqa: BLE001
             log.error("query failed: %s", exc)
             await msg.reply("⚠️ Ошибка при обращении к DeepSeek, попробуй ещё раз.")
@@ -404,5 +544,54 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             return
         await db.set_state("paused", "0")
         await msg.reply("▶️ авто-ingest возобновлён")
+
+    @router.callback_query(F.data.startswith("qsave:"))
+    async def cb_save_query(cb: CallbackQuery) -> None:
+        """Сохранить ответ /ask в wiki/queries/<ts>-<slug>.md."""
+        save_id = (cb.data or "").split(":", 1)[1] if cb.data else ""
+        entry = _pending_saves.pop(save_id, None)
+        if not entry:
+            await cb.answer("⌛ устарело, спроси заново", show_alert=False)
+            return
+        question, answer, chat_id = entry
+        # Per-chat wiki — сохраняем в тот же vault, к которому привязан чат.
+        cfg: ChatConfig | None = None
+        for c in settings.get_chats():
+            if c.chat_id == chat_id:
+                cfg = c
+                break
+        if cfg is None:
+            cfg = settings.get_chats()[0]
+        chat_wiki = _chat_wiki(cfg)
+
+        now = datetime.now(timezone.utc)
+        ts = now.strftime("%Y%m%dT%H%M%SZ")
+        slug = _slugify_query(question)
+        rel = f"wiki/queries/{ts}-{slug}.md"
+        author = (
+            cb.from_user.full_name if cb.from_user else "anon"
+        ) if cb.from_user else "anon"
+        body = (
+            f"---\n"
+            f"type: query\n"
+            f"created: {now.strftime('%Y-%m-%d')}\n"
+            f"author: {author}\n"
+            f"---\n\n"
+            f"# {question}\n\n"
+            f"{answer}\n"
+        )
+        try:
+            chat_wiki.write_file(rel, body)
+        except Exception as exc:  # noqa: BLE001
+            log.error("qsave write failed: %s", exc)
+            await cb.answer("❌ не удалось сохранить", show_alert=True)
+            return
+        # Убираем кнопку, чтобы повторно не нажали.
+        try:
+            if cb.message:
+                await cb.message.edit_text(f"💾 Сохранено: <code>{rel}</code>", parse_mode="HTML")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("qsave edit_text failed: %s", exc)
+        await cb.answer("Сохранено ✅")
 
     return router

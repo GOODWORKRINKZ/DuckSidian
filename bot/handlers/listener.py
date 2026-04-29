@@ -102,7 +102,7 @@ async def _download_media(
         rel = str(dst.relative_to(chat_wiki_root)).replace("\\", "/")
         return media_type, rel
     except Exception as exc:  # noqa: BLE001
-        log.warning("media download failed: %s", exc)
+        log.warning("media download failed: %s: %r", type(exc).__name__, exc, exc_info=True)
         return media_type, None
 
 

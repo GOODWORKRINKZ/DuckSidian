@@ -249,6 +249,28 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_git_log",
+            "description": (
+                "Получить историю коммитов GitHub-репозитория (источник правды для проектов). "
+                "repo — либо 'owner/name', либо полный URL https://github.com/owner/name. "
+                "since — необязательная нижняя дата в формате YYYY-MM-DD (включительно). "
+                "limit — сколько последних коммитов вернуть (1–100, по умолчанию 30). "
+                "Если в frontmatter wiki/projects/<X>.md есть поле repo:, бери оттуда."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string"},
+                    "since": {"type": "string", "description": "YYYY-MM-DD"},
+                    "limit": {"type": "integer", "default": 30},
+                },
+                "required": ["repo"],
+            },
+        },
+    },
 ]
 
 
@@ -432,6 +454,12 @@ class ToolExecutor:
                 )
             if name == "fetch_url":
                 return await self._fetch_url(arguments["url"])
+            if name == "fetch_git_log":
+                return await self._fetch_git_log(
+                    arguments["repo"],
+                    arguments.get("since"),
+                    min(int(arguments.get("limit", 30)), 100),
+                )
             if name == "describe_media":
                 return await self._describe_media(arguments["path"])
             return f"ERROR: unknown tool {name}"
@@ -554,3 +582,54 @@ class ToolExecutor:
         except Exception as exc:  # noqa: BLE001
             log.warning("web_search failed: %s", exc)
             return f"ERROR web_search: {exc}"
+
+    @staticmethod
+    async def _fetch_git_log(repo: str, since: str | None = None, limit: int = 30) -> str:
+        """GitHub commits API. repo: 'owner/name' или полный URL."""
+        import re
+        m = re.search(r"github\.com[:/]+([\w.\-]+)/([\w.\-]+?)(?:\.git)?/?$", repo)
+        if m:
+            owner, name = m.group(1), m.group(2)
+        elif "/" in repo and not repo.startswith("http"):
+            owner, _, name = repo.strip("/").partition("/")
+        else:
+            return f"ERROR fetch_git_log: не парсится repo='{repo}' (ожидаю owner/name или GitHub URL)"
+
+        params: dict[str, str | int] = {"per_page": max(1, min(limit, 100))}
+        if since:
+            params["since"] = f"{since}T00:00:00Z"
+
+        url = f"https://api.github.com/repos/{owner}/{name}/commits"
+        headers = {
+            "User-Agent": "DuckSidian/1.0",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        try:
+            timeout = httpx.Timeout(connect=15.0, read=20.0, write=10.0, pool=5.0)
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                resp = await client.get(url, params=params, headers=headers)
+                if resp.status_code == 404:
+                    return f"ERROR fetch_git_log: repo {owner}/{name} не найден (404)"
+                if resp.status_code == 403:
+                    return f"ERROR fetch_git_log: rate limit / forbidden (403). Повтори позже."
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("fetch_git_log %s/%s failed: %s", owner, name, exc)
+            return f"ERROR fetch_git_log: {exc}"
+
+        if not isinstance(data, list) or not data:
+            return f"[{owner}/{name}] коммитов не найдено (since={since or 'весь период'})"
+
+        lines = [f"# git log {owner}/{name} (since={since or '—'}, {len(data)} коммитов)"]
+        for c in data:
+            commit = c.get("commit", {})
+            author = (commit.get("author") or {}).get("name") or "?"
+            date = (commit.get("author") or {}).get("date") or "?"
+            msg = (commit.get("message") or "").strip().splitlines()[0][:200]
+            sha = (c.get("sha") or "")[:7]
+            lines.append(f"- {date[:10]} {sha} {author}: {msg}")
+        result = "\n".join(lines)
+        log.info("fetch_git_log %s/%s → %d коммитов", owner, name, len(data))
+        return result[:5000]

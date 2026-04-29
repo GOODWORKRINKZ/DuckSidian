@@ -95,7 +95,17 @@ async def main() -> None:
 
     log.info("starting polling for chat_id=%s", settings.telegram_chat_id)
     try:
-        await dp.start_polling(bot)
+        # Retry-обёртка: при потере DNS / сети aiogram может вылететь с
+        # TelegramNetworkError ещё до старта polling-цикла. Не падаем — ждём.
+        backoff = 5
+        while True:
+            try:
+                await dp.start_polling(bot)
+                break  # штатное завершение
+            except Exception as exc:  # noqa: BLE001
+                log.error("polling crashed: %s — retry in %ds", exc, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
     finally:
         scheduler.shutdown(wait=False)
         await orch.aclose()

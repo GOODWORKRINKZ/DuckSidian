@@ -25,7 +25,10 @@ class DeepSeekClient:
             tmo = httpx.Timeout(connect=15.0, read=300.0, write=30.0, pool=10.0)
         else:
             tmo = httpx.Timeout(timeout)
-        self._client = httpx.AsyncClient(timeout=tmo)
+        # Форсируем IPv4: на этой машине дефолтный сокет иногда висит ConnectTimeout 15s
+        # к api.deepseek.com (curl/curl -4 ок, голый httpx — нет). Bind на 0.0.0.0 чинит.
+        transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0", retries=1)
+        self._client = httpx.AsyncClient(timeout=tmo, transport=transport)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -74,8 +77,9 @@ class DeepSeekClient:
             payload["tool_choice"] = tool_choice
         url = f"{self.base_url}/v1/chat/completions"
         _RETRYABLE = (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadTimeout,
-                      httpx.ConnectTimeout, httpx.NetworkError)
-        for attempt in range(3):
+                      httpx.ConnectTimeout, httpx.NetworkError, httpx.WriteError)
+        max_attempts = 5
+        for attempt in range(max_attempts):
             try:
                 resp = await self._client.post(
                     url,
@@ -87,11 +91,13 @@ class DeepSeekClient:
                 )
                 break
             except _RETRYABLE as exc:
-                if attempt == 2:
-                    log.error("DeepSeek request failed after 3 attempts: %s", exc)
+                if attempt == max_attempts - 1:
+                    log.error("DeepSeek request failed after %d attempts: %s: %r",
+                              max_attempts, type(exc).__name__, exc)
                     raise
-                wait = 2 ** attempt
-                log.warning("DeepSeek transient error (attempt %d): %s — retry in %ds", attempt + 1, exc, wait)
+                wait = min(2 ** attempt, 8)
+                log.warning("DeepSeek transient error (attempt %d/%d): %s: %r — retry in %ds",
+                            attempt + 1, max_attempts, type(exc).__name__, exc, wait)
                 await asyncio.sleep(wait)
         if resp.status_code >= 400:
             log.error("DeepSeek HTTP %s: %s", resp.status_code, resp.text[:500])
