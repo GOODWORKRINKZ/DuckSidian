@@ -241,46 +241,119 @@ class Orchestrator:
             commit_and_push(f"ingest adhoc {cfg.name}: last {n} msgs")
         return run.summary or "Ingest завершён."
 
+    @staticmethod
+    def _split_raw_chunks(
+        content: str, max_msgs: int = 8, max_chars: int = 3_000
+    ) -> list[str]:
+        """Разбить raw/daily/*.md на чанки по сообщениям.
+
+        Сообщения в файле разделены строкой "---". Заголовок (до первого "---")
+        повторяется в каждом чанке как контекст. Каждый чанк ≤ max_msgs
+        сообщений и ≤ max_chars символов.
+        """
+        # Разбиваем по строке "---" (граница между сообщениями).
+        parts = content.split("\n---\n")
+        if len(parts) <= 2:
+            return [content]
+        header = parts[0]
+        msgs = [p for p in parts[1:] if p.strip()]
+        chunks: list[str] = []
+        cur: list[str] = []
+        cur_chars = 0
+        for m in msgs:
+            m_len = len(m) + 5  # +"\n---\n"
+            if cur and (len(cur) >= max_msgs or cur_chars + m_len > max_chars):
+                chunks.append(header + "\n---\n" + "\n---\n".join(cur))
+                cur, cur_chars = [], 0
+            cur.append(m)
+            cur_chars += m_len
+        if cur:
+            chunks.append(header + "\n---\n" + "\n---\n".join(cur))
+        return chunks
+
     async def ingest_raw_file(
         self, date_iso: str, chat_cfg: ChatConfig | None = None
     ) -> str:
-        """Запустить ingest для уже готового raw/daily/<date>.md (без БД)."""
+        """Запустить ingest для готового raw/daily/<date>.md.
+
+        Большие дни режутся на чанки по ~25 сообщений / ~8KB и обрабатываются
+        последовательно. Каждый чанк = отдельный agent-run, который сам пишет
+        в `wiki/entities/*`, `wiki/projects/*`, `wiki/sources/*`. После всех
+        чанков оркестратор сам создаёт/обновляет `wiki/daily/<date>.md`,
+        чтобы повторный /ingest-files не подхватил день второй раз.
+        """
         cfg = chat_cfg or settings.get_chats()[0]
         wiki = _chat_wiki(cfg)
         raw_file = wiki.root / "raw" / "daily" / f"{date_iso}.md"
         if not raw_file.exists():
             return f"Файл не найден: raw/daily/{date_iso}.md"
         content = raw_file.read_text(encoding="utf-8")
-        # Считаем строки с сообщениями (начинаются с "###")
-        n_msgs = content.count("\n### ")
+        n_msgs = content.count("\n---\n> **")
         rel = f"raw/daily/{date_iso}.md"
-        executor = self._make_executor(wiki, cfg)
-        user_prompt = (
-            f"Сделай ingest батча из файла `{rel}`. "
-            f"Дата: {date_iso}. Чат: {cfg.name}. "
-            f"В файле примерно {n_msgs} сообщений. "
-            f"Следуй процедуре ingest из AGENTS.md."
+        chunks = self._split_raw_chunks(content)
+        log.info(
+            "ingest_raw_file: %s — %d msgs, split into %d chunk(s)",
+            date_iso, n_msgs, len(chunks),
         )
+        executor = self._make_executor(wiki, cfg)
+        chunk_summaries: list[str] = []
+        total_steps = 0
         try:
-            run = await run_agent(
-                client=self.client,
-                executor=executor,
-                system_prompt=INGEST_SYSTEM,
-                user_prompt=user_prompt,
-                max_steps=40,
+            for idx, chunk in enumerate(chunks, 1):
+                user_prompt = (
+                    f"Ingest чанка {idx}/{len(chunks)} файла `{rel}` "
+                    f"(дата {date_iso}, чат {cfg.name}). "
+                    f"Содержимое чанка приведено НИЖЕ — НЕ читай весь raw-файл, "
+                    f"работай с этим текстом. После анализа обнови соответствующие "
+                    f"страницы в wiki/entities/, wiki/projects/, wiki/sources/, "
+                    f"index.md по правилам AGENTS.md. НЕ создавай wiki/daily/{date_iso}.md "
+                    f"— это сделает оркестратор после всех чанков. В finish() дай "
+                    f"короткую сводку: что нового добавил/обновил.\n\n"
+                    f"--- НАЧАЛО ЧАНКА ---\n{chunk}\n--- КОНЕЦ ЧАНКА ---"
+                )
+                run = await run_agent(
+                    client=self.client,
+                    executor=executor,
+                    system_prompt=INGEST_SYSTEM,
+                    user_prompt=user_prompt,
+                    max_steps=20,
+                )
+                total_steps += run.steps
+                if not run.finished:
+                    log.warning(
+                        "ingest_raw_file: chunk %d/%d for %s did not finish",
+                        idx, len(chunks), date_iso,
+                    )
+                chunk_summaries.append(
+                    f"### Чанк {idx}/{len(chunks)}\n{run.summary or '(пусто)'}"
+                )
+            # Все чанки прошли — создаём wiki/daily/<date>.md как маркер обработки.
+            from datetime import date as _date
+            digest_path = f"wiki/daily/{date_iso}.md"
+            digest_body = (
+                f"---\ntype: daily\ncreated: {date_iso}\nupdated: {date_iso}\n"
+                f"sources: {n_msgs}\ntags: [daily, digest]\n---\n\n"
+                f"# Дайджест: {date_iso}\n\n"
+                f"**Источник:** `{rel}` ({n_msgs} сообщений, {len(chunks)} чанк(ов)).\n\n"
+                + "\n\n".join(chunk_summaries)
+                + "\n"
             )
-            status = "ok" if run.finished else "partial"
+            wiki.write_file(digest_path, digest_body)
             self._append_log(
                 wiki,
-                f"ingest-file | {date_iso} | ~{n_msgs} сообщений | "
-                f"{run.steps} шагов | {status}",
+                f"ingest-file | {date_iso} | {n_msgs} сообщений | "
+                f"{len(chunks)} чанк(ов) | {total_steps} шагов | ok",
             )
             if settings.git_autocommit:
                 commit_and_push(f"ingest-file {cfg.name} {date_iso}")
-            return run.summary or "Ingest завершён."
+            return (
+                f"Ingest {date_iso} завершён: {n_msgs} сообщений в "
+                f"{len(chunks)} чанк(ов), {total_steps} шагов."
+            )
         except Exception as exc:  # noqa: BLE001
             log.exception("ingest_raw_file failed")
             return f"Ошибка ingest: {exc}"
+
 
     async def ingest_raw_pending(
         self, chat_cfg: ChatConfig | None = None, limit: int = 5
@@ -302,8 +375,18 @@ class Orchestrator:
         batch = pending[:limit]
         results: list[str] = []
         for date_iso in batch:
-            log.info("ingest_raw_pending: %s", date_iso)
-            res = await self.ingest_raw_file(date_iso, cfg)
+            # До 3 попыток на день: при сетевом disconnect от DeepSeek первая
+            # часто рвётся, но повтор обычно проходит. Если день успешно
+            # заинжещен — wiki/daily/<date>.md появится и при следующем
+            # /ingest-files мы его уже не подхватим.
+            res = ""
+            for attempt in range(1, 4):
+                log.info("ingest_raw_pending: %s (attempt %d/3)", date_iso, attempt)
+                res = await self.ingest_raw_file(date_iso, cfg)
+                if not res.startswith("Ошибка ingest"):
+                    break
+                log.warning("ingest_raw_pending: %s attempt %d failed: %s", date_iso, attempt, res[:200])
+                await asyncio.sleep(2 ** attempt)  # 2s, 4s, 8s
             results.append(f"**{date_iso}**: {res[:120]}")
         remaining = len(pending) - len(batch)
         summary = "\n".join(results)
@@ -349,24 +432,27 @@ class Orchestrator:
     async def triz(
         self, problem: str, chat_cfg: ChatConfig | None = None
     ) -> str:
-        """ТРИЗ-разбор проблемы из чата (read-only, ответ в чат)."""
-        cfg = chat_cfg or settings.get_chats()[0]
-        wiki = _chat_wiki(cfg)
-        executor = self._make_executor(wiki, cfg)
-        user_prompt = (
-            f"Проблема для ТРИЗ-разбора: {problem}"
-            if problem.strip()
-            else "Проблема не задана. Возьми 1\u20133 самые активные темы "
-            "из последних wiki/daily/ и сделай ТРИЗ-разбор по каждой."
-        )
-        run = await run_agent(
-            client=self.client,
-            executor=executor,
-            system_prompt=TRIZ_SYSTEM,
-            user_prompt=user_prompt,
-            max_steps=20,
-        )
-        return run.summary or "ТРИЗ-разбор не получился."
+        """ТРИЗ-разбор: один прямой запрос к модели, без агент-цикла и vault.
+
+        TRIZ — методология применяется к формулировке проблемы. Поиск по вики
+        только сбивает модель и жжёт шаги, поэтому выключен.
+        """
+        _ = chat_cfg  # сохраняем сигнатуру, но не используем
+        if not problem.strip():
+            return ("Дай формулировку проблемы текстом после `/triz`, "
+                    "либо ответом на сообщение с описанием.")
+        messages = [
+            {"role": "system", "content": TRIZ_SYSTEM},
+            {"role": "user", "content": problem.strip()},
+        ]
+        try:
+            resp = await self.client.chat(messages=messages, tools=None)
+            content = resp["choices"][0]["message"].get("content") or ""
+        except Exception as exc:  # noqa: BLE001
+            log.error("triz: model call failed: %s", exc)
+            return f"ТРИЗ-разбор не удался: {exc}"
+        return content.strip() or "ТРИЗ-разбор не получился (пустой ответ)."
+
 
     # --- PROJECTS ---
 

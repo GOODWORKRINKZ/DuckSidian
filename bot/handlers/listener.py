@@ -157,10 +157,11 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
 
         chat_name = chat_name_by_id[msg.chat.id]
 
-        # Сообщения из бот-топика не архивируем
         bot_topic_id = await ensure_bot_topic(bot, db, msg.chat.id)
-        if bot_topic_id and msg.message_thread_id == bot_topic_id:
-            return
+
+        # Reply на сообщение бота с "id=N" — это ответ на вопрос агента.
+        # Проверяем ДО фильтра бот-топика: вопросы агента уходят именно в
+        # бот-топик, поэтому ответы там тоже должны ловиться.
         if (
             msg.reply_to_message
             and msg.reply_to_message.from_user
@@ -180,6 +181,10 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                     if delivered:
                         await msg.reply("✅ ответ передан агенту")
                         return
+
+        # Прочие сообщения из бот-топика не архивируем (только ответы выше).
+        if bot_topic_id and msg.message_thread_id == bot_topic_id:
+            return
 
         # Команды обрабатываются commands-роутером
         if msg.text and msg.text.startswith("/"):

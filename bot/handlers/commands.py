@@ -43,18 +43,51 @@ def _wiki_for_msg(msg: Message) -> Wiki:
 
 
 async def _reply_html(msg: Message, markdown_text: str) -> None:
-    """Конвертировать markdown-ответ агента в Telegram HTML и отправить чанками.
+    """Отправить markdown-ответ агента в Telegram чанками.
 
-    Передаёт chat_id в конвертер, чтобы wikilinks `[[raw/...#msg-N]]`
-    превращались в кликабельные ссылки на оригинальные сообщения.
+    Устойчив к:
+    - удалённому исходному сообщению (msg.reply → падает в msg.answer);
+    - кратковременным сетевым проблемам (ретрай 3х).
+    Если всё равно не отправилось — логируем весь текст (чтобы не терять
+    результат долгих агентных прогонов).
     """
+    import asyncio
+    from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+
     html_text = md_to_tg_html(markdown_text or "(пусто)", tg_chat_id=msg.chat.id)
     chunks = split_tg_chunks(html_text)
-    for i, chunk in enumerate(chunks):
-        if i == 0:
-            await msg.reply(chunk, parse_mode="HTML")
-        else:
-            await msg.answer(chunk, parse_mode="HTML")
+
+    async def _send_chunk(chunk: str, use_reply: bool) -> bool:
+        backoffs = [0, 2, 5]
+        for i, delay in enumerate(backoffs):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                if use_reply:
+                    await msg.reply(chunk, parse_mode="HTML")
+                else:
+                    await msg.answer(chunk, parse_mode="HTML")
+                return True
+            except TelegramBadRequest as exc:
+                # Исходное сообщение удалили — переключаемся на answer.
+                if use_reply and "reply" in str(exc).lower():
+                    log.warning("reply target gone, falling back to answer: %s", exc)
+                    use_reply = False
+                    continue
+                log.error("send chunk failed (BadRequest): %s", exc)
+                return False
+            except TelegramNetworkError as exc:
+                log.warning("send chunk net err (try %d/%d): %s", i + 1, len(backoffs), exc)
+        return False
+
+    use_reply = True
+    for chunk in chunks:
+        ok = await _send_chunk(chunk, use_reply=use_reply)
+        if not ok:
+            log.error("chunk delivery failed; full agent answer follows:\n%s", markdown_text)
+            break
+        # После первого успеха или фолбэка — остальные чанки простыми answer.
+        use_reply = False
 
 
 HELP_TEXT = (
@@ -153,8 +186,18 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
     @router.message(Command("triz"))
     async def cmd_triz(msg: Message, command: CommandObject) -> None:
         problem = (command.args or "").strip()
+        # Если /triz сделан reply'ем — добавим к проблеме автора и текст того сообщения.
+        if msg.reply_to_message:
+            r = msg.reply_to_message
+            quoted = (r.text or r.caption or "").strip()
+            if quoted:
+                author = (
+                    r.from_user.full_name if r.from_user else "anon"
+                ) if r.from_user else "anon"
+                quoted_block = f"[{author}]: {quoted}"
+                problem = f"{problem}\n\n{quoted_block}".strip() if problem else quoted_block
         cfg = _chat_for_msg(msg)
-        await msg.reply("🧠 ТРИЗ-разбор запущен, жди минуту…")
+        status_msg = await msg.reply("🧠 ТРИЗ-разбор запущен, жди минуту…")
         try:
             out = await orch.triz(problem, cfg)
         except Exception as exc:  # noqa: BLE001
@@ -162,6 +205,11 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             await msg.reply("⚠️ Ошибка ТРИЗ-агента.")
             return
         await _reply_html(msg, out or "(пусто)")
+        # Удаляем служебное «запущен…» — разбор уже в чате.
+        try:
+            await status_msg.delete()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("triz: failed to delete status message: %s", exc)
 
     @router.message(Command("projects"))
     async def cmd_projects(msg: Message) -> None:
@@ -305,7 +353,7 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             if not chats:
                 await msg.reply(f"Чат '{chat_name_filter}' не найден.")
                 return
-        await msg.reply("⏳ ingest-files запущен…")
+        status_msg = await msg.reply("⏳ ingest-files запущен…")
         results = []
         for chat_cfg in chats:
             if not arg or arg.isdigit():
@@ -320,6 +368,10 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
                 out = await orch.ingest_raw_file(arg, chat_cfg)
             results.append(f"[{chat_cfg.name}] {out}")
         await _reply_html(msg, "✅ " + chr(10).join(results))
+        try:
+            await status_msg.delete()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ingest-files: failed to delete status message: %s", exc)
 
     @router.message(Command("lint"))
     async def cmd_lint(msg: Message) -> None:
