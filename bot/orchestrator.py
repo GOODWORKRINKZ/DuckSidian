@@ -53,6 +53,7 @@ def _chat_wiki(chat_cfg: ChatConfig) -> Wiki:
         # Базовые директории
         for subdir in (
             "raw/daily", "raw/notes", "raw/assets",
+            "wiki/projects",
             "wiki/entities", "wiki/concepts", "wiki/sources",
             "wiki/daily", "wiki/queries",
         ):
@@ -61,6 +62,16 @@ def _chat_wiki(chat_cfg: ChatConfig) -> Wiki:
             p = root / fname
             if not p.exists():
                 p.write_text(f"# {fname}\n", encoding="utf-8")
+    # Миграция: добавить wiki/projects/ в существующие волты и шаблон
+    projects_dir = root / "wiki" / "projects"
+    projects_dir.mkdir(parents=True, exist_ok=True)
+    tmpl_src = Path(__file__).resolve().parent.parent / "vault-template" / "wiki" / "projects" / "_template.md"
+    tmpl_dst = projects_dir / "_template.md"
+    if tmpl_src.exists() and not tmpl_dst.exists():
+        try:
+            shutil.copy2(tmpl_src, tmpl_dst)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("copy _template.md failed: %s", exc)
     return Wiki(root)
 
 
