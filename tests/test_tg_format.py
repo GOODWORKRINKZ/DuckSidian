@@ -36,9 +36,26 @@ def test_link():
 def test_wiki_link():
     assert (
         md_to_tg_html("see [[wiki/entities/Techno-Drone#anchor]]")
-        == "see <i>Techno-Drone</i>"
+        == "see <i>Techno-Drone #anchor</i>"
     )
     assert md_to_tg_html("[[wiki/x|Алиас]]") == "<i>Алиас</i>"
+
+
+def test_raw_msg_wikilink_to_tg_link():
+    # Без chat_id — курсив с anchor
+    out = md_to_tg_html("ссылка [[raw/2025-04-28.md#msg-12345]]")
+    assert "<i>2025-04-28 #msg-12345</i>" in out
+    # С chat_id супергруппы — кликабельная https://t.me/c/<short>/<msg>
+    out2 = md_to_tg_html(
+        "ссылка [[raw/2025-04-28.md#msg-12345]]", tg_chat_id=-1003838691724
+    )
+    assert '<a href="https://t.me/c/3838691724/12345">2025-04-28 #msg-12345</a>' in out2
+    # Без anchor msg — остаётся курсивом
+    out3 = md_to_tg_html("[[raw/2025-04-28.md]]", tg_chat_id=-1003838691724)
+    assert "<i>2025-04-28</i>" in out3
+    # Wiki-ссылка не превращается в t.me
+    out4 = md_to_tg_html("[[wiki/concepts/X#msg-1]]", tg_chat_id=-1003838691724)
+    assert "<a href" not in out4
 
 
 def test_blockquote():
@@ -67,7 +84,7 @@ def test_donos_smoke():
     out = md_to_tg_html(src)
     assert "<b>📄 ДОНОС</b>" in out
     assert "<blockquote>" in out
-    assert "<i>Techno-Drone</i>" in out
+    assert "<i>Techno-Drone #2026-04-28-основные-батчи</i>" in out
     assert "<code>code &lt;x&gt;</code>" in out
     # никаких ## или [[ остаться не должно
     assert "##" not in out

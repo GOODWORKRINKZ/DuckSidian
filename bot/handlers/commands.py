@@ -43,8 +43,12 @@ def _wiki_for_msg(msg: Message) -> Wiki:
 
 
 async def _reply_html(msg: Message, markdown_text: str) -> None:
-    """Конвертировать markdown-ответ агента в Telegram HTML и отправить чанками."""
-    html_text = md_to_tg_html(markdown_text or "(пусто)")
+    """Конвертировать markdown-ответ агента в Telegram HTML и отправить чанками.
+
+    Передаёт chat_id в конвертер, чтобы wikilinks `[[raw/...#msg-N]]`
+    превращались в кликабельные ссылки на оригинальные сообщения.
+    """
+    html_text = md_to_tg_html(markdown_text or "(пусто)", tg_chat_id=msg.chat.id)
     chunks = split_tg_chunks(html_text)
     for i, chunk in enumerate(chunks):
         if i == 0:

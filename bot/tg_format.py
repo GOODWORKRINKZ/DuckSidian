@@ -43,21 +43,58 @@ _HR_RE = re.compile(r"^\s{0,3}([-*_])(\s*\1){2,}\s*$")
 _LIST_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
 
 
+_MSG_ANCHOR_RE = re.compile(r"^msg-(\d+)$")
+
+
 def _wiki_alias(target: str, alias: str | None) -> str:
-    """Превратить [[wiki/...#anchor]] в человекочитаемый алиас."""
+    """Превратить [[wiki/...#anchor]] в человекочитаемый алиас.
+
+    Для `raw/2025-04-28.md#msg-12345` возвращаем `2025-04-28 #msg-12345`,
+    чтобы id сообщения был виден пользователю.
+    """
     if alias:
         return alias.strip()
-    # отбросить #anchor
-    base = target.split("#", 1)[0]
-    # последний компонент пути, без .md
+    base, _, anchor = target.partition("#")
     name = base.rsplit("/", 1)[-1]
     if name.endswith(".md"):
         name = name[:-3]
-    return name.strip() or target.strip()
+    name = name.strip() or target.strip()
+    anchor = anchor.strip()
+    if anchor:
+        return f"{name} #{anchor}" if not anchor.startswith("msg-") else f"{name} #{anchor}"
+    return name
 
 
-def md_to_tg_html(text: str) -> str:
-    """Конвертировать markdown-строку в Telegram-совместимый HTML."""
+def _tg_link_for_wiki(target: str, tg_chat_id: int | None) -> str | None:
+    """Если wikilink ведёт на raw/...#msg-N и есть chat_id супергруппы —
+    вернуть https://t.me/c/<short>/<msg_id>. Иначе None.
+    """
+    if tg_chat_id is None:
+        return None
+    base, _, anchor = target.partition("#")
+    if not base.lstrip().startswith(("raw/", "raw\\")):
+        return None
+    m = _MSG_ANCHOR_RE.match(anchor.strip())
+    if not m:
+        return None
+    msg_id = m.group(1)
+    # Для супергрупп chat_id вида -100XXXXXXXXXX → ссылка t.me/c/XXXXXXXXXX/<msg>
+    cid = tg_chat_id
+    if cid < 0:
+        s = str(cid)[1:]  # убрать минус
+        if s.startswith("100"):
+            s = s[3:]
+        return f"https://t.me/c/{s}/{msg_id}"
+    return None
+
+
+def md_to_tg_html(text: str, tg_chat_id: int | None = None) -> str:
+    """Конвертировать markdown-строку в Telegram-совместимый HTML.
+
+    Если передан `tg_chat_id` (id супергруппы вида -100…), wikilinks вида
+    `[[raw/2025-04-28.md#msg-12345]]` превращаются в кликабельные ссылки
+    на оригинальное сообщение в Telegram.
+    """
     if not text:
         return ""
 
@@ -88,12 +125,17 @@ def md_to_tg_html(text: str) -> str:
         return _stash(f'<a href="{url}">{label}</a>')
 
     text = _LINK_RE.sub(_link_sub, text)
-    text = _WIKI_RE.sub(
-        lambda m: _stash(
-            f"<i>{html.escape(_wiki_alias(m.group(1), m.group(2)))}</i>"
-        ),
-        text,
-    )
+
+    def _wiki_sub(m: re.Match[str]) -> str:
+        target = m.group(1)
+        alias_label = _wiki_alias(target, m.group(2))
+        label_esc = html.escape(alias_label)
+        url = _tg_link_for_wiki(target, tg_chat_id)
+        if url:
+            return _stash(f'<a href="{html.escape(url, quote=True)}">{label_esc}</a>')
+        return _stash(f"<i>{label_esc}</i>")
+
+    text = _WIKI_RE.sub(_wiki_sub, text)
 
     # 3) Экранировать всё остальное.
     text = html.escape(text, quote=False)
