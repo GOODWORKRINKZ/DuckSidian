@@ -345,8 +345,6 @@ class Orchestrator:
         return run.summary or "Lint завершён."
 
     # --- TRIZ ---
-
-    async def triz(
         self, problem: str, chat_cfg: ChatConfig | None = None
     ) -> str:
         """ТРИЗ-разбор проблемы из чата (read-only, ответ в чат)."""
