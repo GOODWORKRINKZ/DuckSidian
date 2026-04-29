@@ -276,11 +276,14 @@ class Orchestrator:
     ) -> str:
         """Запустить ingest для готового raw/daily/<date>.md.
 
-        Большие дни режутся на чанки по ~25 сообщений / ~8KB и обрабатываются
-        последовательно. Каждый чанк = отдельный agent-run, который сам пишет
-        в `wiki/entities/*`, `wiki/projects/*`, `wiki/sources/*`. После всех
-        чанков оркестратор сам создаёт/обновляет `wiki/daily/<date>.md`,
-        чтобы повторный /ingest-files не подхватил день второй раз.
+        Большие дни режутся на чанки (~8 сообщений / ~3KB). Каждый чанк =
+        отдельный agent-run. После успешного чанка summary кэшируется
+        в `.cache/ingest/<date>/chunk-<idx>.txt`, поэтому при retry
+        уже сделанные чанки пропускаются. После всех чанков оркестратор
+        создаёт `wiki/daily/<date>.md` и чистит кэш.
+
+        Контекст vault (AGENTS.md, index.md) читается ОДИН раз и пробрасывается
+        в user_prompt каждого чанка — агент сам их не открывает.
         """
         cfg = chat_cfg or settings.get_chats()[0]
         wiki = _chat_wiki(cfg)
@@ -291,6 +294,28 @@ class Orchestrator:
         n_msgs = content.count("\n---\n> **")
         rel = f"raw/daily/{date_iso}.md"
         chunks = self._split_raw_chunks(content)
+
+        # B: один раз читаем «головной» контекст vault и встраиваем в каждый чанк.
+        def _read_or(p: Path, cap: int) -> str:
+            try:
+                t = p.read_text(encoding="utf-8")
+            except OSError:
+                return "(нет файла)"
+            return t if len(t) <= cap else t[:cap] + "\n...[truncated]"
+
+        agents_md = _read_or(wiki.root / "AGENTS.md", 8_000)
+        index_md = _read_or(wiki.root / "index.md", 6_000)
+        template_md = _read_or(wiki.root / "wiki" / "projects" / "_template.md", 2_000)
+        head_ctx = (
+            "=== AGENTS.md ===\n" + agents_md
+            + "\n\n=== index.md ===\n" + index_md
+            + "\n\n=== wiki/projects/_template.md ===\n" + template_md
+        )
+
+        # C: кэш частичного прогресса.
+        cache_dir = wiki.root / ".cache" / "ingest" / date_iso
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
         log.info(
             "ingest_raw_file: %s — %d msgs, split into %d chunk(s)",
             date_iso, n_msgs, len(chunks),
@@ -300,6 +325,18 @@ class Orchestrator:
         total_steps = 0
         try:
             for idx, chunk in enumerate(chunks, 1):
+                cache_file = cache_dir / f"chunk-{idx:03d}.txt"
+                if cache_file.exists():
+                    cached = cache_file.read_text(encoding="utf-8")
+                    log.info(
+                        "ingest_raw_file: %s chunk %d/%d — using cached summary (%d chars)",
+                        date_iso, idx, len(chunks), len(cached),
+                    )
+                    chunk_summaries.append(
+                        f"### Чанк {idx}/{len(chunks)} (кэш)\n{cached}"
+                    )
+                    continue
+
                 user_prompt = (
                     f"Ingest чанка {idx}/{len(chunks)} файла `{rel}` "
                     f"(дата {date_iso}, чат {cfg.name}). "
@@ -309,6 +346,9 @@ class Orchestrator:
                     f"index.md по правилам AGENTS.md. НЕ создавай wiki/daily/{date_iso}.md "
                     f"— это сделает оркестратор после всех чанков. В finish() дай "
                     f"короткую сводку: что нового добавил/обновил.\n\n"
+                    f"--- КОНТЕКСТ VAULT (НЕ ЧИТАЙ ЭТИ ФАЙЛЫ ЧЕРЕЗ read_file) ---\n"
+                    f"{head_ctx}\n"
+                    f"--- КОНЕЦ КОНТЕКСТА ---\n\n"
                     f"--- НАЧАЛО ЧАНКА ---\n{chunk}\n--- КОНЕЦ ЧАНКА ---"
                 )
                 run = await run_agent(
@@ -316,7 +356,7 @@ class Orchestrator:
                     executor=executor,
                     system_prompt=INGEST_SYSTEM,
                     user_prompt=user_prompt,
-                    max_steps=20,
+                    max_steps=12,
                 )
                 total_steps += run.steps
                 if not run.finished:
@@ -324,11 +364,12 @@ class Orchestrator:
                         "ingest_raw_file: chunk %d/%d for %s did not finish",
                         idx, len(chunks), date_iso,
                     )
+                summary = run.summary or "(пусто)"
+                cache_file.write_text(summary, encoding="utf-8")
                 chunk_summaries.append(
-                    f"### Чанк {idx}/{len(chunks)}\n{run.summary or '(пусто)'}"
+                    f"### Чанк {idx}/{len(chunks)}\n{summary}"
                 )
             # Все чанки прошли — создаём wiki/daily/<date>.md как маркер обработки.
-            from datetime import date as _date
             digest_path = f"wiki/daily/{date_iso}.md"
             digest_body = (
                 f"---\ntype: daily\ncreated: {date_iso}\nupdated: {date_iso}\n"
@@ -339,6 +380,13 @@ class Orchestrator:
                 + "\n"
             )
             wiki.write_file(digest_path, digest_body)
+            # Чистим кэш частичного прогресса — день закрыт.
+            try:
+                for f in cache_dir.glob("chunk-*.txt"):
+                    f.unlink()
+                cache_dir.rmdir()
+            except OSError:
+                pass
             self._append_log(
                 wiki,
                 f"ingest-file | {date_iso} | {n_msgs} сообщений | "
