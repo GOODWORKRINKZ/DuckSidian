@@ -33,6 +33,7 @@ from .agent.tools import ToolExecutor
 from .config import ChatConfig, settings
 from .db import DB
 from .git_sync import commit_and_push
+from .tg_format import md_to_tg_html
 from .topic_manager import ensure_bot_topic
 from .wiki import Wiki
 
@@ -106,15 +107,15 @@ class Orchestrator:
             kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
         text = (
-            f"❓ *Вопрос от агента*\n\n{question}\n\n"
-            f"_id={qid}. Ответьте reply'ем на это сообщение или кнопкой._"
+            f"❓ <b>Вопрос от агента</b>\n\n{md_to_tg_html(question)}\n\n"
+            f"<i>id={qid}. Ответьте reply'ем на это сообщение или кнопкой.</i>"
         )
         sent = await self.bot.send_message(
             chat_id=chat_id,
             text=text,
             message_thread_id=topic_id,
             reply_markup=kb,
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         await self.db.attach_question_post(qid, sent.message_id)
 

@@ -135,9 +135,10 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         await cb.answer("принято" if delivered else "уже отвечено")
         if cb.message:
             try:
+                from html import escape as _esc
                 await cb.message.edit_text(
-                    (cb.message.text or "") + f"\n\n✅ *Ответ:* {chosen}",
-                    parse_mode="Markdown",
+                    _esc(cb.message.text or "") + f"\n\n✅ <b>Ответ:</b> {_esc(chosen)}",
+                    parse_mode="HTML",
                 )
             except Exception:  # noqa: BLE001
                 pass
