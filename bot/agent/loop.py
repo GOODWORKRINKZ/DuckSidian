@@ -224,4 +224,27 @@ async def run_agent(
         except Exception as exc:  # noqa: BLE001
             log.error("forced summary call failed: %s", exc)
             run.summary = run.summary or "(agent stopped without finish())"
+    run.summary = _sanitize_summary(run.summary)
     return run
+
+
+# DeepSeek иногда возвращает в content свой внутренний tool-call формат как plain text:
+#   <｜DSML｜tool_calls><｜DSML｜invoke name="..."><｜DSML｜parameter ...>...</｜DSML｜...>
+# Это не должно попадать в дайджесты vault'а. Чистим всё, что обрамлено такими токенами,
+# а если первый такой токен встречается — обрезаем хвост.
+import re as _re
+
+_DSML_FULL_RE = _re.compile(r"<｜DSML｜[^>]*>.*?</｜DSML｜[^>]*>", _re.DOTALL)
+_DSML_TAG_RE = _re.compile(r"<\｜?DSML\｜?[^>]*>")
+
+
+def _sanitize_summary(s: str) -> str:
+    if not s or "DSML" not in s:
+        return s.strip()
+    # Сначала вырезаем парные блоки.
+    s = _DSML_FULL_RE.sub("", s)
+    # Если остался непарный открывающий — режем по нему.
+    m = _DSML_TAG_RE.search(s)
+    if m:
+        s = s[: m.start()].rstrip()
+    return s.strip()

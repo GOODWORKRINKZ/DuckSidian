@@ -149,10 +149,12 @@ class Orchestrator:
             return True
         return False
 
-    def _make_executor(self, wiki: Wiki, chat_cfg: ChatConfig | None = None) -> ToolExecutor:
+    def _make_executor(self, wiki: Wiki, chat_cfg: ChatConfig | None = None,
+                       file_cache: dict[str, str] | None = None) -> ToolExecutor:
         async def ask_user_cb(question: str, options: list[str] | None) -> str:
             return await self._ask_user(question, options, chat_cfg)
-        return ToolExecutor(wiki, ask_user_cb, deepseek_client=self.client)
+        return ToolExecutor(wiki, ask_user_cb, deepseek_client=self.client,
+                            file_cache=file_cache)
 
     # --- INGEST ---
 
@@ -242,6 +244,79 @@ class Orchestrator:
         return run.summary or "Ingest завершён."
 
     @staticmethod
+    def _extract_media_refs(content: str, date_iso: str) -> list[str]:
+        """Достать все wiki-ссылки на медиа дня: [[raw/assets/<date>/<file>]]."""
+        import re
+        pat = re.compile(
+            r"\[\[(raw/assets/" + re.escape(date_iso) + r"/[^\]\r\n]+)\]\]"
+        )
+        seen: set[str] = set()
+        out: list[str] = []
+        for m in pat.finditer(content):
+            rel = m.group(1)
+            if rel not in seen:
+                seen.add(rel)
+                out.append(rel)
+        return out
+
+    async def _preanalyze_media(
+        self, refs: list[str], wiki: Wiki, executor: ToolExecutor
+    ) -> dict[str, str]:
+        """Получить описание каждого медиа-файла дня.
+
+        Кэшируется на диске в `.cache/media/<flat>.txt`, чтобы не повторять
+        дорогую vision/STT обработку при retry/повторных ingest. Возвращает
+        отображение rel_path → краткое описание (≤600 символов).
+        """
+        cache_root = wiki.root / ".cache" / "media"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        out: dict[str, str] = {}
+        for rel in refs:
+            flat = rel.replace("/", "__")
+            cache_file = cache_root / f"{flat}.txt"
+            if cache_file.exists():
+                desc = cache_file.read_text(encoding="utf-8")
+            else:
+                try:
+                    desc = await executor._describe_media(rel)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("preanalyze_media %s failed: %s", rel, exc)
+                    desc = f"[ошибка анализа: {exc}]"
+                # Сохраняем как есть; усечение делаем при встраивании.
+                try:
+                    cache_file.write_text(desc, encoding="utf-8")
+                except OSError as exc:
+                    log.warning("media cache write %s failed: %s", rel, exc)
+            # Чистим возможный DSML-мусор и нормализуем переносы.
+            desc = desc.strip()
+            if len(desc) > 600:
+                desc = desc[:600].rstrip() + "…"
+            desc = desc.replace("\n", " ⏎ ")
+            out[rel] = desc
+        return out
+
+    @staticmethod
+    def _enrich_with_media(content: str, media_map: dict[str, str]) -> str:
+        """Встроить описание медиа сразу после строки, ссылающейся на него.
+
+        Karpathy: "LLMs can't natively read markdown with inline images in one
+        pass — workaround: read the text first, then view referenced images
+        separately to gain additional context." Делаем это заранее: в одном
+        проходе агент уже видит и сообщение, и описание медиа, без вызова
+        describe_media.
+        """
+        if not media_map:
+            return content
+        out_lines: list[str] = []
+        for line in content.splitlines():
+            out_lines.append(line)
+            for rel, desc in media_map.items():
+                if f"[[{rel}]]" in line:
+                    out_lines.append(f"> 🧠 [МЕДИА {rel.rsplit('/', 1)[-1]}]: {desc}")
+                    break
+        return "\n".join(out_lines)
+
+    @staticmethod
     def _split_raw_chunks(
         content: str, max_msgs: int = 8, max_chars: int = 3_000
     ) -> list[str]:
@@ -274,16 +349,19 @@ class Orchestrator:
     async def ingest_raw_file(
         self, date_iso: str, chat_cfg: ChatConfig | None = None
     ) -> str:
-        """Запустить ingest для готового raw/daily/<date>.md.
+        """Ingest целого дня в стиле Karpathy LLM-Wiki.
 
-        Большие дни режутся на чанки (~8 сообщений / ~3KB). Каждый чанк =
-        отдельный agent-run. После успешного чанка summary кэшируется
-        в `.cache/ingest/<date>/chunk-<idx>.txt`, поэтому при retry
-        уже сделанные чанки пропускаются. После всех чанков оркестратор
-        создаёт `wiki/daily/<date>.md` и чистит кэш.
-
-        Контекст vault (AGENTS.md, index.md) читается ОДИН раз и пробрасывается
-        в user_prompt каждого чанка — агент сам их не открывает.
+        Pipeline:
+          1) Прескан медиа: для каждого `[[raw/assets/<date>/...]]` получаем
+             описание (vision/STT/parse) ОДИН раз и кэшируем на диске.
+          2) Обогащённый контент: описания медиа встраиваются inline сразу
+             после ссылки на файл — агенту не нужно дёргать describe_media.
+          3) Чанкинг по сообщениям; в каждом чанке агент обновляет
+             wiki/entities, wiki/projects, wiki/sources, wiki/concepts,
+             index.md. НИКАКОЙ дайджест-страницы wiki/daily/<date>.md
+             не создаётся (Karpathy: wiki — это entity/concept/source pages,
+             не пер-дневные саммари).
+          4) Маркер «день обработан» = строка в log.md `ingest-day | <date>`.
         """
         cfg = chat_cfg or settings.get_chats()[0]
         wiki = _chat_wiki(cfg)
@@ -293,9 +371,8 @@ class Orchestrator:
         content = raw_file.read_text(encoding="utf-8")
         n_msgs = content.count("\n---\n> **")
         rel = f"raw/daily/{date_iso}.md"
-        chunks = self._split_raw_chunks(content)
 
-        # B: один раз читаем «головной» контекст vault и встраиваем в каждый чанк.
+        # Один раз читаем «головной» контекст vault и встраиваем в каждый чанк.
         def _read_or(p: Path, cap: int) -> str:
             try:
                 t = p.read_text(encoding="utf-8")
@@ -312,40 +389,39 @@ class Orchestrator:
             + "\n\n=== wiki/projects/_template.md ===\n" + template_md
         )
 
-        # C: кэш частичного прогресса.
-        cache_dir = wiki.root / ".cache" / "ingest" / date_iso
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        executor = self._make_executor(wiki, cfg)
+
+        # 1+2: Прескан медиа и встраивание описаний в текст.
+        media_refs = self._extract_media_refs(content, date_iso)
+        log.info(
+            "ingest_raw_file: %s — %d msgs, %d media refs to pre-analyze",
+            date_iso, n_msgs, len(media_refs),
+        )
+        media_map = await self._preanalyze_media(media_refs, wiki, executor)
+        enriched = self._enrich_with_media(content, media_map)
+
+        # 3: Чанкуем обогащённый контент. Лимит чуть больше т.к. встроены описания.
+        chunks = self._split_raw_chunks(enriched, max_msgs=8, max_chars=4_500)
 
         log.info(
-            "ingest_raw_file: %s — %d msgs, split into %d chunk(s)",
-            date_iso, n_msgs, len(chunks),
+            "ingest_raw_file: %s — split into %d chunk(s), %d media described",
+            date_iso, len(chunks), len(media_map),
         )
-        executor = self._make_executor(wiki, cfg)
-        chunk_summaries: list[str] = []
         total_steps = 0
         try:
             for idx, chunk in enumerate(chunks, 1):
-                cache_file = cache_dir / f"chunk-{idx:03d}.txt"
-                if cache_file.exists():
-                    cached = cache_file.read_text(encoding="utf-8")
-                    log.info(
-                        "ingest_raw_file: %s chunk %d/%d — using cached summary (%d chars)",
-                        date_iso, idx, len(chunks), len(cached),
-                    )
-                    chunk_summaries.append(
-                        f"### Чанк {idx}/{len(chunks)} (кэш)\n{cached}"
-                    )
-                    continue
-
                 user_prompt = (
                     f"Ingest чанка {idx}/{len(chunks)} файла `{rel}` "
                     f"(дата {date_iso}, чат {cfg.name}). "
                     f"Содержимое чанка приведено НИЖЕ — НЕ читай весь raw-файл, "
-                    f"работай с этим текстом. После анализа обнови соответствующие "
-                    f"страницы в wiki/entities/, wiki/projects/, wiki/sources/, "
-                    f"index.md по правилам AGENTS.md. НЕ создавай wiki/daily/{date_iso}.md "
-                    f"— это сделает оркестратор после всех чанков. В finish() дай "
-                    f"короткую сводку: что нового добавил/обновил.\n\n"
+                    f"работай с этим текстом. ВСЕ медиа уже описаны inline "
+                    f"(строки `> 🧠 [МЕДИА ...]:`) — НЕ вызывай describe_media. "
+                    f"Обнови соответствующие страницы в wiki/entities/, "
+                    f"wiki/projects/, wiki/sources/, wiki/concepts/, index.md "
+                    f"по правилам AGENTS.md. НЕ создавай wiki/daily/{date_iso}.md "
+                    f"— дневные саммари в архитектуре не нужны (маркер ставит "
+                    f"оркестратор в log.md). В finish() дай короткую сводку: "
+                    f"что нового добавил/обновил.\n\n"
                     f"--- КОНТЕКСТ VAULT (НЕ ЧИТАЙ ЭТИ ФАЙЛЫ ЧЕРЕЗ read_file) ---\n"
                     f"{head_ctx}\n"
                     f"--- КОНЕЦ КОНТЕКСТА ---\n\n"
@@ -364,39 +440,19 @@ class Orchestrator:
                         "ingest_raw_file: chunk %d/%d for %s did not finish",
                         idx, len(chunks), date_iso,
                     )
-                summary = run.summary or "(пусто)"
-                cache_file.write_text(summary, encoding="utf-8")
-                chunk_summaries.append(
-                    f"### Чанк {idx}/{len(chunks)}\n{summary}"
-                )
-            # Все чанки прошли — создаём wiki/daily/<date>.md как маркер обработки.
-            digest_path = f"wiki/daily/{date_iso}.md"
-            digest_body = (
-                f"---\ntype: daily\ncreated: {date_iso}\nupdated: {date_iso}\n"
-                f"sources: {n_msgs}\ntags: [daily, digest]\n---\n\n"
-                f"# Дайджест: {date_iso}\n\n"
-                f"**Источник:** `{rel}` ({n_msgs} сообщений, {len(chunks)} чанк(ов)).\n\n"
-                + "\n\n".join(chunk_summaries)
-                + "\n"
-            )
-            wiki.write_file(digest_path, digest_body)
-            # Чистим кэш частичного прогресса — день закрыт.
-            try:
-                for f in cache_dir.glob("chunk-*.txt"):
-                    f.unlink()
-                cache_dir.rmdir()
-            except OSError:
-                pass
+            # 4: Маркер обработки — запись в log.md.
             self._append_log(
                 wiki,
-                f"ingest-file | {date_iso} | {n_msgs} сообщений | "
-                f"{len(chunks)} чанк(ов) | {total_steps} шагов | ok",
+                f"ingest-day | {date_iso} | {n_msgs} msgs | "
+                f"{len(media_map)} media | {len(chunks)} chunks | "
+                f"{total_steps} steps | ok",
             )
             if settings.git_autocommit:
-                commit_and_push(f"ingest-file {cfg.name} {date_iso}")
+                commit_and_push(f"ingest-day {cfg.name} {date_iso}")
             return (
-                f"Ingest {date_iso} завершён: {n_msgs} сообщений в "
-                f"{len(chunks)} чанк(ов), {total_steps} шагов."
+                f"Ingest {date_iso} завершён: {n_msgs} сообщений, "
+                f"{len(media_map)} медиа, {len(chunks)} чанк(ов), "
+                f"{total_steps} шагов."
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("ingest_raw_file failed")
@@ -408,32 +464,47 @@ class Orchestrator:
     ) -> str:
         """Инжестировать первые N не-обработанных raw/daily/*.md файлов.
 
-        «Обработанный» — рядом с ним существует wiki/daily/<date>.md.
+        «Обработанный» определяется по двум критериям (любой):
+          * в log.md есть строка `ingest-day | <date> |` (новый маркер);
+          * существует wiki/daily/<date>.md (legacy: ранее писали дайджесты).
         """
+        import re
         cfg = chat_cfg or settings.get_chats()[0]
         wiki = _chat_wiki(cfg)
         raw_dir = wiki.root / "raw" / "daily"
         wiki_dir = wiki.root / "wiki" / "daily"
+        log_file = wiki.root / "log.md"
         if not raw_dir.exists():
             return "Нет raw/daily/ директории."
+        log_text = ""
+        if log_file.exists():
+            try:
+                log_text = log_file.read_text(encoding="utf-8")
+            except OSError:
+                log_text = ""
+        done_in_log: set[str] = set(
+            re.findall(r"ingest-day \| (\d{4}-\d{2}-\d{2}) \|", log_text)
+        )
         all_dates = sorted(p.stem for p in raw_dir.glob("*.md"))
-        pending = [d for d in all_dates if not (wiki_dir / f"{d}.md").exists()]
+        pending = [
+            d for d in all_dates
+            if d not in done_in_log and not (wiki_dir / f"{d}.md").exists()
+        ]
         if not pending:
-            return "Все raw/daily/*.md уже обработаны — wiki/daily/ актуальна."
+            return "Все raw/daily/*.md уже обработаны (см. log.md)."
         batch = pending[:limit]
         results: list[str] = []
         for date_iso in batch:
-            # До 3 попыток на день: при сетевом disconnect от DeepSeek первая
-            # часто рвётся, но повтор обычно проходит. Если день успешно
-            # заинжещен — wiki/daily/<date>.md появится и при следующем
-            # /ingest-files мы его уже не подхватим.
             res = ""
             for attempt in range(1, 4):
                 log.info("ingest_raw_pending: %s (attempt %d/3)", date_iso, attempt)
                 res = await self.ingest_raw_file(date_iso, cfg)
                 if not res.startswith("Ошибка ingest"):
                     break
-                log.warning("ingest_raw_pending: %s attempt %d failed: %s", date_iso, attempt, res[:200])
+                log.warning(
+                    "ingest_raw_pending: %s attempt %d failed: %s",
+                    date_iso, attempt, res[:200],
+                )
                 await asyncio.sleep(2 ** attempt)  # 2s, 4s, 8s
             results.append(f"**{date_iso}**: {res[:120]}")
         remaining = len(pending) - len(batch)
@@ -459,21 +530,99 @@ class Orchestrator:
 
     # --- LINT ---
 
-    async def lint(self, chat_cfg: ChatConfig | None = None) -> str:
-        cfg = chat_cfg or settings.get_chats()[0]
-        wiki = _chat_wiki(cfg)
+    # Допустимые scope'ы для /lint. Сопоставление: scope → относительная папка.
+    LINT_SCOPES: dict[str, str] = {
+        # concepts/*
+        "audio-voice": "wiki/concepts/audio-voice",
+        "chassis": "wiki/concepts/chassis",
+        "drive": "wiki/concepts/drive",
+        "electronics": "wiki/concepts/electronics",
+        "manufacturing": "wiki/concepts/manufacturing",
+        "military": "wiki/concepts/military",
+        "misc": "wiki/concepts/misc",
+        "platforms": "wiki/concepts/platforms",
+        "sensors": "wiki/concepts/sensors",
+        "software": "wiki/concepts/software",
+        # entities/*
+        "companies": "wiki/entities/companies",
+        "orgs": "wiki/entities/orgs",
+        "people": "wiki/entities/people",
+        # flat
+        "projects": "wiki/projects",
+        "sources": "wiki/sources",
+    }
+
+    async def _lint_scope(
+        self,
+        wiki: Wiki,
+        cfg: ChatConfig,
+        scope: str,
+        rel_dir: str,
+    ) -> str:
+        """Прогон lint-агента по одному скоупу. Возвращает короткий отчёт."""
         executor = self._make_executor(wiki, cfg)
+        prompt = (
+            f"Скоуп: `{rel_dir}/`.\n"
+            f"Сделай health-check ТОЛЬКО файлов из этой папки. "
+            f"Верни короткий отчёт по правилам из system-prompt."
+        )
         run = await run_agent(
             client=self.client,
             executor=executor,
             system_prompt=LINT_SYSTEM,
-            user_prompt="Сделай health-check вики. Верни отчёт.",
-            max_steps=20,
+            user_prompt=prompt,
+            max_steps=25,
         )
-        self._append_log(wiki, f"lint | {run.steps} шагов")
+        body = (run.summary or "").strip() or "(пусто)"
+        return f"### {scope} ({run.steps} шагов)\n{body}"
+
+    async def lint(
+        self,
+        chat_cfg: ChatConfig | None = None,
+        scope: str | None = None,
+    ) -> str:
+        """Health-check вики.
+
+        - `scope=None` или `"all"` — последовательно по всем доменам.
+        - `scope="<domain>"` — только указанный домен (см. `LINT_SCOPES`).
+        """
+        cfg = chat_cfg or settings.get_chats()[0]
+        wiki = _chat_wiki(cfg)
+
+        scope_norm = (scope or "all").strip().lower()
+        if scope_norm in ("", "all"):
+            targets = list(self.LINT_SCOPES.items())
+        elif scope_norm in self.LINT_SCOPES:
+            targets = [(scope_norm, self.LINT_SCOPES[scope_norm])]
+        else:
+            available = ", ".join(sorted(self.LINT_SCOPES))
+            return (
+                f"⚠️ Неизвестный scope `{scope_norm}`.\n"
+                f"Доступны: {available}, или `all`."
+            )
+
+        total_steps = 0
+        parts: list[str] = []
+        for name, rel_dir in targets:
+            try:
+                report = await self._lint_scope(wiki, cfg, name, rel_dir)
+                parts.append(report)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("lint scope %s failed", name)
+                parts.append(f"### {name}\n❌ упал: {type(exc).__name__}: {exc}")
+            # Грубая оценка шагов для лога: парсим '(N шагов)' из отчёта.
+            try:
+                last = parts[-1].splitlines()[0]
+                if "шагов)" in last:
+                    n = int(last.split("(")[1].split(" ")[0])
+                    total_steps += n
+            except Exception:  # noqa: BLE001
+                pass
+
+        self._append_log(wiki, f"lint scope={scope_norm} | ~{total_steps} шагов")
         if settings.git_autocommit:
-            commit_and_push(f"lint {cfg.name}")
-        return run.summary or "Lint завершён."
+            commit_and_push(f"lint {cfg.name} scope={scope_norm}")
+        return "\n\n".join(parts) or "Lint завершён."
 
     # --- TRIZ ---
 

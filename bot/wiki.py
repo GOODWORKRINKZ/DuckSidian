@@ -54,7 +54,39 @@ class Wiki:
 
     # ----- read / write -----
 
+    def find_md(self, rel: str) -> str:
+        """Если файл существует по точному rel — вернуть rel.
+        Иначе, если rel вида 'wiki/<area>/<name>.md' и под wiki/<area>/
+        есть РОВНО один файл с тем же basename (в любом подкаталоге-домене),
+        вернуть его реальный rel-путь. Иначе вернуть исходный rel (как есть).
+
+        Это нужно чтобы агент мог обращаться к 'wiki/concepts/X.md' даже
+        после того как файл переехал в 'wiki/concepts/<domain>/X.md'.
+        """
+        rel = (rel or "").strip().lstrip("/")
+        if not rel.endswith(".md"):
+            return rel
+        try:
+            target = self.resolve(rel)
+        except WikiPathError:
+            return rel
+        if target.is_file():
+            return rel
+        parts = rel.split("/")
+        if len(parts) < 3 or parts[0] != "wiki":
+            return rel
+        area = parts[1]  # concepts | entities | sources | projects
+        basename = parts[-1]
+        area_root = self.root / "wiki" / area
+        if not area_root.is_dir():
+            return rel
+        matches = [p for p in area_root.rglob(basename) if p.is_file()]
+        if len(matches) == 1:
+            return str(matches[0].relative_to(self.root)).replace("\\", "/")
+        return rel
+
     def read_file(self, rel: str, max_bytes: int = 200_000) -> str:
+        rel = self.find_md(rel)
         p = self.resolve(rel)
         if not p.is_file():
             raise WikiPathError(f"not a file: {rel}")
@@ -88,12 +120,23 @@ class Wiki:
             out.append(rel_path + ("/" if child.is_dir() else ""))
         return out
 
-    def search(self, query: str, max_hits: int = 20) -> list[dict]:
-        """Простой grep: подстрока, без regex, кейс-инсенситив."""
+    def search(
+        self,
+        query: str,
+        max_hits: int = 20,
+        context: int = 2,
+    ) -> list[dict]:
+        """Подстрочный поиск с N строк контекста до/после.
+
+        Каждый hit: {path, line, text, before: [...], after: [...]}.
+        Контекст помогает LLM-агенту самому отсеять false-positive
+        (например, query='СОРИК' и матч на 'Сенсорика' внутри слова).
+        """
         if not query.strip():
             return []
         q = query.lower()
         hits: list[dict] = []
+        ctx = max(0, int(context))
         for md in self.root.rglob("*.md"):
             try:
                 rel = str(md.relative_to(self.root)).replace("\\", "/")
@@ -103,9 +146,26 @@ class Wiki:
                 text = md.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            for i, line in enumerate(text.splitlines(), start=1):
+            lines = text.splitlines()
+            for i, line in enumerate(lines, start=1):
                 if q in line.lower():
-                    hits.append({"path": rel, "line": i, "text": line.strip()})
+                    before = [
+                        lines[j].strip()
+                        for j in range(max(0, i - 1 - ctx), i - 1)
+                    ]
+                    after = [
+                        lines[j].strip()
+                        for j in range(i, min(len(lines), i + ctx))
+                    ]
+                    hits.append(
+                        {
+                            "path": rel,
+                            "line": i,
+                            "text": line.strip(),
+                            "before": before,
+                            "after": after,
+                        }
+                    )
                     if len(hits) >= max_hits:
                         return hits
         return hits

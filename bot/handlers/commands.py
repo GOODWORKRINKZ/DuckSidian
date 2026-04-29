@@ -374,12 +374,19 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             log.debug("ingest-files: failed to delete status message: %s", exc)
 
     @router.message(Command("lint"))
-    async def cmd_lint(msg: Message) -> None:
+    async def cmd_lint(msg: Message, command: CommandObject) -> None:
         if not _is_admin(msg.from_user.id if msg.from_user else None):
             await msg.reply("⛔ только для админов")
             return
-        await msg.reply("⏳ lint…")
-        out = await orch.lint()
+        scope = (command.args or "").strip() or None
+        label = scope or "all"
+        await msg.reply(f"⏳ lint scope={label}…")
+        try:
+            out = await orch.lint(scope=scope)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("lint failed")
+            await msg.reply(f"❌ lint упал: {type(exc).__name__}: {exc}")
+            return
         await _reply_html(msg, "🩺 " + out)
 
     @router.message(Command("pause"))

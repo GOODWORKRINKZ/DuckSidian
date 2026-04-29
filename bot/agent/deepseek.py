@@ -15,11 +15,17 @@ log = logging.getLogger(__name__)
 
 class DeepSeekClient:
     def __init__(self, api_key: str | None = None, base_url: str | None = None,
-                 model: str | None = None, timeout: float = 120.0):
+                 model: str | None = None, timeout: float | None = None):
         self.api_key = api_key or settings.deepseek_api_key
         self.base_url = (base_url or settings.deepseek_base_url).rstrip("/")
         self.model = model or settings.deepseek_model
-        self._client = httpx.AsyncClient(timeout=timeout)
+        # connect — быстрый (ловим DNS/network), read — долгий
+        # (DeepSeek-chat иногда думает >2 минут на tool-calling).
+        if timeout is None:
+            tmo = httpx.Timeout(connect=15.0, read=300.0, write=30.0, pool=10.0)
+        else:
+            tmo = httpx.Timeout(timeout)
+        self._client = httpx.AsyncClient(timeout=tmo)
 
     async def aclose(self) -> None:
         await self._client.aclose()

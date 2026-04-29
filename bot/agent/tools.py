@@ -31,6 +31,45 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "read_lines",
+            "description": (
+                "Прочитать диапазон строк файла (экономит контекст на больших файлах). "
+                "start и end — 1-based, включительные. Если end=0 — до конца."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer", "default": 0},
+                },
+                "required": ["path", "start"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep_file",
+            "description": (
+                "Поиск по regex внутри одного файла. Возвращает список совпавших строк "
+                "в формате 'NNN: текст'. context — количество строк вокруг каждого матча."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "pattern": {"type": "string"},
+                    "context": {"type": "integer", "default": 2},
+                    "max_matches": {"type": "integer", "default": 30},
+                },
+                "required": ["path", "pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_dir",
             "description": "Список файлов и папок относительно корня vault'а.",
             "parameters": {
@@ -43,10 +82,20 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "search_wiki",
-            "description": "Подстроковый поиск по всем .md в vault.",
+            "description": (
+                "Подстроковый поиск по всем .md в vault. Возвращает JSON-массив "
+                "hit'ов c полями path, line, text + before/after — по 'context' "
+                "строк контекста до и после. Используй контекст, чтобы самому "
+                "отсеять false-positive: например, query='СОРИК' может "
+                "совпасть со словом 'сенСОРИКа' — тогда смотри before/after и "
+                "игнорируй. Регистронезависимо, без regex."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"query": {"type": "string"}},
+                "properties": {
+                    "query": {"type": "string"},
+                    "context": {"type": "integer", "default": 2},
+                },
                 "required": ["query"],
             },
         },
@@ -81,6 +130,26 @@ TOOL_SCHEMAS: list[dict] = [
                     "content": {"type": "string"},
                 },
                 "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Точечный str-replace в файле: заменить old_string на new_string. "
+                "old_string должен встречаться РОВНО ОДИН раз. Идеально для правки frontmatter "
+                "(updated/sources/tags) или патчинга строки без регенерации всего файла."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                },
+                "required": ["path", "old_string", "new_string"],
             },
         },
     },
@@ -190,19 +259,104 @@ class ToolExecutor:
     """Исполняет вызовы инструментов от LLM. Сохраняет write-режим: агент
     не может писать в raw/."""
 
-    def __init__(self, wiki: Wiki, ask_user: AskUserFn, deepseek_client: Any = None):
+    def __init__(self, wiki: Wiki, ask_user: AskUserFn, deepseek_client: Any = None,
+                 file_cache: dict[str, str] | None = None):
         self.wiki = wiki
         self.ask_user = ask_user
         self._ds = deepseek_client
+        # Кэш содержимого файлов в рамках run_agent (или прокинутый снаружи —
+        # тогда живёт между несколькими run_agent одного дня). Ключ — rel path.
+        self._fcache: dict[str, str] = file_cache if file_cache is not None else {}
 
     async def call(self, name: str, arguments: dict[str, Any]) -> str:
         try:
             if name == "read_file":
-                return self.wiki.read_file(arguments["path"])
+                path = arguments["path"]
+                # Хардкод-защита: log.md растёт без предела, читать его при ingest бессмысленно.
+                if path in ("log.md", "/log.md") or path.endswith("/log.md"):
+                    return (
+                        "[log.md полностью не читается: файл огромный. "
+                        "Используй grep_file('log.md', '<pattern>') для поиска "
+                        "или read_lines('log.md', start, end) для куска. "
+                        "Для записи новой строки используй append_file('log.md', ...).]"
+                    )
+                if path in self._fcache:
+                    log.info("read_file %s -> cache hit (%d chars)", path, len(self._fcache[path]))
+                    return self._fcache[path] + "\n\n[cached: этот файл уже был прочитан/записан ранее в этом ране; не читай его снова]"
+                content = self.wiki.read_file(path)
+                self._fcache[path] = content
+                return content
+            if name == "read_lines":
+                path = self.wiki.find_md(arguments["path"])
+                start = max(1, int(arguments.get("start", 1)))
+                end = int(arguments.get("end", 0))
+                if path in self._fcache:
+                    text = self._fcache[path]
+                else:
+                    if path in ("log.md", "/log.md") or path.endswith("/log.md"):
+                        # Специальный случай: log.md по диапазону МОЖНО читать, это разумно.
+                        text = self.wiki.read_file(path, max_bytes=2_000_000)
+                    else:
+                        text = self.wiki.read_file(path)
+                        self._fcache[path] = text
+                lines = text.splitlines()
+                if end <= 0 or end > len(lines):
+                    end = len(lines)
+                if start > len(lines):
+                    return f"[файл всего {len(lines)} строк, start={start} вне диапазона]"
+                slc = lines[start - 1:end]
+                numbered = "\n".join(f"{i:>5}: {ln}" for i, ln in enumerate(slc, start))
+                return f"[{path} строки {start}–{end} из {len(lines)}]\n{numbered}"
+            if name == "grep_file":
+                import re as _re
+                path = self.wiki.find_md(arguments["path"])
+                pattern = arguments["pattern"]
+                ctx = max(0, int(arguments.get("context", 2)))
+                limit = max(1, int(arguments.get("max_matches", 30)))
+                if path in self._fcache:
+                    text = self._fcache[path]
+                else:
+                    if path in ("log.md", "/log.md") or path.endswith("/log.md"):
+                        text = self.wiki.read_file(path, max_bytes=2_000_000)
+                    else:
+                        text = self.wiki.read_file(path)
+                        self._fcache[path] = text
+                try:
+                    rx = _re.compile(pattern, _re.IGNORECASE | _re.MULTILINE)
+                except _re.error as exc:
+                    return f"ERROR: неверный regex: {exc}"
+                lines = text.splitlines()
+                hits: list[int] = [i for i, ln in enumerate(lines) if rx.search(ln)]
+                if not hits:
+                    return f"[нет совпадений для /{pattern}/ в {path}]"
+                truncated = len(hits) > limit
+                hits = hits[:limit]
+                # Объединяем окна контекста
+                ranges: list[tuple[int, int]] = []
+                for h in hits:
+                    a = max(0, h - ctx)
+                    b = min(len(lines) - 1, h + ctx)
+                    if ranges and a <= ranges[-1][1] + 1:
+                        ranges[-1] = (ranges[-1][0], max(ranges[-1][1], b))
+                    else:
+                        ranges.append((a, b))
+                blocks = []
+                for a, b in ranges:
+                    block = "\n".join(f"{i + 1:>5}: {lines[i]}" for i in range(a, b + 1))
+                    blocks.append(block)
+                tail = f"\n[срезано до {limit} матчей]" if truncated else ""
+                return (
+                    f"[grep /{pattern}/ в {path}: {len(hits)} матчей, "
+                    f"файл {len(lines)} строк]\n"
+                    + "\n---\n".join(blocks) + tail
+                )
             if name == "list_dir":
                 return "\n".join(self.wiki.list_dir(arguments.get("path", "")))
             if name == "search_wiki":
-                hits = self.wiki.search(arguments["query"])
+                hits = self.wiki.search(
+                    arguments["query"],
+                    context=int(arguments.get("context", 2)),
+                )
                 return json.dumps(hits, ensure_ascii=False, indent=2)
             if name == "write_file":
                 path = arguments.get("path") or arguments.get("filename") or arguments.get("file_path") or arguments.get("filepath")
@@ -210,7 +364,11 @@ class ToolExecutor:
                     return "ERROR: missing 'path' argument"
                 if path.startswith("raw/"):
                     return "ERROR: raw/ is read-only for the agent"
-                rel = self.wiki.write_file(path, arguments["content"])
+                content = arguments["content"]
+                rel = self.wiki.write_file(path, content)
+                # Актуализируем кэш под реальным rel-path и по исходному.
+                self._fcache[rel] = content
+                self._fcache[path] = content
                 return f"OK: wrote {rel}"
             if name == "append_file":
                 path = arguments.get("path") or arguments.get("filename") or arguments.get("file_path") or arguments.get("filepath")
@@ -218,8 +376,51 @@ class ToolExecutor:
                     return "ERROR: missing 'path' argument"
                 if path.startswith("raw/"):
                     return "ERROR: raw/ is read-only for the agent"
-                rel = self.wiki.append_file(path, arguments["content"])
+                path = self.wiki.find_md(path)
+                addition = arguments["content"]
+                rel = self.wiki.append_file(path, addition)
+                # Обновляем кэш: если был — добавим, иначе прочитаем разово с диска.
+                if rel in self._fcache:
+                    self._fcache[rel] = self._fcache[rel] + addition
+                else:
+                    try:
+                        self._fcache[rel] = self.wiki.read_file(rel)
+                    except Exception:
+                        pass
+                self._fcache[path] = self._fcache.get(rel, "")
                 return f"OK: appended {rel}"
+            if name == "edit_file":
+                path = arguments.get("path") or arguments.get("file_path")
+                old_s = arguments.get("old_string", "")
+                new_s = arguments.get("new_string", "")
+                if not path or not old_s:
+                    return "ERROR: missing 'path' or 'old_string'"
+                if path.startswith("raw/"):
+                    return "ERROR: raw/ is read-only for the agent"
+                path = self.wiki.find_md(path)
+                # Берём из кэша или с диска
+                current = self._fcache.get(path)
+                if current is None:
+                    try:
+                        current = self.wiki.read_file(path)
+                    except WikiPathError as exc:
+                        return f"ERROR: {exc}"
+                cnt = current.count(old_s)
+                if cnt == 0:
+                    return (
+                        "ERROR: old_string не найден в файле. "
+                        "Проверь точное совпадение (пробелы/переносы) или используй read_lines."
+                    )
+                if cnt > 1:
+                    return (
+                        f"ERROR: old_string встречается {cnt} раз. "
+                        "Добавь контекст (соседние строки), чтобы old_string был уникален."
+                    )
+                updated = current.replace(old_s, new_s, 1)
+                rel = self.wiki.write_file(path, updated)
+                self._fcache[rel] = updated
+                self._fcache[path] = updated
+                return f"OK: edited {rel} (замена {len(old_s)} → {len(new_s)} симв.)"
             if name == "ask_user":
                 opts = arguments.get("options") or None
                 ans = await self.ask_user(arguments["question"], opts)
