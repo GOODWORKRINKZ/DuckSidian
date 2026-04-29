@@ -61,6 +61,7 @@ HELP_TEXT = (
     "<b>DuckSidian — команды</b>\n\n"
     "/ask &lt;вопрос&gt; — спросить wiki\n"
     "/triz [проблема] — ТРИЗ-разбор и идеи по обсуждениям\n"
+    "/projects — список проектов в вики\n"
     "/search &lt;строка&gt; — поиск по vault\n"
     "/summary day|week — сводка\n"
     "/log — последние записи log.md\n"
@@ -161,6 +162,30 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             await msg.reply("⚠️ Ошибка ТРИЗ-агента.")
             return
         await _reply_html(msg, out or "(пусто)")
+
+    @router.message(Command("projects"))
+    async def cmd_projects(msg: Message) -> None:
+        cfg = _chat_for_msg(msg) or settings.get_chats()[0]
+        items = orch.list_projects(cfg)
+        if not items:
+            await msg.reply(
+                "Пока ни одного проекта не опознано. "
+                "Запусти /ingest — агент заведёт страницы в wiki/projects/."
+            )
+            return
+        emoji = {"active": "🟢", "paused": "🟡", "done": "✅", "archive": "📁"}
+        lines = [f"<b>Проекты [{cfg.name}]:</b>"]
+        for it in items:
+            mark = emoji.get(it["status"], "⚪️")
+            upd = f" <i>upd {it['updated']}</i>" if it["updated"] else ""
+            src = f" · src={it['sources']}" if it["sources"] not in ("", "0") else ""
+            from html import escape as _esc
+            summary = _esc(it["summary"]) if it["summary"] else ""
+            lines.append(
+                f"{mark} <b>{_esc(it['name'])}</b>{upd}{src}\n {summary}"
+            )
+        text = "\n\n".join(lines)
+        await msg.reply(text[:4000], parse_mode="HTML")
 
     @router.message(Command("note"))
     async def cmd_note(msg: Message, command: CommandObject) -> None:

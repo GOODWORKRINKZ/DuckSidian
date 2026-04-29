@@ -345,6 +345,8 @@ class Orchestrator:
         return run.summary or "Lint завершён."
 
     # --- TRIZ ---
+
+    async def triz(
         self, problem: str, chat_cfg: ChatConfig | None = None
     ) -> str:
         """ТРИЗ-разбор проблемы из чата (read-only, ответ в чат)."""
@@ -365,6 +367,54 @@ class Orchestrator:
             max_steps=20,
         )
         return run.summary or "ТРИЗ-разбор не получился."
+
+    # --- PROJECTS ---
+
+    def list_projects(self, chat_cfg: ChatConfig | None = None) -> list[dict[str, Any]]:
+        """Список страниц wiki/projects/ с парсингом frontmatter.
+
+        Возвращает [{name, status, updated, sources, summary}], отсортированный
+        по updated убыв. Шаблон `_template.md` исключается.
+        """
+        cfg = chat_cfg or settings.get_chats()[0]
+        wiki = _chat_wiki(cfg)
+        pdir = wiki.root / "wiki" / "projects"
+        out: list[dict[str, Any]] = []
+        if not pdir.exists():
+            return out
+        for p in sorted(pdir.glob("*.md")):
+            if p.name.startswith("_"):
+                continue
+            try:
+                text = p.read_text(encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                continue
+            fm: dict[str, str] = {}
+            if text.startswith("---\n"):
+                end = text.find("\n---", 4)
+                if end > 0:
+                    for line in text[4:end].splitlines():
+                        if ":" in line:
+                            k, _, v = line.partition(":")
+                            fm[k.strip()] = v.strip().strip('"').strip("'")
+            # первая непустая строка после заголовка — однострочное описание
+            summary = ""
+            body = text[text.find("\n---", 4) + 4 :] if text.startswith("---\n") else text
+            for line in body.splitlines():
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                summary = s[:120]
+                break
+            out.append({
+                "name": p.stem,
+                "status": fm.get("status", "?"),
+                "updated": fm.get("updated", ""),
+                "sources": fm.get("sources", "0"),
+                "summary": summary,
+            })
+        out.sort(key=lambda x: x["updated"], reverse=True)
+        return out
 
     # --- SUMMARY ---
 
