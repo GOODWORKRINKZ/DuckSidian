@@ -97,7 +97,7 @@ async def run_agent(
     user_prompt: str,
     max_steps: int = 30,
     tool_result_cap: int = 12_000,
-    ctx_char_budget: int = 60_000,
+    ctx_char_budget: int = 400_000,
 ) -> AgentRun:
     """Один прогон агента до вызова finish() или исчерпания шагов."""
 
