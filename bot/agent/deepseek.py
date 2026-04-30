@@ -78,7 +78,7 @@ class DeepSeekClient:
         url = f"{self.base_url}/v1/chat/completions"
         _RETRYABLE = (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadTimeout,
                       httpx.ConnectTimeout, httpx.NetworkError, httpx.WriteError)
-        max_attempts = 5
+        max_attempts = 10
         for attempt in range(max_attempts):
             try:
                 resp = await self._client.post(
@@ -95,7 +95,7 @@ class DeepSeekClient:
                     log.error("DeepSeek request failed after %d attempts: %s: %r",
                               max_attempts, type(exc).__name__, exc)
                     raise
-                wait = min(2 ** attempt, 8)
+                wait = 1 + (attempt % 5)  # 1..5s, без экспоненты — не душим бота
                 log.warning("DeepSeek transient error (attempt %d/%d): %s: %r — retry in %ds",
                             attempt + 1, max_attempts, type(exc).__name__, exc, wait)
                 await asyncio.sleep(wait)

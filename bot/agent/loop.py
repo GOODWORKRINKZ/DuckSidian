@@ -113,12 +113,9 @@ async def run_agent(
         ctx_chars = _ctx_chars(messages)
         if ctx_chars > ctx_char_budget:
             log.warning(
-                "agent step %d: ctx %d > budget %d, asking LLM to compress old tool outputs",
+                "agent step %d: ctx %d > budget %d (compression disabled)",
                 step, ctx_chars, ctx_char_budget,
             )
-            if await _compress_old_tool_results(client, messages):
-                ctx_chars = _ctx_chars(messages)
-                log.info("agent step %d: compressed, ctx now %d", step, ctx_chars)
         log.info("agent step %d: ctx_msgs=%d ctx_chars=%d", step, len(messages), ctx_chars)
         # На предпоследнем и последнем шаге форсируем finish, чтобы не выйти
         # из цикла с пустым summary.
@@ -141,18 +138,40 @@ async def run_agent(
             break
 
         # Сохраняем assistant-сообщение как есть (для tool_call_id связки).
+        raw_content = msg.get("content") or ""
         assistant_msg: dict[str, Any] = {
             "role": "assistant",
-            "content": msg.get("content") or "",
+            "content": raw_content,
         }
         tool_calls = msg.get("tool_calls") or []
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
 
+        # DeepSeek иногда пишет tool-calls прямо в content как XML-разметку
+        # (с fullwidth || или ASCII ||) вместо структурированного tool_calls.
+        # Детектируем по наличию 'DSML' или '<invoke ' в тексте.
+        _is_dsml = bool(raw_content) and (
+            "DSML" in raw_content or "<invoke " in raw_content
+        )
+        if _is_dsml:
+            log.warning(
+                "agent step %d: DeepSeek returned XML tool-call in content "
+                "(tool_calls=%d), asking to reformat. head=%r",
+                step, len(tool_calls), raw_content[:120],
+            )
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Используй tool_calls API, не пиши XML вручную. "
+                    "Повтори то же действие через tool call."
+                ),
+            })
+            continue
+
         if not tool_calls:
             # Модель решила ответить без tool-call → считаем что закончила.
-            run.summary = msg.get("content") or ""
+            run.summary = raw_content
             run.finished = True
             break
 
