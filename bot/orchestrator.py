@@ -24,6 +24,8 @@ from aiogram.types import (
 from .agent.deepseek import DeepSeekClient
 from .agent.loop import run_agent
 from .agent.prompts import (
+    ENTITY_BUILD_SYSTEM,
+    ENTITY_MERGE_SYSTEM,
     INGEST_SYSTEM,
     LINT_SYSTEM,
     QUERY_SYSTEM,
@@ -276,10 +278,17 @@ class Orchestrator:
             flat = rel.replace("/", "__")
             cache_file = cache_root / f"{flat}.txt"
             if cache_file.exists():
+                log.info("preanalyze_media cache hit: %s", rel)
                 desc = cache_file.read_text(encoding="utf-8")
             else:
+                log.info("preanalyze_media start: %s", rel)
                 try:
-                    desc = await executor._describe_media(rel)
+                    desc = await asyncio.wait_for(
+                        executor._describe_media(rel), timeout=300.0
+                    )
+                except asyncio.TimeoutError:
+                    log.warning("preanalyze_media timeout (>300s): %s", rel)
+                    desc = "[таймаут анализа медиа]"
                 except Exception as exc:  # noqa: BLE001
                     log.warning("preanalyze_media %s failed: %s", rel, exc)
                     desc = f"[ошибка анализа: {exc}]"
@@ -567,6 +576,93 @@ class Orchestrator:
             max_steps=8,
         )
         return run.summary or original_answer
+
+    # --- ENTITY BUILD ---
+
+    async def build_entity(
+        self,
+        entity_name: str,
+        chat_cfg: ChatConfig | None = None,
+    ) -> str:
+        """Собрать/обновить wiki-страницу сущности по всем сырым данным.
+
+        Агент сам ищет упоминания через search_wiki + grep_file, определяет тип
+        (person/project/concept/...) и создаёт или дополняет страницу.
+        """
+        cfg = chat_cfg or settings.get_chats()[0]
+        wiki = _chat_wiki(cfg)
+        executor = self._make_executor(wiki, cfg)
+        today = datetime.now(timezone.utc).date().isoformat()
+        user_prompt = (
+            f"Построй или обнови wiki-страницу сущности **{entity_name}**.\n"
+            f"Дата сегодня: {today}. Чат: {cfg.name}.\n"
+            f"Следуй алгоритму из system-prompt: сначала search_wiki, затем "
+            f"grep по raw-файлам, затем создай/обнови страницу."
+        )
+        try:
+            run = await run_agent(
+                client=self.client,
+                executor=executor,
+                system_prompt=ENTITY_BUILD_SYSTEM,
+                user_prompt=user_prompt,
+                max_steps=20,
+            )
+            status = "ok" if run.finished else "partial"
+            self._append_log(
+                wiki,
+                f"build-entity | {entity_name} | {run.steps} шагов | {status}",
+            )
+            if settings.git_autocommit:
+                commit_and_push(f"build-entity {cfg.name}: {entity_name}")
+            return run.summary or "Готово."
+        except Exception as exc:  # noqa: BLE001
+            log.exception("build_entity failed for %r", entity_name)
+            return f"Ошибка build-entity: {exc}"
+
+    # --- ENTITY MERGE ---
+
+    async def merge_entities(
+        self,
+        canonical: str,
+        alias: str,
+        chat_cfg: ChatConfig | None = None,
+    ) -> str:
+        """Слить страницу псевдонима в каноническую.
+
+        canonical — главное имя/путь, alias — дубль/псевдоним.
+        Агент читает обе страницы, переносит уникальные факты в каноническую,
+        заменяет страницу псевдонима редиректом и обновляет wikilinks.
+        """
+        cfg = chat_cfg or settings.get_chats()[0]
+        wiki = _chat_wiki(cfg)
+        executor = self._make_executor(wiki, cfg)
+        today = datetime.now(timezone.utc).date().isoformat()
+        user_prompt = (
+            f"Слей две сущности в одну:\n"
+            f"- **Каноническая** (сохраняем): `{canonical}`\n"
+            f"- **Псевдоним/дубль** (растворяем): `{alias}`\n\n"
+            f"Дата сегодня: {today}. Чат: {cfg.name}.\n"
+            f"Следуй алгоритму из system-prompt."
+        )
+        try:
+            run = await run_agent(
+                client=self.client,
+                executor=executor,
+                system_prompt=ENTITY_MERGE_SYSTEM,
+                user_prompt=user_prompt,
+                max_steps=15,
+            )
+            status = "ok" if run.finished else "partial"
+            self._append_log(
+                wiki,
+                f"merge-entity | {alias} → {canonical} | {run.steps} шагов | {status}",
+            )
+            if settings.git_autocommit:
+                commit_and_push(f"merge-entity {cfg.name}: {alias} → {canonical}")
+            return run.summary or "Готово."
+        except Exception as exc:  # noqa: BLE001
+            log.exception("merge_entities failed: %r → %r", alias, canonical)
+            return f"Ошибка merge-entity: {exc}"
 
     # --- LINT ---
 

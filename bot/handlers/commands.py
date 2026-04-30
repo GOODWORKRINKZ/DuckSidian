@@ -220,6 +220,8 @@ HELP_TEXT = (
     "/log — последние записи log.md\n"
     "/note &lt;текст&gt; — ручная заметка в raw/notes/\n"
     "/chats — список отслеживаемых чатов\n"
+    "/build &lt;имя&gt; [&lt;chat&gt;] — собрать/обновить страницу сущности из всех raw-данных <i>(admin)</i>\n"
+    "/merge &lt;канонич&gt; | &lt;псевдоним&gt; [&lt;chat&gt;] — слить дубли в одну страницу <i>(admin)</i>\n"
     "/ingest [today|N|&lt;YYYY-MM-DD&gt;] [&lt;chat&gt;] — внеплановый ingest <i>(admin)</i>\n"
     "/lint — health-check <i>(admin)</i>\n"
     "/topic — создать/пересоздать служебный топик <i>(admin)</i>\n"
@@ -464,6 +466,106 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
         tail = "\n".join(lines[-10:]) or "(лог пуст)"
         from html import escape as _esc
         await msg.reply(f"<pre>{_esc(tail)}</pre>", parse_mode="HTML")
+
+    @router.message(Command("build"))
+    async def cmd_build(msg: Message, command: CommandObject) -> None:
+        """/build <имя> [<chat>] — собрать/обновить страницу сущности из всех raw-данных."""
+        if not _is_admin(msg.from_user.id if msg.from_user else None):
+            await msg.reply("⛔ только для админов")
+            return
+        args = (command.args or "").strip()
+        if not args:
+            await msg.reply(
+                "Использование: /build &lt;имя сущности&gt; [chat_name]\n"
+                "Пример: /build БиБа\n"
+                "Пример: /build «Мастер дрон» main",
+                parse_mode="HTML",
+            )
+            return
+        # Разбираем: последний токен — необязательный chat_name (без пробелов)
+        parts = args.rsplit(None, 1)
+        chats = settings.get_chats()
+        chat_name_filter: str | None = None
+        entity_name = args
+        if len(parts) == 2:
+            maybe_chat = parts[1]
+            matched = [c for c in chats if c.name == maybe_chat]
+            if matched:
+                chat_name_filter = maybe_chat
+                entity_name = parts[0]
+                chats = matched
+        if chat_name_filter is None:
+            # берём чат сообщения или первый
+            cfg = _chat_for_msg(msg) or chats[0]
+            chats = [cfg]
+        status_msg = await msg.reply(
+            f"⏳ build-entity <b>{entity_name}</b>…",
+            parse_mode="HTML",
+        )
+        results = []
+        for chat_cfg in chats:
+            out = await orch.build_entity(entity_name, chat_cfg)
+            results.append(f"[{chat_cfg.name}] {out}")
+        await _reply_html(msg, "✅ " + "\n".join(results))
+        try:
+            await status_msg.delete()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("build: failed to delete status message: %s", exc)
+
+    @router.message(Command("merge"))
+    async def cmd_merge(msg: Message, command: CommandObject) -> None:
+        """/merge <каноническая> | <псевдоним> [<chat>]
+
+        Слить дубль/псевдоним в каноническую страницу.
+        Разделитель между именами — символ |.
+        Пример: /merge Мастер-Дрон | Денчик
+        Пример: /merge SIRIUSROVER | Сириус-Ровер main
+        """
+        if not _is_admin(msg.from_user.id if msg.from_user else None):
+            await msg.reply("⛔ только для админов")
+            return
+        args = (command.args or "").strip()
+        if "|" not in args:
+            await msg.reply(
+                "Использование: /merge &lt;каноническая&gt; | &lt;псевдоним&gt; [chat_name]\n"
+                "Пример: /merge Мастер-Дрон | Денчик\n"
+                "Разделитель — символ <code>|</code>",
+                parse_mode="HTML",
+            )
+            return
+        raw_left, raw_right = args.split("|", 1)
+        # Последний токен правой части — необязательный chat_name
+        right_parts = raw_right.strip().rsplit(None, 1)
+        chats = settings.get_chats()
+        chat_name_filter: str | None = None
+        alias = raw_right.strip()
+        if len(right_parts) == 2:
+            maybe_chat = right_parts[1]
+            matched = [c for c in chats if c.name == maybe_chat]
+            if matched:
+                chat_name_filter = maybe_chat
+                alias = right_parts[0].strip()
+                chats = matched
+        canonical = raw_left.strip()
+        if not canonical or not alias:
+            await msg.reply("Укажи оба имени: /merge &lt;каноническая&gt; | &lt;псевдоним&gt;", parse_mode="HTML")
+            return
+        if chat_name_filter is None:
+            cfg = _chat_for_msg(msg) or chats[0]
+            chats = [cfg]
+        status_msg = await msg.reply(
+            f"⏳ merge-entity: <b>{alias}</b> → <b>{canonical}</b>…",
+            parse_mode="HTML",
+        )
+        results = []
+        for chat_cfg in chats:
+            out = await orch.merge_entities(canonical, alias, chat_cfg)
+            results.append(f"[{chat_cfg.name}] {out}")
+        await _reply_html(msg, "✅ " + "\n".join(results))
+        try:
+            await status_msg.delete()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("merge: failed to delete status message: %s", exc)
 
     @router.message(Command("ingest"))
     async def cmd_ingest(msg: Message, command: CommandObject) -> None:

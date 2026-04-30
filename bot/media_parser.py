@@ -144,59 +144,93 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp", ".ts"}
 
 # ── VIDEO: STT + keyframes ────────────────────────────────────────────────────
 
-def _extract_video_audio_sync(video_path: Path, audio_path: Path) -> bool:
+async def _run_ffmpeg(args: list[str], timeout: float = 60.0) -> tuple[int, bytes, bytes]:
+    """Запустить ffmpeg асинхронно с таймаутом; убивает процесс при превышении."""
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,  # отдельная группа — не получает SIGSTOP от job-control
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode or 0, stdout, stderr
+    except asyncio.TimeoutError:
+        log.warning("ffmpeg timeout (%.0fs), killing pid=%s: %s", timeout, proc.pid, args[:4])
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        except Exception:
+            pass
+        return -1, b"", b""
+
+
+_VIDEO_AUDIO_SIZE_LIMIT = 50 * 1024 * 1024  # 50 MB — выше этого STT скипаем
+
+
+async def _extract_video_audio_async(video_path: Path, audio_path: Path) -> bool:
     """Извлечь аудио из видео через ffmpeg в WAV (16 kHz mono)."""
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(video_path),
-             "-vn", "-ar", "16000", "-ac", "1", "-f", "wav", str(audio_path)],
-            capture_output=True, timeout=120,
-        )
-        return result.returncode == 0
-    except Exception as exc:  # noqa: BLE001
-        log.warning("ffmpeg audio extract failed: %s", exc)
+    size = video_path.stat().st_size
+    log.info("video audio extract start: %s (%.1fMB)",
+             video_path.name, size / 1024 / 1024)
+    if size > _VIDEO_AUDIO_SIZE_LIMIT:
+        log.info("video too large for STT (%.1fMB > 50MB), skipping: %s",
+                 size / 1024 / 1024, video_path.name)
         return False
+    rc, _, stderr = await _run_ffmpeg(
+        ["ffmpeg", "-y", "-i", str(video_path),
+         "-vn", "-ar", "16000", "-ac", "1", "-f", "wav", str(audio_path)],
+        timeout=120.0,
+    )
+    if rc != 0:
+        log.info("video audio extract failed rc=%d: %s", rc, stderr[-200:] if stderr else b"")
+    else:
+        sz = audio_path.stat().st_size if audio_path.exists() else 0
+        log.info("video audio extract ok: %s -> %dKB wav", video_path.name, sz // 1024)
+    return rc == 0
 
 
-def _extract_keyframes_sync(video_path: Path, frames_dir: Path, n: int = 4) -> list[Path]:
+async def _extract_keyframes_async(video_path: Path, frames_dir: Path, n: int = 4) -> list[Path]:
     """Извлечь N равномерно распределённых кейфреймов из видео через ffmpeg."""
-    import subprocess
     frames_dir.mkdir(parents=True, exist_ok=True)
+    log.info("keyframe extract start: %s n=%d", video_path.name, n)
+
+    # Получаем длительность
+    rc, stdout, _ = await _run_ffmpeg(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+        timeout=30.0,
+    )
     try:
-        # Получаем длительность
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
-            capture_output=True, text=True, timeout=30,
-        )
-        duration = float(probe.stdout.strip() or "0")
-    except Exception:  # noqa: BLE001
+        duration = float(stdout.decode().strip() or "0") if rc == 0 else 0.0
+    except ValueError:
         duration = 0.0
+    log.info("keyframe extract: %s duration=%.1fs", video_path.name, duration)
 
     frames: list[Path] = []
     if duration <= 0:
-        # Fallback: просто первые N кадров через fps=1/10
         out = frames_dir / "frame%02d.jpg"
-        subprocess.run(
+        await _run_ffmpeg(
             ["ffmpeg", "-y", "-i", str(video_path),
-             "-vf", f"fps=1/10,scale=640:-1", "-frames:v", str(n), str(out)],
-            capture_output=True, timeout=60,
+             "-vf", "fps=1/10,scale=640:-1", "-frames:v", str(n), str(out)],
+            timeout=60.0,
         )
     else:
-        # Равномерно: шаг = duration / (n+1)
         step = duration / (n + 1)
         for i in range(n):
             ts = step * (i + 1)
             out = frames_dir / f"frame_{i:02d}.jpg"
-            r = subprocess.run(
+            rc2, _, _ = await _run_ffmpeg(
                 ["ffmpeg", "-y", "-ss", str(ts), "-i", str(video_path),
                  "-vf", "scale=640:-1", "-frames:v", "1", "-q:v", "3", str(out)],
-                capture_output=True, timeout=30,
+                timeout=30.0,
             )
-            if r.returncode == 0 and out.exists():
+            if rc2 == 0 and out.exists():
                 frames.append(out)
-
+    log.info("keyframe extract done: %s -> %d frames", video_path.name, len(frames))
     return frames
 
 
@@ -206,17 +240,19 @@ async def analyze_video(video_path: Path, describe_image_fn) -> str:
     describe_image_fn — async callable(base64_data: str, mime: str) -> str
     Возвращает итоговое текстовое описание.
     """
-    loop = asyncio.get_running_loop()
     parts: list[str] = []
 
+    log.info("analyze_video start: %s", video_path.name)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
 
         # 1. STT
         audio_path = tmp / "audio.wav"
-        ok = await loop.run_in_executor(None, _extract_video_audio_sync, video_path, audio_path)
+        ok = await _extract_video_audio_async(video_path, audio_path)
         if ok and audio_path.exists():
+            log.info("video STT start: %s", video_path.name)
             transcript = await transcribe_audio(audio_path)
+            log.info("video STT done: %s -> %r", video_path.name, transcript[:80] if transcript else "")
             if transcript and not transcript.startswith("("):
                 parts.append(f"**Аудио (транскрипция):**\n{transcript}")
             else:
@@ -224,16 +260,18 @@ async def analyze_video(video_path: Path, describe_image_fn) -> str:
         else:
             log.info("no audio extracted from video %s", video_path.name)
 
-        # 2. Keyframes → DeepSeek VL
+        # 2. Keyframes → moondream
         frames_dir = tmp / "frames"
-        frames = await loop.run_in_executor(None, _extract_keyframes_sync, video_path, frames_dir, 4)
+        frames = await _extract_keyframes_async(video_path, frames_dir, 4)
         if frames:
             frame_descriptions: list[str] = []
             for i, frame_path in enumerate(frames):
                 try:
+                    log.info("moondream frame %d/%d: %s", i + 1, len(frames), video_path.name)
                     img_bytes = frame_path.read_bytes()
                     b64 = base64.b64encode(img_bytes).decode()
                     desc = await describe_image_fn(b64, "image/jpeg")
+                    log.info("moondream frame %d done: %r", i + 1, desc[:60])
                     frame_descriptions.append(f"Кадр {i + 1}: {desc}")
                 except Exception as exc:  # noqa: BLE001
                     log.warning("frame %d describe failed: %s", i, exc)
