@@ -639,7 +639,7 @@ class ToolExecutor:
                 if not rel or not project:
                     return "ERROR: нужны 'path' и 'project'"
                 # Получить описание из кэша media (если есть) или не гнать снова.
-                media_cache = self.wiki.root / ".cache" / "media" / rel.replace("/", "__") + ".txt"
+                media_cache = self.wiki.root / ".cache" / "media" / (rel.replace("/", "__") + ".txt")
                 cached_desc = ""
                 if media_cache.exists():
                     try:

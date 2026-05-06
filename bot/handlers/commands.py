@@ -6,7 +6,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     CallbackQuery,
@@ -15,6 +15,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
     Message,
+    ReactionTypeEmoji,
 )
 
 from ..config import ChatConfig, settings
@@ -27,6 +28,18 @@ from ..wiki import Wiki
 log = logging.getLogger(__name__)
 
 router = Router(name="commands")
+
+
+async def _react(bot: Bot, msg: Message, emoji: str) -> None:
+    """Поставить реакцию на сообщение; молча игнорировать ошибки."""
+    try:
+        await bot.set_message_reaction(
+            chat_id=msg.chat.id,
+            message_id=msg.message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)],
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("_react %s failed: %s: %s", emoji, type(exc).__name__, exc)
 
 
 # Кэш ответов /ask, ожидающих кнопки "Сохранить".
@@ -270,11 +283,12 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
         await msg.reply("\n".join(lines), parse_mode="HTML")
 
     @router.message(Command("ask"))
-    async def cmd_ask(msg: Message, command: CommandObject) -> None:
+    async def cmd_ask(msg: Message, command: CommandObject, bot: Bot) -> None:
         q = (command.args or "").strip()
         if not q:
             await msg.reply("Использование: /ask <вопрос>")
             return
+        await _react(bot, msg, "👀")
         await msg.chat.do("typing")
         try:
             answer = await orch.query(q)
@@ -325,6 +339,7 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
                     log.warning("ask: send save-button failed: %s", exc)
         except Exception as exc:  # noqa: BLE001
             log.error("query failed: %s", exc)
+            await _react(bot, msg, "❌")
             await msg.reply("⚠️ Ошибка при обращении к DeepSeek, попробуй ещё раз.")
 
     @router.message(Command("search"))
@@ -570,10 +585,11 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             log.debug("merge: failed to delete status message: %s", exc)
 
     @router.message(Command("ingest"))
-    async def cmd_ingest(msg: Message, command: CommandObject) -> None:
+    async def cmd_ingest(msg: Message, command: CommandObject, bot: Bot) -> None:
         if not _is_admin(msg.from_user.id if msg.from_user else None):
             await msg.reply("⛔ только для админов")
             return
+        await _react(bot, msg, "👀")
         args = (command.args or "today").strip().split()
         arg = args[0]
         # Опциональный слаг чата: /ingest today sales
@@ -601,8 +617,8 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             results.append(f"[{chat_cfg.name}] {out}")
         await _reply_html(msg, "✅ " + chr(10).join(results))
 
-    @router.message(Command("ingestfiles"))
-    async def cmd_ingest_files(msg: Message, command: CommandObject) -> None:
+    @router.message(Command("ingestfiles", "ingest_files", "ingest-files"))
+    async def cmd_ingest_files(msg: Message, command: CommandObject, bot: Bot) -> None:
         """Инжест уже готовых raw/daily/*.md (не из БД).
 
         /ingestfiles           — следующие 5 необработанных дней
@@ -612,6 +628,7 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
         if not _is_admin(msg.from_user.id if msg.from_user else None):
             await msg.reply("⛔ только для админов")
             return
+        await _react(bot, msg, "👀")
         args = (command.args or "").strip().split()
         arg = args[0] if args else ""
         chat_name_filter = args[1] if len(args) > 1 else None
