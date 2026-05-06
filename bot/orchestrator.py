@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from dataclasses import dataclass
+
 from aiogram import Bot
 from aiogram.types import (
     InlineKeyboardButton,
@@ -42,6 +44,7 @@ from .topic_manager import ensure_bot_topic
 from .wiki import Wiki
 
 log = logging.getLogger(__name__)
+tokens_log = logging.getLogger("bot.tokens")
 
 
 def _chat_wiki(chat_cfg: ChatConfig) -> Wiki:
@@ -78,6 +81,20 @@ def _chat_wiki(chat_cfg: ChatConfig) -> Wiki:
     return Wiki(root)
 
 
+@dataclass
+class _RunStat:
+    op: str
+    ts: str
+    steps: int
+    tokens_prompt: int
+    tokens_completion: int
+    tokens_cached: int
+
+    @property
+    def tokens_total(self) -> int:
+        return self.tokens_prompt + self.tokens_completion
+
+
 class Orchestrator:
     def __init__(self, bot: Bot, db: DB, wiki: Wiki):
         self.bot = bot
@@ -85,6 +102,10 @@ class Orchestrator:
         self.wiki = wiki  # глобальный wiki (для /ask, /search, /lint, /summary)
         self.client = DeepSeekClient()
         self._waiters: dict[int, asyncio.Future[str]] = {}
+        # Накапливаем статистику токенов с момента старта бота
+        self._run_stats: list[_RunStat] = []
+        # Per-file locks to prevent duplicate concurrent media analysis
+        self._media_locks: dict[str, asyncio.Lock] = {}
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -157,7 +178,63 @@ class Orchestrator:
         async def ask_user_cb(question: str, options: list[str] | None) -> str:
             return await self._ask_user(question, options, chat_cfg)
         return ToolExecutor(wiki, ask_user_cb, deepseek_client=self.client,
-                            file_cache=file_cache)
+                            file_cache=file_cache, db=self.db)
+
+    def _record_run(self, op: str, run: Any) -> None:
+        """Сохранить статистику токенов одного запуска агента."""
+        from .agent.loop import AgentRun
+        if not isinstance(run, AgentRun):
+            return
+        stat = _RunStat(
+            op=op,
+            ts=datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            steps=run.steps,
+            tokens_prompt=run.tokens_prompt,
+            tokens_completion=run.tokens_completion,
+            tokens_cached=run.tokens_cached,
+        )
+        self._run_stats.append(stat)
+        # Держим последние 50 запусков
+        if len(self._run_stats) > 50:
+            self._run_stats = self._run_stats[-50:]
+        # deepseek-v4-flash pricing: $0.07/M input, $0.28/M output, $0.014/M cached
+        run_cost = (
+            (stat.tokens_prompt - stat.tokens_cached) * 0.07
+            + stat.tokens_cached * 0.014
+            + stat.tokens_completion * 0.28
+        ) / 1_000_000
+        total_p = sum(s.tokens_prompt for s in self._run_stats)
+        total_c = sum(s.tokens_completion for s in self._run_stats)
+        total_ca = sum(s.tokens_cached for s in self._run_stats)
+        session_cost = (
+            (total_p - total_ca) * 0.07
+            + total_ca * 0.014
+            + total_c * 0.28
+        ) / 1_000_000
+        prev = self._run_stats[-2] if len(self._run_stats) >= 2 else None
+        delta = f" delta={stat.tokens_total - prev.tokens_total:+d}" if prev else ""
+        tokens_log.info(
+            "run op=%s steps=%d prompt=%d compl=%d cached=%d total=%d%s "
+            "run_cost=$%.5f session_cost=$%.5f session_runs=%d",
+            op, stat.steps,
+            stat.tokens_prompt, stat.tokens_completion, stat.tokens_cached,
+            stat.tokens_total, delta,
+            run_cost, session_cost, len(self._run_stats),
+        )
+
+    def get_token_stats(self) -> dict:
+        """Суммарная статистика токенов с момента старта."""
+        total_p = sum(s.tokens_prompt for s in self._run_stats)
+        total_c = sum(s.tokens_completion for s in self._run_stats)
+        total_ca = sum(s.tokens_cached for s in self._run_stats)
+        return {
+            "runs": len(self._run_stats),
+            "total_prompt": total_p,
+            "total_completion": total_c,
+            "total_tokens": total_p + total_c,
+            "total_cached": total_ca,
+            "recent": self._run_stats[-10:],
+        }
 
     # --- INGEST ---
 
@@ -192,6 +269,7 @@ class Orchestrator:
                 user_prompt=user_prompt,
                 max_steps=30,
             )
+            self._record_run(f"ingest/{date_iso}", run)
             status = "ok" if run.finished else "partial"
             await self.db.finish_batch(
                 batch_id, status, len(msgs), notes=run.summary[:500],
@@ -238,6 +316,7 @@ class Orchestrator:
             user_prompt=user_prompt,
             max_steps=30,
         )
+        self._record_run(f"ingest-adhoc/{cfg.name}", run)
         await self.db.finish_batch(
             batch_id, "ok" if run.finished else "partial", len(msgs)
         )
@@ -248,10 +327,13 @@ class Orchestrator:
 
     @staticmethod
     def _extract_media_refs(content: str, date_iso: str) -> list[str]:
-        """Достать все wiki-ссылки на медиа дня: [[raw/assets/<date>/<file>]]."""
+        """Достать все wiki-ссылки на медиа дня: [[raw/assets/<date>/<file>]].
+
+        Поддерживает как bare [[...]], так и `[[...]]` (backtick-обёртка в raw daily).
+        """
         import re
         pat = re.compile(
-            r"\[\[(raw/assets/" + re.escape(date_iso) + r"/[^\]\r\n]+)\]\]"
+            r"`?\[\[(raw/assets/" + re.escape(date_iso) + r"/[^\]\r\n]+)\]\]`?"
         )
         seen: set[str] = set()
         out: list[str] = []
@@ -277,26 +359,29 @@ class Orchestrator:
         for rel in refs:
             flat = rel.replace("/", "__")
             cache_file = cache_root / f"{flat}.txt"
-            if cache_file.exists():
-                log.info("preanalyze_media cache hit: %s", rel)
-                desc = cache_file.read_text(encoding="utf-8")
-            else:
-                log.info("preanalyze_media start: %s", rel)
-                try:
-                    desc = await asyncio.wait_for(
-                        executor._describe_media(rel), timeout=300.0
-                    )
-                except asyncio.TimeoutError:
-                    log.warning("preanalyze_media timeout (>300s): %s", rel)
-                    desc = "[таймаут анализа медиа]"
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("preanalyze_media %s failed: %s", rel, exc)
-                    desc = f"[ошибка анализа: {exc}]"
-                # Сохраняем как есть; усечение делаем при встраивании.
-                try:
-                    cache_file.write_text(desc, encoding="utf-8")
-                except OSError as exc:
-                    log.warning("media cache write %s failed: %s", rel, exc)
+            if rel not in self._media_locks:
+                self._media_locks[rel] = asyncio.Lock()
+            async with self._media_locks[rel]:
+                if cache_file.exists():
+                    log.info("preanalyze_media cache hit: %s", rel)
+                    desc = cache_file.read_text(encoding="utf-8")
+                else:
+                    log.info("preanalyze_media start: %s", rel)
+                    try:
+                        desc = await asyncio.wait_for(
+                            executor._describe_media(rel), timeout=300.0
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning("preanalyze_media timeout (>300s): %s", rel)
+                        desc = "[таймаут анализа медиа]"
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("preanalyze_media %s failed: %s", rel, exc)
+                        desc = f"[ошибка анализа: {exc}]"
+                    # Сохраняем как есть; усечение делаем при встраивании.
+                    try:
+                        cache_file.write_text(desc, encoding="utf-8")
+                    except OSError as exc:
+                        log.warning("media cache write %s failed: %s", rel, exc)
             # Чистим возможный DSML-мусор и нормализуем переносы.
             desc = desc.strip()
             if len(desc) > 600:
@@ -420,6 +505,13 @@ class Orchestrator:
         total_steps = 0
         try:
             for idx, chunk in enumerate(chunks, 1):
+                # head_ctx (AGENTS.md + index.md + template) шлём только в первый чанк —
+                # в остальных агент уже знает структуру vault'а из кэша.
+                ctx_section = (
+                    f"--- КОНТЕКСТ VAULT (НЕ ЧИТАЙ ЭТИ ФАЙЛЫ ЧЕРЕЗ read_file) ---\n"
+                    f"{head_ctx}\n"
+                    f"--- КОНЕЦ КОНТЕКСТА ---\n\n"
+                ) if idx == 1 else ""
                 user_prompt = (
                     f"Ingest чанка {idx}/{len(chunks)} файла `{rel}` "
                     f"(дата {date_iso}, чат {cfg.name}). "
@@ -432,9 +524,7 @@ class Orchestrator:
                     f"— дневные саммари в архитектуре не нужны (маркер ставит "
                     f"оркестратор в log.md). В finish() дай короткую сводку: "
                     f"что нового добавил/обновил.\n\n"
-                    f"--- КОНТЕКСТ VAULT (НЕ ЧИТАЙ ЭТИ ФАЙЛЫ ЧЕРЕЗ read_file) ---\n"
-                    f"{head_ctx}\n"
-                    f"--- КОНЕЦ КОНТЕКСТА ---\n\n"
+                    f"{ctx_section}"
                     f"--- НАЧАЛО ЧАНКА ---\n{chunk}\n--- КОНЕЦ ЧАНКА ---"
                 )
                 run = await run_agent(
@@ -444,6 +534,7 @@ class Orchestrator:
                     user_prompt=user_prompt,
                     max_steps=12,
                 )
+                self._record_run(f"ingest-raw/{date_iso}/chunk{idx}", run)
                 total_steps += run.steps
                 if not run.finished:
                     log.warning(
@@ -493,14 +584,15 @@ class Orchestrator:
             except OSError:
                 log_text = ""
         # Маркеры обработки в log.md: поддерживаем три исторических формата:
-        #   1) `ingest-day | YYYY-MM-DD |`        — текущий
-        #   2) `ingest-file | YYYY-MM-DD |`       — промежуточный
-        #   3) `## [YYYY-MM-DD HH:MM] ingest |`   — самый старый (заголовок-дата)
+        #   1) `ingest-day | YYYY-MM-DD |`               — legacy (только дата)
+        #   1b) `ingest-day | YYYY-MM-DD_adhoc-XXXX |`   — текущий (полный стем)
+        #   2) `ingest-file | YYYY-MM-DD |`              — промежуточный
+        #   3) `## [YYYY-MM-DD HH:MM] ingest |`          — самый старый (заголовок-дата)
         done_in_log: set[str] = set(
-            re.findall(r"ingest-day \| (\d{4}-\d{2}-\d{2}) \|", log_text)
+            re.findall(r"ingest-day \| ([\w.-]+) \|", log_text)
         )
         done_in_log.update(
-            re.findall(r"ingest-file \| (\d{4}-\d{2}-\d{2}) \|", log_text)
+            re.findall(r"ingest-file \| ([\w.-]+) \|", log_text)
         )
         done_in_log.update(
             re.findall(r"^## \[(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}\] ingest \|", log_text, re.MULTILINE)
@@ -544,8 +636,9 @@ class Orchestrator:
             executor=executor,
             system_prompt=QUERY_SYSTEM,
             user_prompt=question,
-            max_steps=15,
+            max_steps=30,
         )
+        self._record_run("query", run)
         return run.summary or "Не нашёл ответа."
 
     async def revise_query(
@@ -575,6 +668,7 @@ class Orchestrator:
             user_prompt=user_prompt,
             max_steps=8,
         )
+        self._record_run("revise-query", run)
         return run.summary or original_answer
 
     # --- ENTITY BUILD ---
@@ -607,6 +701,7 @@ class Orchestrator:
                 user_prompt=user_prompt,
                 max_steps=20,
             )
+            self._record_run(f"build-entity/{entity_name}", run)
             status = "ok" if run.finished else "partial"
             self._append_log(
                 wiki,
@@ -650,8 +745,9 @@ class Orchestrator:
                 executor=executor,
                 system_prompt=ENTITY_MERGE_SYSTEM,
                 user_prompt=user_prompt,
-                max_steps=15,
+                max_steps=30,
             )
+            self._record_run(f"merge-entity/{alias}→{canonical}", run)
             status = "ok" if run.finished else "partial"
             self._append_log(
                 wiki,
@@ -709,6 +805,7 @@ class Orchestrator:
             user_prompt=prompt,
             max_steps=25,
         )
+        self._record_run(f"lint/{scope}", run)
         body = (run.summary or "").strip() or "(пусто)"
         return f"### {scope} ({run.steps} шагов)\n{body}"
 
@@ -850,6 +947,7 @@ class Orchestrator:
             user_prompt=f"Сделай сводку за период: {period}.",
             max_steps=10,
         )
+        self._record_run("summary", run)
         return run.summary or "Сводка не сгенерирована."
 
     # --- helpers ---

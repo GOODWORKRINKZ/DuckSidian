@@ -8,6 +8,7 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import Update
 from aiohttp import web
 
 from .config import settings
@@ -61,6 +62,15 @@ async def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Отдельный файл для токенов/расходов — data/tokens.log
+    _tokens_log_path = settings.data_path / "tokens.log"
+    _tokens_log_path.parent.mkdir(parents=True, exist_ok=True)
+    _fh = logging.FileHandler(_tokens_log_path, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _fh.setLevel(logging.DEBUG)
+    logging.getLogger("bot.tokens").addHandler(_fh)
+    logging.getLogger("bot.tokens").setLevel(logging.DEBUG)
+    logging.getLogger("bot.tokens").propagate = False  # не дублировать в основной лог
 
     _ensure_vault_initialised(settings.vault_path)
     # Сеять поддиректории для каждого зарегистрированного чата
@@ -85,6 +95,16 @@ async def main() -> None:
         await ensure_bot_topic(bot, db, chat_cfg.chat_id)
 
     dp = Dispatcher()
+
+    @dp.update.outer_middleware()
+    async def _log_all_updates(handler, event: Update, data: dict):
+        log.info(
+            "RAW_UPDATE id=%s type=%s",
+            event.update_id,
+            event.event_type,
+        )
+        return await handler(event, data)
+
     dp.include_router(cmd_router_mod.setup(db, wiki, orch))
     dp.include_router(listener_mod.setup(db, orch, bot))
 
@@ -94,6 +114,7 @@ async def main() -> None:
     await _run_health_server()
 
     log.info("starting polling for chat_id=%s", settings.telegram_chat_id)
+    log.info("DeepSeek model: %s | base_url: %s", settings.deepseek_model, settings.deepseek_base_url)
     try:
         # Retry-обёртка: при потере DNS / сети aiogram может вылететь с
         # TelegramNetworkError ещё до старта polling-цикла. Не падаем — ждём.

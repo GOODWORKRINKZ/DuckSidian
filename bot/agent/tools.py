@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from ..wiki import Wiki, WikiPathError
+from ..media_index import MediaIndex
 
 log = logging.getLogger(__name__)
 
@@ -156,6 +157,73 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "move_file",
+            "description": (
+                "Переместить (переименовать) файл внутри wiki/. "
+                "Используй для переклассификации страниц, например: "
+                "wiki/concepts/misc/1688.md → wiki/entities/companies/1688.md. "
+                "raw/ запрещён. Старый файл удаляется, содержимое сохраняется."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string", "description": "Текущий путь файла"},
+                    "dst": {"type": "string", "description": "Новый путь файла"},
+                },
+                "required": ["src", "dst"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": (
+                "Удалить файл из wiki/. Используй для удаления дублирующих или "
+                "устаревших страниц после слияния (merge). raw/ запрещён."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Путь файла для удаления"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "defer_question",
+            "description": (
+                "Отложить спорный вопрос в очередь разрешения конфликтов. "
+                "Используй вместо ask_user когда вопрос не блокирует работу "
+                "прямо сейчас: например, к какому проекту относится сообщение, "
+                "стоит ли слить два похожих проекта, правильно ли определён домен. "
+                "Агент продолжает работу, а пользователь отвечает позже через /resolve. "
+                "НЕ жди ответа — сразу вызывай finish() после defer_question."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "Краткий вопрос пользователю"},
+                    "context": {
+                        "type": "string",
+                        "description": "Контекст: что произошло, почему возник вопрос, что уже сделано",
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Варианты ответа (опц.)",
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "ask_user",
             "description": (
                 "Задать вопрос команде в forum-топик и подождать ответ. "
@@ -186,12 +254,38 @@ TOOL_SCHEMAS: list[dict] = [
                 "описание 4 равномерных кейфреймов через vision. "
                 "Для голосовых/аудио — STT транскрипция через Whisper. "
                 "Для документов (PDF, DOCX, XLSX) — извлечение текста. "
-                "path — относительный путь внутри vault, например raw/assets/..."
+                "path — относительный путь внутри vault, например raw/assets/... "
+                "Если файл уже тегирован или похож на известный проект — в ответе "
+                "будет подсказка с именем проекта."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tag_media",
+            "description": (
+                "Пометить медиафайл как принадлежащий конкретному проекту. "
+                "Записывает в визуальный индекс: при следующих ingest describe_media "
+                "будет сразу показывать подсказку о проекте. "
+                "Используй после describe_media когда уверен в принадлежности. "
+                "project — название проекта (например 'РОББОКС', 'BiBa'). "
+                "notes — ключевые визуальные признаки (цвет, форма, компоненты), "
+                "они пополняют визуальный профиль проекта для будущих матчей."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "rel_path файла, например raw/assets/.../file.jpg"},
+                    "project": {"type": "string", "description": "Название проекта"},
+                    "notes": {"type": "string", "description": "Визуальные признаки (необяз.)"},
+                },
+                "required": ["path", "project"],
             },
         },
     },
@@ -282,10 +376,12 @@ class ToolExecutor:
     не может писать в raw/."""
 
     def __init__(self, wiki: Wiki, ask_user: AskUserFn, deepseek_client: Any = None,
-                 file_cache: dict[str, str] | None = None):
+                 file_cache: dict[str, str] | None = None, db: Any = None):
         self.wiki = wiki
         self.ask_user = ask_user
         self._ds = deepseek_client
+        self._db = db
+        self._media_index = MediaIndex(wiki.root)
         # Кэш содержимого файлов в рамках run_agent (или прокинутый снаружи —
         # тогда живёт между несколькими run_agent одного дня). Ключ — rel path.
         self._fcache: dict[str, str] = file_cache if file_cache is not None else {}
@@ -443,6 +539,55 @@ class ToolExecutor:
                 self._fcache[rel] = updated
                 self._fcache[path] = updated
                 return f"OK: edited {rel} (замена {len(old_s)} → {len(new_s)} симв.)"
+            if name == "delete_file":
+                path = arguments.get("path", "")
+                if not path:
+                    return "ERROR: missing 'path'"
+                if path.startswith("raw/"):
+                    return "ERROR: raw/ is read-only for the agent"
+                try:
+                    found = self.wiki.find_md(path)
+                except WikiPathError as exc:
+                    return f"ERROR: {exc}"
+                abs_path = self.wiki.root / found
+                if not abs_path.exists():
+                    return f"ERROR: файл не найден: {found}"
+                abs_path.unlink()
+                self._fcache.pop(found, None)
+                self._fcache.pop(path, None)
+                log.info("delete_file: %s", found)
+                return f"OK: deleted {found}"
+            if name == "move_file":
+                src = arguments.get("src", "")
+                dst = arguments.get("dst", "")
+                if not src or not dst:
+                    return "ERROR: missing 'src' or 'dst'"
+                if src.startswith("raw/") or dst.startswith("raw/"):
+                    return "ERROR: raw/ is read-only for the agent"
+                src_full = self.wiki.find_md(src)
+                content = self.wiki.read_file(src_full)
+                rel = self.wiki.write_file(dst, content)
+                src_abs = self.wiki.root / src_full
+                if src_abs.exists():
+                    src_abs.unlink()
+                    # Invalidate cache for old path
+                    self._fcache.pop(src_full, None)
+                    self._fcache.pop(src, None)
+                self._fcache[rel] = content
+                return f"OK: moved {src_full} → {rel}"
+            if name == "defer_question":
+                question = arguments.get("question", "")
+                context = arguments.get("context") or None
+                options = arguments.get("options") or None
+                if not question:
+                    return "ERROR: missing 'question'"
+                if self._db is not None:
+                    dispute_id = await self._db.add_dispute(question, context, options)
+                    log.info("defer_question: dispute_id=%s q=%r", dispute_id, question)
+                    return f"OK: спорный вопрос #{dispute_id} отложен. Пользователь ответит через /resolve."
+                else:
+                    log.warning("defer_question: no db attached, falling back to ask_user")
+                    return await self.ask_user(question, options)
             if name == "ask_user":
                 opts = arguments.get("options") or None
                 ans = await self.ask_user(arguments["question"], opts)
@@ -461,7 +606,48 @@ class ToolExecutor:
                     min(int(arguments.get("limit", 30)), 100),
                 )
             if name == "describe_media":
-                return await self._describe_media(arguments["path"])
+                rel = arguments["path"]
+                # Проверить визуальный индекс.
+                known = self._media_index.get_file(rel)
+                desc = await self._describe_media(rel)
+                if known:
+                    hint = (
+                        f"\n\n⚡ ВИЗУАЛЬНЫЙ ИНДЕКС: этот файл уже тегирован как "
+                        f"**{known['project']}**."
+                        + (f" Заметки: {known['notes']}" if known.get("notes") else "")
+                        + " Используй эту информацию при атрибуции артефакта."
+                    )
+                    return desc + hint
+                # Попробовать идентифицировать по профилям.
+                hits = self._media_index.identify(desc)
+                if hits:
+                    top = hits[:2]
+                    matches = "; ".join(
+                        f"{h.project} (score={h.score}, слова: {', '.join(h.evidence[:5])})"
+                        for h in top
+                    )
+                    hint = (
+                        f"\n\n💡 ВИЗУАЛЬНОЕ СОВПАДЕНИЕ: описание похоже на проект(ы): {matches}. "
+                        "Проверь по контексту сообщения. Если верно — вызови tag_media."
+                    )
+                    return desc + hint
+                return desc
+            if name == "tag_media":
+                rel = arguments.get("path", "")
+                project = arguments.get("project", "").strip()
+                notes = (arguments.get("notes") or "").strip()
+                if not rel or not project:
+                    return "ERROR: нужны 'path' и 'project'"
+                # Получить описание из кэша media (если есть) или не гнать снова.
+                media_cache = self.wiki.root / ".cache" / "media" / rel.replace("/", "__") + ".txt"
+                cached_desc = ""
+                if media_cache.exists():
+                    try:
+                        cached_desc = media_cache.read_text(encoding="utf-8")[:400]
+                    except OSError:
+                        pass
+                self._media_index.tag(rel, project, desc=cached_desc, notes=notes or None)
+                return f"OK: {rel} → {project}" + (f" ({notes})" if notes else "")
             return f"ERROR: unknown tool {name}"
         except WikiPathError as exc:
             return f"ERROR: {exc}"
@@ -514,6 +700,62 @@ class ToolExecutor:
         return f"[файл {ext}, {size_kb} KB — бинарный, анализ недоступен]"
 
     @staticmethod
+    @staticmethod
+    async def _fetch_bilibili(bvid: str) -> str:
+        """Fetch Bilibili video metadata via public API."""
+        import datetime
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            "Referer": "https://www.bilibili.com/",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}",
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                body = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bilibili api %s failed: %s", bvid, exc)
+            return f"ERROR fetch_url bilibili api: {exc}"
+
+        if body.get("code") != 0:
+            return f"Bilibili API error: {body.get('message')}"
+
+        d = body["data"]
+        title = d.get("title", "")
+        desc = (d.get("desc") or "").strip()
+        if desc == "-":
+            desc = ""
+        owner = d.get("owner", {}).get("name", "")
+        pubdate = d.get("pubdate")
+        date_str = (
+            datetime.datetime.fromtimestamp(pubdate).strftime("%Y-%m-%d")
+            if pubdate
+            else ""
+        )
+        duration = d.get("duration", 0)
+        dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else ""
+        url = f"https://www.bilibili.com/video/{bvid}"
+
+        lines = [f"URL: {url}", f"Заголовок: {title}"]
+        if owner:
+            lines.append(f"Автор: {owner}")
+        if date_str:
+            lines.append(f"Дата: {date_str}")
+        if dur_str:
+            lines.append(f"Длительность: {dur_str}")
+        if desc:
+            lines.append(f"\nОписание: {desc[:500]}")
+
+        result = "\n".join(lines)
+        log.info("bilibili api %s → %s", bvid, title)
+        return result
+
+    @staticmethod
     async def _fetch_url(url: str) -> str:
         """Загрузить страницу и вернуть очищенный текст (до 3000 символов)."""
         import re
@@ -522,6 +764,24 @@ class ToolExecutor:
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ("http", "https"):
             return f"ERROR: неподдерживаемая схема '{parsed.scheme}' (только http/https)"
+
+        # Bilibili: use public API instead of scraping (site blocks bots with 412)
+        import re as _re
+        _bv_match = _re.search(r"/video/(BV[a-zA-Z0-9]+)", url)
+        if _bv_match and "bilibili.com" in parsed.netloc:
+            return await ToolExecutor._fetch_bilibili(_bv_match.group(1))
+
+        # 1688: blocks scraping with JS challenge; no public API without key.
+        # Return offer URL so agent can still record it as a clickable link.
+        if "1688.com" in parsed.netloc:
+            _offer_match = _re.search(r"/offer/(\d+)", url)
+            offer_id = _offer_match.group(1) if _offer_match else ""
+            clean_url = f"https://detail.1688.com/offer/{offer_id}.html" if offer_id else url
+            return (
+                f"URL: {clean_url}\n"
+                f"Заголовок: товар на 1688.com (offer {offer_id})\n\n"
+                f"[1688 блокирует автоматические запросы. Запиши ссылку как есть: {clean_url}]"
+            )
 
         try:
             headers = {

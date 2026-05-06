@@ -18,6 +18,9 @@ class AgentRun:
     steps: int = 0
     transcript: list[dict[str, Any]] = field(default_factory=list)
     finished: bool = False
+    tokens_prompt: int = 0
+    tokens_completion: int = 0
+    tokens_cached: int = 0
 
 
 def _ctx_chars(messages: list[dict[str, Any]]) -> int:
@@ -96,8 +99,9 @@ async def run_agent(
     system_prompt: str,
     user_prompt: str,
     max_steps: int = 30,
-    tool_result_cap: int = 12_000,
+    tool_result_cap: int = 6_000,
     ctx_char_budget: int = 400_000,
+    compress_ctx_threshold: int = 80_000,
 ) -> AgentRun:
     """Один прогон агента до вызова finish() или исчерпания шагов."""
 
@@ -111,9 +115,14 @@ async def run_agent(
         run.steps = step + 1
         # Лог размера контекста — чтобы ловить раздувание (DeepSeek рвёт большие тела).
         ctx_chars = _ctx_chars(messages)
+        if ctx_chars > compress_ctx_threshold and step > 0:
+            compressed = await _compress_old_tool_results(client, messages, keep_last=3)
+            if compressed:
+                ctx_chars = _ctx_chars(messages)
+                log.info("agent step %d: context compressed, new ctx_chars=%d", step, ctx_chars)
         if ctx_chars > ctx_char_budget:
             log.warning(
-                "agent step %d: ctx %d > budget %d (compression disabled)",
+                "agent step %d: ctx %d > budget %d",
                 step, ctx_chars, ctx_char_budget,
             )
         log.info("agent step %d: ctx_msgs=%d ctx_chars=%d", step, len(messages), ctx_chars)
@@ -130,6 +139,10 @@ async def run_agent(
                 ),
             })
         resp = await client.chat(messages=messages, tools=TOOL_SCHEMAS)
+        usage = resp.get("usage") or {}
+        run.tokens_prompt += usage.get("prompt_tokens", 0)
+        run.tokens_completion += usage.get("completion_tokens", 0)
+        run.tokens_cached += usage.get("prompt_cache_hit_tokens", 0)
         try:
             choice = resp["choices"][0]
             msg = choice["message"]
@@ -143,6 +156,11 @@ async def run_agent(
             "role": "assistant",
             "content": raw_content,
         }
+        # DeepSeek thinking mode: reasoning_content нужно передавать обратно
+        # в следующих запросах, иначе API вернёт 400.
+        reasoning = msg.get("reasoning_content")
+        if reasoning:
+            assistant_msg["reasoning_content"] = reasoning
         tool_calls = msg.get("tool_calls") or []
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
@@ -234,36 +252,49 @@ async def run_agent(
                 ),
             })
             final = await client.chat(messages=messages, tools=None)
-            run.summary = (
+            fusage = final.get("usage") or {}
+            run.tokens_prompt += fusage.get("prompt_tokens", 0)
+            run.tokens_completion += fusage.get("completion_tokens", 0)
+            run.tokens_cached += fusage.get("prompt_cache_hit_tokens", 0)
+            forced_text = (
                 final["choices"][0]["message"].get("content")
                 or run.summary
                 or "(agent stopped without finish())"
             )
+            # Forced call also sometimes returns DSML XML — sanitize immediately.
+            if "DSML" in forced_text:
+                log.warning("forced summary contains DSML, sanitizing")
+                forced_text = _sanitize_summary(forced_text)
+            run.summary = forced_text
             run.finished = True
         except Exception as exc:  # noqa: BLE001
             log.error("forced summary call failed: %s", exc)
             run.summary = run.summary or "(agent stopped without finish())"
     run.summary = _sanitize_summary(run.summary)
+    log.info(
+        "agent done: steps=%d tokens_prompt=%d tokens_completion=%d "
+        "tokens_total=%d tokens_cached=%d",
+        run.steps,
+        run.tokens_prompt,
+        run.tokens_completion,
+        run.tokens_prompt + run.tokens_completion,
+        run.tokens_cached,
+    )
     return run
 
 
 # DeepSeek иногда возвращает в content свой внутренний tool-call формат как plain text:
-#   <｜DSML｜tool_calls><｜DSML｜invoke name="..."><｜DSML｜parameter ...>...</｜DSML｜...>
-# Это не должно попадать в дайджесты vault'а. Чистим всё, что обрамлено такими токенами,
-# а если первый такой токен встречается — обрезаем хвост.
+#   <｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="..."><｜｜DSML｜｜parameter ...>
+# Количество fullwidth-pipes варьируется (｜ или ｜｜).
+# Чистим: находим первое вхождение DSML, откатываемся до '<', обрезаем.
 import re as _re
-
-_DSML_FULL_RE = _re.compile(r"<｜DSML｜[^>]*>.*?</｜DSML｜[^>]*>", _re.DOTALL)
-_DSML_TAG_RE = _re.compile(r"<\｜?DSML\｜?[^>]*>")
 
 
 def _sanitize_summary(s: str) -> str:
     if not s or "DSML" not in s:
         return s.strip()
-    # Сначала вырезаем парные блоки.
-    s = _DSML_FULL_RE.sub("", s)
-    # Если остался непарный открывающий — режем по нему.
-    m = _DSML_TAG_RE.search(s)
-    if m:
-        s = s[: m.start()].rstrip()
+    idx = s.find("DSML")
+    lt = s.rfind("<", 0, idx)
+    if lt != -1:
+        s = s[:lt].rstrip()
     return s.strip()

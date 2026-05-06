@@ -11,6 +11,7 @@ import httpx
 from ..config import settings
 
 log = logging.getLogger(__name__)
+tokens_log = logging.getLogger("bot.tokens")
 
 
 class DeepSeekClient:
@@ -19,6 +20,7 @@ class DeepSeekClient:
         self.api_key = api_key or settings.deepseek_api_key
         self.base_url = (base_url or settings.deepseek_base_url).rstrip("/")
         self.model = model or settings.deepseek_model
+        log.info("DeepSeekClient init: model=%s base_url=%s", self.model, self.base_url)
         # connect — быстрый (ловим DNS/network), read — долгий
         # (DeepSeek-chat иногда думает >2 минут на tool-calling).
         if timeout is None:
@@ -32,6 +34,23 @@ class DeepSeekClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def fetch_balance(self) -> dict:
+        """Запросить текущий баланс аккаунта DeepSeek."""
+        url = f"{self.base_url}/user/balance"
+        try:
+            resp = await self._client.get(
+                url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Accept": "application/json",
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("fetch_balance failed: %s", exc)
+            return {"error": str(exc)}
 
     async def describe_image(self, base64_data: str, mime: str = "image/jpeg") -> str:
         """Описание изображения через локальную Ollama moondream (нативный API)."""
@@ -71,6 +90,10 @@ class DeepSeekClient:
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
+            # Явно отключаем thinking mode — нам нужен быстрый tool-calling,
+            # а не размышления. Без этого v4-flash иногда сам включает thinking,
+            # что требует особой обработки reasoning_content.
+            "thinking": {"type": "disabled"},
         }
         if tools:
             payload["tools"] = tools
@@ -102,4 +125,24 @@ class DeepSeekClient:
         if resp.status_code >= 400:
             log.error("DeepSeek HTTP %s: %s", resp.status_code, resp.text[:500])
             resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        resp_model = data.get("model", self.model)
+        usage = data.get("usage") or {}
+        if usage:
+            log.info(
+                "DeepSeek usage: model=%s prompt=%d completion=%d total=%d cached=%d",
+                resp_model,
+                usage.get("prompt_tokens", 0),
+                usage.get("completion_tokens", 0),
+                usage.get("total_tokens", 0),
+                usage.get("prompt_cache_hit_tokens", 0),
+            )
+            tokens_log.info(
+                "call model=%s prompt=%d compl=%d total=%d cached=%d",
+                resp_model,
+                usage.get("prompt_tokens", 0),
+                usage.get("completion_tokens", 0),
+                usage.get("total_tokens", 0),
+                usage.get("prompt_cache_hit_tokens", 0),
+            )
+        return data

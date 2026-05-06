@@ -54,6 +54,16 @@ CREATE TABLE IF NOT EXISTS state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS disputes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    question TEXT NOT NULL,
+    context TEXT,
+    options TEXT,
+    answer TEXT,
+    answered_at TEXT,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -74,6 +84,19 @@ class DB:
                     await db.commit()
                 except Exception:  # noqa: BLE001
                     pass  # колонка уже существует
+            # Migration: создать таблицу disputes если она не создана через SCHEMA
+            # (для уже существующих БД без неё)
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS disputes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    question TEXT NOT NULL,
+                    context TEXT,
+                    options TEXT,
+                    answer TEXT,
+                    answered_at TEXT,
+                    created_at TEXT NOT NULL
+                )"""
+            )
             await db.commit()
 
     @asynccontextmanager
@@ -259,3 +282,48 @@ class DB:
                 "SELECT * FROM pending_questions WHERE id=?", (question_id,)
             ) as cur:
                 return await cur.fetchone()
+
+    # --- disputes ---
+
+    async def add_dispute(
+        self, question: str, context: str | None, options: list[str] | None
+    ) -> int:
+        import json
+        async with self.conn() as db:
+            cur = await db.execute(
+                """INSERT INTO disputes (question, context, options, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    question,
+                    context,
+                    json.dumps(options, ensure_ascii=False) if options else None,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            await db.commit()
+            return cur.lastrowid or 0
+
+    async def get_oldest_dispute(self) -> aiosqlite.Row | None:
+        """Вернуть самый старый неотвеченный спорный вопрос."""
+        async with self.conn() as db:
+            async with db.execute(
+                """SELECT * FROM disputes WHERE answer IS NULL
+                   ORDER BY created_at ASC LIMIT 1"""
+            ) as cur:
+                return await cur.fetchone()
+
+    async def count_pending_disputes(self) -> int:
+        async with self.conn() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM disputes WHERE answer IS NULL"
+            ) as cur:
+                row = await cur.fetchone()
+                return row[0] if row else 0
+
+    async def answer_dispute(self, dispute_id: int, answer: str) -> None:
+        async with self.conn() as db:
+            await db.execute(
+                """UPDATE disputes SET answer=?, answered_at=? WHERE id=?""",
+                (answer, datetime.now(timezone.utc).isoformat(), dispute_id),
+            )
+            await db.commit()

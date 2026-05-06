@@ -220,12 +220,14 @@ HELP_TEXT = (
     "/log — последние записи log.md\n"
     "/note &lt;текст&gt; — ручная заметка в raw/notes/\n"
     "/chats — список отслеживаемых чатов\n"
+    "/balance — баланс DeepSeek + расход токенов <i>(admin)</i>\n"
     "/build &lt;имя&gt; [&lt;chat&gt;] — собрать/обновить страницу сущности из всех raw-данных <i>(admin)</i>\n"
     "/merge &lt;канонич&gt; | &lt;псевдоним&gt; [&lt;chat&gt;] — слить дубли в одну страницу <i>(admin)</i>\n"
     "/ingest [today|N|&lt;YYYY-MM-DD&gt;] [&lt;chat&gt;] — внеплановый ingest <i>(admin)</i>\n"
     "/lint — health-check <i>(admin)</i>\n"
     "/topic — создать/пересоздать служебный топик <i>(admin)</i>\n"
     "/pause /resume — авто-ingest <i>(admin)</i>\n"
+    "/resolve — разобрать спорные вопросы агента по одному <i>(admin)</i>\n"
 )
 
 
@@ -655,6 +657,65 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             return
         await _reply_html(msg, "🩺 " + out)
 
+    @router.message(Command("balance"))
+    async def cmd_balance(msg: Message) -> None:
+        if not _is_admin(msg.from_user.id if msg.from_user else None):
+            await msg.reply("⛔ только для админов")
+            return
+        # Баланс DeepSeek
+        bal_data = await orch.client.fetch_balance()
+        if "error" in bal_data:
+            bal_text = f"⚠️ Ошибка запроса баланса: {bal_data['error']}"
+        else:
+            lines = []
+            for b in bal_data.get("balance_infos", []):
+                cur = b.get("currency", "?")
+                total = b.get("total_balance", "?")
+                topped = b.get("topped_up_balance", "?")
+                granted = b.get("granted_balance", "0")
+                lines.append(
+                    f"  {cur}: <b>{total}</b> (пополнено: {topped}, бонус: {granted})"
+                )
+            avail = "✅" if bal_data.get("is_available") else "❌"
+            bal_text = f"{avail} Баланс DeepSeek:\n" + "\n".join(lines)
+        # Статистика токенов
+        stats = orch.get_token_stats()
+        runs = stats["runs"]
+        if runs == 0:
+            stats_text = "\n\n📊 Токенов с момента старта: нет данных"
+        else:
+            # deepseek-v4-flash pricing: $0.07/M input, $0.28/M output, $0.014/M cached
+            cost_usd = (
+                (stats["total_prompt"] - stats["total_cached"]) * 0.07
+                + stats["total_cached"] * 0.014
+                + stats["total_completion"] * 0.28
+            ) / 1_000_000
+            stats_text = (
+                f"\n\n📊 Токены с момента старта (<b>{runs}</b> запусков):\n"
+                f"  prompt: <b>{stats['total_prompt']:,}</b> "
+                f"(cached: {stats['total_cached']:,})\n"
+                f"  completion: <b>{stats['total_completion']:,}</b>\n"
+                f"  итого: <b>{stats['total_tokens']:,}</b> "
+                f"≈ <b>${cost_usd:.4f}</b>\n"
+            )
+            recent = stats["recent"]
+            if recent:
+                stats_text += "\n<b>Последние запуски:</b>\n"
+                prev_total = None
+                for s in recent:
+                    delta = ""
+                    if prev_total is not None:
+                        diff = s.tokens_total - prev_total
+                        sign = "+" if diff >= 0 else ""
+                        delta = f" ({sign}{diff:,})"
+                    stats_text += (
+                        f"  {s.ts} <code>{s.op}</code> "
+                        f"— {s.tokens_total:,} tok{delta}, "
+                        f"{s.steps} шагов\n"
+                    )
+                    prev_total = s.tokens_total
+        await msg.reply(bal_text + stats_text, parse_mode="HTML")
+
     @router.message(Command("pause"))
     async def cmd_pause(msg: Message) -> None:
         if not _is_admin(msg.from_user.id if msg.from_user else None):
@@ -670,6 +731,142 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             return
         await db.set_state("paused", "0")
         await msg.reply("▶️ авто-ingest возобновлён")
+
+    async def cmd_resume(msg: Message) -> None:
+        if not _is_admin(msg.from_user.id if msg.from_user else None):
+            await msg.reply("⛔ только для админов")
+            return
+        await db.set_state("paused", "0")
+        await msg.reply("▶️ авто-ingest возобновлён")
+
+    # --- /resolve: пошаговое разрешение спорных вопросов ---
+    # Состояние хранится в памяти: chat_id → (dispute_id, bot_msg_id)
+    _resolve_active: dict[int, tuple[int, int]] = {}
+
+    async def _post_next_dispute(chat_id: int, thread_id: int | None) -> None:
+        """Достать следующий спорный вопрос и отправить в чат."""
+        dispute = await db.get_oldest_dispute()
+        if not dispute:
+            kb = None
+            await orch.bot.send_message(
+                chat_id,
+                "✅ Все спорные вопросы разрешены!",
+                message_thread_id=thread_id,
+                reply_markup=kb,
+            )
+            _resolve_active.pop(chat_id, None)
+            return
+
+        import json as _json
+        options: list[str] | None = None
+        if dispute["options"]:
+            try:
+                options = _json.loads(dispute["options"])
+            except Exception:
+                pass
+
+        count = await db.count_pending_disputes()
+        header = f"❓ <b>Спорный вопрос #{dispute['id']}</b> (осталось: {count})\n\n"
+        body = dispute["question"]
+        if dispute["context"]:
+            body += f"\n\n<i>{dispute['context'][:600]}</i>"
+
+        # Inline-кнопки: варианты ответа (если есть) + Стоп
+        buttons: list[list[InlineKeyboardButton]] = []
+        if options:
+            row = [
+                InlineKeyboardButton(
+                    text=opt,
+                    callback_data=f"resolve_ans:{dispute['id']}:{opt[:50]}",
+                )
+                for opt in options[:4]
+            ]
+            # Разбиваем по 2 кнопки в ряд
+            for i in range(0, len(row), 2):
+                buttons.append(row[i : i + 2])
+        buttons.append(
+            [InlineKeyboardButton(text="⏹ Стоп", callback_data="resolve_stop")]
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+        sent = await orch.bot.send_message(
+            chat_id,
+            header + body,
+            parse_mode="HTML",
+            message_thread_id=thread_id,
+            reply_markup=kb,
+        )
+        _resolve_active[chat_id] = (dispute["id"], sent.message_id)
+
+    @router.message(Command("resolve"))
+    async def cmd_resolve(msg: Message) -> None:
+        if not _is_admin(msg.from_user.id if msg.from_user else None):
+            await msg.reply("⛔ только для админов")
+            return
+        count = await db.count_pending_disputes()
+        if count == 0:
+            await msg.reply("✅ Нет спорных вопросов в очереди.")
+            return
+        await msg.reply(f"📋 В очереди: <b>{count}</b> вопрос(ов). Начинаю...", parse_mode="HTML")
+        await _post_next_dispute(msg.chat.id, msg.message_thread_id)
+
+    @router.callback_query(F.data == "resolve_stop")
+    async def cb_resolve_stop(cb: CallbackQuery) -> None:
+        chat_id = cb.message.chat.id if cb.message else 0
+        _resolve_active.pop(chat_id, None)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            pass
+        await cb.answer("Разрешение остановлено")
+        await cb.message.answer("⏹ Разрешение спорных вопросов остановлено.")  # type: ignore[union-attr]
+
+    @router.callback_query(F.data.startswith("resolve_ans:"))
+    async def cb_resolve_answer(cb: CallbackQuery) -> None:
+        """Ответ через inline-кнопку."""
+        if not cb.message:
+            await cb.answer()
+            return
+        chat_id = cb.message.chat.id
+        parts = (cb.data or "").split(":", 2)
+        if len(parts) != 3:
+            await cb.answer("bad data")
+            return
+        dispute_id = int(parts[1])
+        answer = parts[2]
+
+        active = _resolve_active.get(chat_id)
+        if active and active[0] != dispute_id:
+            await cb.answer("Устаревшая кнопка", show_alert=False)
+            return
+
+        await db.answer_dispute(dispute_id, answer)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        await cb.answer(f"✅ Ответ: {answer}")
+        await cb.message.answer(f"✅ <b>#{dispute_id}</b> → {answer}", parse_mode="HTML")
+        await _post_next_dispute(chat_id, cb.message.message_thread_id)
+
+    @router.message(lambda msg: bool(
+        msg.reply_to_message
+        and msg.chat.id in _resolve_active
+        and msg.reply_to_message.message_id == _resolve_active.get(msg.chat.id, (None, None))[1]
+    ))
+    async def on_resolve_reply(msg: Message) -> None:
+        """Текстовый реплай на вопрос /resolve."""
+        answer = (msg.text or msg.caption or "").strip()
+        if not answer:
+            return
+        chat_id = msg.chat.id
+        active = _resolve_active.get(chat_id)
+        if not active:
+            return
+        dispute_id, _ = active
+        await db.answer_dispute(dispute_id, answer)
+        await msg.reply(f"✅ <b>#{dispute_id}</b> → {answer}", parse_mode="HTML")
+        await _post_next_dispute(chat_id, msg.message_thread_id)
 
     @router.callback_query(F.data.startswith("qsave:"))
     async def cb_save_query(cb: CallbackQuery) -> None:
@@ -752,7 +949,10 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             pass
         await cb.answer("жду правки 👀")
 
-    @router.message(F.reply_to_message)
+    @router.message(lambda msg: bool(
+        msg.reply_to_message
+        and msg.reply_to_message.message_id in _fix_prompt_to_save_id
+    ))
     async def on_correction_reply(msg: Message) -> None:
         """Реплай на бот-сообщение «жду правки» — переписываем ответ и сохраняем."""
         if not msg.reply_to_message:
@@ -760,7 +960,7 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
         target_id = msg.reply_to_message.message_id
         save_id = _fix_prompt_to_save_id.pop(target_id, None)
         if not save_id:
-            return  # это не наш промпт — отдаём дальше другим хендлерам
+            return
         entry = _pending_fixes.pop(save_id, None)
         if not entry:
             await msg.reply("⌛ устарело, спроси заново через /ask")
