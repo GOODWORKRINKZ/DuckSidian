@@ -243,8 +243,36 @@ HELP_TEXT = (
     "/resolve — разобрать спорные вопросы агента по одному <i>(admin)</i>\n"
 )
 
+# Белый список чатов (chat_id) из конфига — вычисляется один раз при старте.
+def _allowed_chat_ids() -> set[int]:
+    return {c.chat_id for c in settings.get_chats()}
+
 
 def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
+
+    allowed_chats = _allowed_chat_ids()
+
+    @router.message.middleware()
+    async def chat_guard(handler, msg: Message, data: dict):
+        """Игнорировать все команды из чатов не из конфига."""
+        if msg.chat.id not in allowed_chats:
+            log.warning(
+                "CMD from unknown chat %s (%r) — ignored",
+                msg.chat.id, msg.chat.title,
+            )
+            return  # не вызываем handler
+        return await handler(msg, data)
+
+    @router.callback_query.middleware()
+    async def callback_guard(handler, cb: CallbackQuery, data: dict):
+        """Игнорировать callback из чатов не из конфига."""
+        if cb.message and cb.message.chat.id not in allowed_chats:
+            log.warning(
+                "CALLBACK from unknown chat %s — ignored", cb.message.chat.id
+            )
+            await cb.answer()
+            return
+        return await handler(cb, data)
 
     @router.message(Command("help", "start"))
     async def cmd_help(msg: Message) -> None:
