@@ -41,9 +41,58 @@ _ITALIC_UND_RE = re.compile(r"(?<![_\w])_(?!\s)([^_\n]+?)(?<!\s)_(?![_\w])")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 _HR_RE = re.compile(r"^\s{0,3}([-*_])(\s*\1){2,}\s*$")
 _LIST_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+_TABLE_ROW_RE = re.compile(r"^\|.+\|$")
+_TABLE_SEP_CELL_RE = re.compile(r"^[\s\-:|]+$")
 
 
 _MSG_ANCHOR_RE = re.compile(r"^msg-(\d+)$")
+
+
+def _is_table_sep(line: str) -> bool:
+    """Return True if line is a markdown table separator row like | --- | :---: |."""
+    cells = line[1:-1].split("|")
+    return bool(cells) and all(_TABLE_SEP_CELL_RE.match(c) for c in cells)
+
+
+def _format_table_text(rows: list[list[str]]) -> str:
+    """Format parsed table rows as readable Telegram text (no <pre>).
+
+    2-column tables  → each row as "col1: col2".
+    N-column tables  → card list: first column as title, rest as attrs.
+    Cell content is already html-escaped and may contain \\x00PH\\x00 placeholders
+    plus raw markdown bold/italic markers — do NOT html.escape again.
+    """
+    if not rows:
+        return ""
+    col_count = max(len(r) for r in rows)
+    rows = [r + [""] * (col_count - len(r)) for r in rows]
+
+    if col_count <= 2:
+        # Key-value table.
+        lines: list[str] = []
+        for row in rows:
+            k, v = row[0], row[1]
+            if k and v:
+                lines.append(f"{k}: {v}")
+            elif k:
+                lines.append(k)
+        return "\n".join(lines)
+
+    # N-column card format.
+    header = rows[0]
+    data = rows[1:]
+    parts: list[str] = []
+    for row in data:
+        card = [f"• {row[0]}"]
+        for i in range(1, col_count):
+            cell = row[i]
+            if not cell:
+                continue
+            hdr = header[i] if i < len(header) else ""
+            card.append(f"    {hdr}: {cell}" if hdr else f"    {cell}")
+        parts.append("\n".join(card))
+    hdr_line = " | ".join(header)
+    return hdr_line + "\n\n" + "\n\n".join(parts)
 
 
 def _wiki_alias(target: str, alias: str | None) -> str:
@@ -143,8 +192,23 @@ def md_to_tg_html(text: str, tg_chat_id: int | None = None) -> str:
     # 4) Построчная обработка: заголовки, hr, цитаты, списки.
     out_lines: list[str] = []
     in_quote = False
+    table_buf: list[list[str]] = []
+
+    def _flush_table() -> None:
+        if table_buf:
+            out_lines.append(_format_table_text(table_buf))
+            table_buf.clear()
+
     for raw_line in text.split("\n"):
         line = raw_line.rstrip()
+
+        # Table row detection
+        if _TABLE_ROW_RE.match(line):
+            if not _is_table_sep(line):
+                cells = [c.strip() for c in line[1:-1].split("|")]
+                table_buf.append(cells)
+            continue
+        _flush_table()
 
         if _HR_RE.match(line):
             if in_quote:
@@ -183,6 +247,7 @@ def md_to_tg_html(text: str, tg_chat_id: int | None = None) -> str:
 
     if in_quote:
         out_lines.append("</blockquote>")
+    _flush_table()
 
     text = "\n".join(out_lines)
 
@@ -207,29 +272,42 @@ def md_to_tg_html(text: str, tg_chat_id: int | None = None) -> str:
 def split_tg_chunks(text: str, limit: int = TG_LIMIT) -> list[str]:
     """Разбить готовый HTML на куски ≤ limit символов по границам строк.
 
-    Не делит внутри тегов: режет только по `\n`. Для очень длинных строк
-    делает жёсткое разрезание по limit.
+    Не разрывает <pre>...</pre> блоки. Если один <pre>-блок сам по себе
+    больше limit, вставляет </pre>\\n<pre> в точке разреза.
     """
     if len(text) <= limit:
         return [text]
     chunks: list[str] = []
     buf: list[str] = []
     cur = 0
+    in_pre = False
     for line in text.split("\n"):
         ln = len(line) + 1
         if cur + ln > limit and buf:
-            chunks.append("\n".join(buf))
-            buf, cur = [], 0
-        if ln > limit:
-            # Слишком длинная строка — резать жёстко.
-            if buf:
+            if in_pre:
+                # Внутри <pre>: закрыть блок, сбросить, открыть заново.
+                buf.append("</pre>")
+                chunks.append("\n".join(buf))
+                buf = ["<pre>"]
+                cur = len("<pre>") + 1
+            elif ln > limit:
+                # Очень длинная строка вне <pre> — жёсткое разрезание.
                 chunks.append("\n".join(buf))
                 buf, cur = [], 0
-            for i in range(0, len(line), limit):
-                chunks.append(line[i : i + limit])
-            continue
+                for i in range(0, len(line), limit):
+                    chunks.append(line[i : i + limit])
+                continue
+            else:
+                # Обычный переполнение вне <pre>.
+                chunks.append("\n".join(buf))
+                buf, cur = [], 0
         buf.append(line)
         cur += ln
+        # Обновляем состояние after добавления строки.
+        if "<pre>" in line and "</pre>" not in line:
+            in_pre = True
+        elif "</pre>" in line:
+            in_pre = False
     if buf:
         chunks.append("\n".join(buf))
     return chunks

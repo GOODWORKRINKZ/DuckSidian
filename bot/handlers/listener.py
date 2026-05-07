@@ -205,7 +205,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             # Авто-извлечение текста: STT для голосовых и аудио, парсинг для документов
             # Видео анализируется позже агентом через describe_media (STT + кейфреймы)
             if media_path and media_type in {"voice", "audio", "document"}:
-                abs_path = settings.vault_path / media_path
+                abs_path = settings.vault_path / chat_name / media_path
                 try:
                     extracted_text = await extract_text_from_file(abs_path)
                     if extracted_text:

@@ -256,6 +256,15 @@ class Orchestrator:
         await self.db.mark_processed([m["id"] for m in msgs], batch_id)
 
         executor = self._make_executor(wiki, cfg)
+
+        # Предварительный анализ медиа — кэшируем в .cache/media/ чтобы
+        # агент не запускал STT/vision повторно при следующих ingest.
+        content = wiki.read_file(rel)
+        media_refs = self._extract_media_refs(content, date_iso)
+        if media_refs:
+            log.info("ingest_for_date: pre-analyzing %d media refs for %s", len(media_refs), date_iso)
+            await self._preanalyze_media(media_refs, wiki, executor)
+
         user_prompt = (
             f"Сделай ingest нового дневного батча: `{rel}`. "
             f"Дата: {date_iso}. Чат: {cfg.name}. В батче {len(msgs)} сообщений. "

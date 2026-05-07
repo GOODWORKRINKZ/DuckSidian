@@ -98,6 +98,46 @@ def test_split_chunks():
     assert "".join(p + ("\n" if i < len(parts) - 1 else "") for i, p in enumerate(parts)).rstrip("\n") == long.rstrip("\n")
 
 
+def test_split_chunks_does_not_break_pre():
+    # Большой <pre>-блок (> 4096) должен быть разбит с закрытием/открытием тегов,
+    # но никогда не должен создавать чанк с незакрытым <pre>.
+    row = "| " + "A" * 80 + " | " + "B" * 80 + " |\n"
+    big_pre = "<pre>" + (row * 60) + "</pre>"
+    parts = split_tg_chunks(big_pre, limit=4096)
+    assert len(parts) > 1, "должно разбиться на несколько частей"
+    for p in parts:
+        open_count = p.count("<pre>")
+        close_count = p.count("</pre>")
+        assert open_count == close_count, (
+            f"несбалансированные теги <pre>: открыто={open_count}, закрыто={close_count}\n{p[:200]}"
+        )
+
+
+def test_split_chunks_pre_fits_no_split():
+    # Маленький <pre>-блок не должен разбиваться.
+    pre = "<pre>" + "line\n" * 5 + "</pre>"
+    parts = split_tg_chunks(pre, limit=4096)
+    assert len(parts) == 1
+
+
+def test_table_kv():
+    md = "| Ключ | Значение |\n|---|---|\n| **ФИО** | Денис |\n| GitHub | krikz |\n"
+    out = md_to_tg_html(md)
+    assert "<pre>" not in out
+    assert "<b>ФИО</b>: Денис" in out
+    assert "GitHub: krikz" in out
+
+
+def test_table_cards():
+    md = "| Имя | Роль | Навык |\n|---|---|---|\n| **Вася** | Dev | Python |\n| Петя | PM | Excel |\n"
+    out = md_to_tg_html(md)
+    assert "<pre>" not in out
+    assert "• <b>Вася</b>" in out
+    assert "Роль: Dev" in out
+    assert "• Петя" in out
+    assert "Навык: Excel" in out
+
+
 def test_unbalanced_asterisk_safe():
     # одиночные * не должны ломать вывод
     out = md_to_tg_html("a * b * c **bold**")

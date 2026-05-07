@@ -346,6 +346,17 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "get_current_time",
+            "description": (
+                "Вернуть текущую дату и время (часовой пояс Europe/Moscow). "
+                "Используй когда нужно знать 'сегодня', 'вчера', 'эта неделя' и т.д."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "fetch_git_log",
             "description": (
                 "Получить историю коммитов GitHub-репозитория (источник правды для проектов). "
@@ -388,6 +399,17 @@ class ToolExecutor:
 
     async def call(self, name: str, arguments: dict[str, Any]) -> str:
         try:
+            if name == "get_current_time":
+                import datetime as _dt
+                import zoneinfo as _zi
+                tz = _zi.ZoneInfo("Europe/Moscow")
+                now = _dt.datetime.now(tz)
+                yesterday = (now - _dt.timedelta(days=1)).date()
+                return (
+                    f"Сейчас: {now.strftime('%Y-%m-%d %H:%M')} MSK\n"
+                    f"Сегодня: {now.date()}\n"
+                    f"Вчера: {yesterday}"
+                )
             if name == "read_file":
                 path = arguments["path"]
                 # Хардкод-защита: log.md растёт без предела, читать его при ingest бессмысленно.
@@ -656,7 +678,11 @@ class ToolExecutor:
             return f"ERROR: {exc}"
 
     async def _describe_media(self, rel_path: str) -> str:
-        """Анализ медиафайла: vision для изображений, STT/parse для остальных."""
+        """Анализ медиафайла: vision для изображений, STT/parse для остальных.
+
+        Результат кэшируется в .cache/media/<rel_path_escaped>.txt — повторный
+        вызов с тем же файлом возвращает кэш мгновенно без запуска STT/vision.
+        """
         from ..media_parser import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, extract_text_from_file, analyze_video
 
         try:
@@ -665,6 +691,16 @@ class ToolExecutor:
             return f"ERROR: {exc}"
         if not file_path.is_file():
             return f"ERROR: файл не найден: {rel_path}"
+
+        # Проверить диск-кэш прежде чем запускать STT/vision.
+        cache_path = self.wiki.root / ".cache" / "media" / (rel_path.replace("/", "__") + ".txt")
+        if cache_path.exists():
+            try:
+                cached = cache_path.read_text(encoding="utf-8")
+                log.info("describe_media %s → cache hit (%d chars)", rel_path, len(cached))
+                return cached
+            except OSError:
+                pass
 
         ext = file_path.suffix.lower()
         size_kb = file_path.stat().st_size // 1024
@@ -682,22 +718,32 @@ class ToolExecutor:
             raw = file_path.read_bytes()
             b64 = base64.b64encode(raw).decode()
             description = await self._ds.describe_image(b64, mime)
-            return f"[изображение {ext}, {size_kb} KB]\n{description}"
+            result = f"[изображение {ext}, {size_kb} KB]\n{description}"
 
-        # Видео — STT + keyframes
-        if ext in VIDEO_EXTENSIONS:
+        elif ext in VIDEO_EXTENSIONS:
+            # Видео — STT + keyframes
             if self._ds is None:
                 return f"[видео {ext}, {size_kb} KB — vision API недоступен]"
-            result = await analyze_video(file_path, self._ds.describe_image)
-            return f"[видео {ext}, {size_kb} KB]\n{result}"
+            analysis = await analyze_video(file_path, self._ds.describe_image)
+            result = f"[видео {ext}, {size_kb} KB]\n{analysis}"
 
-        # PDF, DOCX, XLSX, текст, аудио/голосовые — через media_parser
-        extracted = await extract_text_from_file(file_path)
-        if extracted is not None:
-            label = "голосовое/аудио (STT)" if ext in AUDIO_EXTENSIONS else f"файл {ext}"
-            return f"[{label}, {size_kb} KB]\n{extracted}"
+        else:
+            # PDF, DOCX, XLSX, текст, аудио/голосовые — через media_parser
+            extracted = await extract_text_from_file(file_path)
+            if extracted is not None:
+                label = "голосовое/аудио (STT)" if ext in AUDIO_EXTENSIONS else f"файл {ext}"
+                result = f"[{label}, {size_kb} KB]\n{extracted}"
+            else:
+                return f"[файл {ext}, {size_kb} KB — бинарный, анализ недоступен]"
 
-        return f"[файл {ext}, {size_kb} KB — бинарный, анализ недоступен]"
+        # Сохранить в кэш.
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(result, encoding="utf-8")
+        except OSError as exc:
+            log.warning("describe_media: не удалось записать кэш %s: %s", cache_path, exc)
+
+        return result
 
     @staticmethod
     @staticmethod
@@ -756,6 +802,87 @@ class ToolExecutor:
         return result
 
     @staticmethod
+    def _yt_video_id(url: str) -> str | None:
+        """Извлечь video_id из ссылки YouTube."""
+        import re
+        import urllib.parse
+        parsed = urllib.parse.urlparse(url)
+        # youtu.be/VIDEO_ID
+        if parsed.netloc in ("youtu.be",):
+            vid = parsed.path.lstrip("/").split("/")[0].split("?")[0]
+            return vid or None
+        # youtube.com/watch?v=VIDEO_ID  или /shorts/VIDEO_ID  или /embed/VIDEO_ID
+        if "youtube.com" in parsed.netloc:
+            m = re.search(r"[?&]v=([a-zA-Z0-9_-]{11})", url)
+            if m:
+                return m.group(1)
+            m = re.search(r"/(?:shorts|embed|v)/([a-zA-Z0-9_-]{11})", parsed.path)
+            if m:
+                return m.group(1)
+        return None
+
+    @staticmethod
+    async def _fetch_youtube(url: str, video_id: str) -> str:
+        """Получить метаданные + стенограмму YouTube-видео."""
+        import asyncio
+
+        yt_url = f"https://www.youtube.com/watch?v={video_id}"
+
+        def _get_transcript() -> tuple[str, str]:
+            """Синхронно: стянуть стенограмму через youtube-transcript-api."""
+            try:
+                from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled  # type: ignore[import]
+                api = YouTubeTranscriptApi()
+                # Предпочитаем русский, потом английский, потом любой
+                try:
+                    transcript = api.fetch(video_id, languages=["ru", "en"])
+                except NoTranscriptFound:
+                    transcript_list = api.list(video_id)
+                    transcript = next(iter(transcript_list)).fetch()
+                snippets = [s.text for s in transcript]
+                full = " ".join(snippets)
+                # Обрезаем до ~4000 символов
+                if len(full) > 4000:
+                    full = full[:4000] + f"...(обрезано, всего ~{len(full)} символов)"
+                lang = getattr(transcript, "language_code", "?")
+                return full, lang
+            except Exception as exc:  # noqa: BLE001
+                return "", str(exc)
+
+        def _get_title() -> str:
+            """Синхронно: получить заголовок через oEmbed (без API-ключа)."""
+            try:
+                import urllib.request
+                import json as _json
+                oembed_url = f"https://www.youtube.com/oembed?url={yt_url}&format=json"
+                with urllib.request.urlopen(oembed_url, timeout=8) as r:  # noqa: S310
+                    data = _json.loads(r.read())
+                return data.get("title", ""), data.get("author_name", "")
+            except Exception:  # noqa: BLE001
+                return "", ""
+
+        loop = asyncio.get_event_loop()
+        (title, author), (transcript_text, transcript_err) = await asyncio.gather(
+            loop.run_in_executor(None, _get_title),
+            loop.run_in_executor(None, _get_transcript),
+        )
+
+        lines = [f"URL: {yt_url}"]
+        if title:
+            lines.append(f"Заголовок: {title}")
+        if author:
+            lines.append(f"Канал: {author}")
+
+        if transcript_text:
+            lines.append(f"\nСтенограмма:\n{transcript_text}")
+        else:
+            lines.append(f"\n[Стенограмма недоступна: {transcript_err}]")
+
+        result = "\n".join(lines)
+        log.info("youtube %s → title=%r transcript=%d chars", video_id, title, len(transcript_text))
+        return result
+
+    @staticmethod
     async def _fetch_url(url: str) -> str:
         """Загрузить страницу и вернуть очищенный текст (до 3000 символов)."""
         import re
@@ -770,6 +897,11 @@ class ToolExecutor:
         _bv_match = _re.search(r"/video/(BV[a-zA-Z0-9]+)", url)
         if _bv_match and "bilibili.com" in parsed.netloc:
             return await ToolExecutor._fetch_bilibili(_bv_match.group(1))
+
+        # YouTube: use transcript API
+        _yt_id = ToolExecutor._yt_video_id(url)
+        if _yt_id:
+            return await ToolExecutor._fetch_youtube(url, _yt_id)
 
         # 1688: blocks scraping with JS challenge; no public API without key.
         # Return offer URL so agent can still record it as a clickable link.
