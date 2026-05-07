@@ -232,16 +232,18 @@ class Wiki:
             lines.append(head)
             if tg_link:
                 lines.append(f"> tg: [{mid}]({tg_link})")
-            if text:
+            media_type = m.get("media_type")
+            media_path = m.get("media_path")
+            if media_type and media_path:
+                lines.append(f"> 📎 *{media_type}*: `[[{media_path}]]`")
+                if text:
+                    for ln in text.splitlines():
+                        lines.append(f"> {ln}")
+            elif media_type:
+                lines.append(f"> 📎 *{media_type}* (файл не скачан)")
+            elif text:
                 for ln in text.splitlines():
                     lines.append(f"> {ln}")
-            elif m.get("media_type"):
-                media_type = m["media_type"]
-                media_path = m.get("media_path")
-                if media_path:
-                    lines.append(f"> 📎 *{media_type}*: `[[{media_path}]]`")
-                else:
-                    lines.append(f"> 📎 *{media_type}* (файл не скачан)")
             else:
                 lines.append("> *(non-text content)*")
             lines.append(f"^msg-{mid}")
