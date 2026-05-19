@@ -487,6 +487,7 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
 
     @router.message(
         F.reply_to_message,
+        F.reply_to_message.from_user.is_bot == True,  # только реплаи на бота
         F.func(lambda m: not any(
             e.type == "bot_command" for e in (m.entities or [])
         )),
