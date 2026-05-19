@@ -208,6 +208,8 @@ async def run_agent(
                 run.finished = True
                 finish_called = True
                 log.info("agent step %d: finish(summary=%r)", step, run.summary[:120])
+                if len(run.summary) > 120:
+                    log.info("agent step %d: finish(summary_tail=%r)", step, run.summary[-300:])
                 messages.append(
                     {
                         "role": "tool",

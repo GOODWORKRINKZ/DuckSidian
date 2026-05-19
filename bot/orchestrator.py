@@ -640,11 +640,13 @@ class Orchestrator:
         cfg = chat_cfg or settings.get_chats()[0]
         wiki = _chat_wiki(cfg)
         executor = self._make_executor(wiki, cfg)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        user_prompt = f"Сегодня: {today}.\n\n{question}"
         run = await run_agent(
             client=self.client,
             executor=executor,
             system_prompt=QUERY_SYSTEM,
-            user_prompt=question,
+            user_prompt=user_prompt,
             max_steps=30,
         )
         self._record_run("query", run)

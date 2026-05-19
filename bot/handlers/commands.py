@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandObject
@@ -14,6 +16,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    InputMediaVideo,
     Message,
     ReactionTypeEmoji,
 )
@@ -48,6 +51,11 @@ async def _react(bot: Bot, msg: Message, emoji: str) -> None:
 # после рестарта бота кнопки протухнут — это ок, они одноразовые.
 _pending_saves: dict[str, tuple[str, str, int]] = {}
 _PENDING_SAVES_MAX = 200
+
+# message_id сообщений бота, которые являются ответами на /ask (или followup).
+# Только на эти сообщения разрешён followup-реплай.
+_ask_response_msg_ids: set[int] = set()
+_ASK_RESPONSE_IDS_MAX = 500
 
 
 # Кэш ответов /ask, ожидающих пользовательских правок (кнопка ✏️ Поправить).
@@ -93,12 +101,15 @@ def _slugify_query(text: str, max_len: int = 40) -> str:
     return s
 
 
-# Расширения, которые Telegram умеет показывать как фото в media group.
+# Расширения, которые Telegram умеет показывать как фото/видео/анимация.
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+_VID_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
+_GIF_EXTS = {".gif"}
+_MEDIA_EXTS = _IMG_EXTS | _VID_EXTS | _GIF_EXTS
 
 
 def _extract_image_refs(answer: str, wiki_root, max_n: int = 10) -> list:
-    """Найти картинки в финальном блоке IMAGES: ответа агента.
+    """Найти медиафайлы в финальном блоке IMAGES: ответа агента.
 
     Формат, который агент обязан использовать (см. QUERY_SYSTEM):
 
@@ -106,11 +117,11 @@ def _extract_image_refs(answer: str, wiki_root, max_n: int = 10) -> list:
 
         IMAGES:
         raw/assets/2026-04-28/photo_1.jpg
-        raw/assets/2026-04-28/photo_2.png
+        raw/assets/2026-04-28/video_1.mp4
 
     Любые `raw/assets/...` упоминания вне этого блока игнорируются —
     они часто оказываются левыми (агент копирует из wiki-источников).
-    Файл должен реально существовать в vault'е чата; jpg/jpeg/png/webp.
+    Файл должен реально существовать в vault'е чата; jpg/jpeg/png/webp/mp4/mov.
     """
     if not answer:
         return []
@@ -135,7 +146,7 @@ def _extract_image_refs(answer: str, wiki_root, max_n: int = 10) -> list:
             break
         rel = lm.group(0).rstrip(".,;:!?")
         ext = rel.lower().rsplit(".", 1)
-        if len(ext) != 2 or "." + ext[1] not in _IMG_EXTS:
+        if len(ext) != 2 or "." + ext[1] not in _MEDIA_EXTS:
             continue
         if rel in seen:
             continue
@@ -175,7 +186,50 @@ def _wiki_for_msg(msg: Message) -> Wiki:
     return _chat_wiki(cfg)
 
 
-async def _reply_html(msg: Message, markdown_text: str) -> None:
+async def _download_ask_media(bot: Bot, source_msg: Message, wiki: Wiki) -> list[str]:
+    """Скачать медиафайл(ы) из сообщения в vault и вернуть rel-пути.
+
+    Поддерживает photo, video, animation (gif), document с медиа-расширением.
+    Возвращает пустой список если медиа нет или скачать не удалось.
+    """
+    date = (source_msg.date or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+    assets_dir = wiki.root / "raw" / "assets" / date
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    mid = source_msg.message_id
+    candidates: list[tuple[str, str]] = []  # (file_id, filename)
+    if source_msg.photo:
+        ph = source_msg.photo[-1]
+        candidates.append((ph.file_id, f"ask_photo_{mid}.jpg"))
+    if source_msg.video:
+        candidates.append((source_msg.video.file_id, source_msg.video.file_name or f"ask_video_{mid}.mp4"))
+    if source_msg.animation:
+        candidates.append((source_msg.animation.file_id, source_msg.animation.file_name or f"ask_anim_{mid}.gif"))
+    if source_msg.document:
+        doc = source_msg.document
+        fn = doc.file_name or ""
+        ext = ("." + fn.lower().rsplit(".", 1)[-1]) if "." in fn else ""
+        if ext in _MEDIA_EXTS:
+            candidates.append((doc.file_id, fn or f"ask_doc_{mid}{ext}"))
+
+    results: list[str] = []
+    for file_id, filename in candidates:
+        safe = "".join(c for c in filename if c.isalnum() or c in "._-") or f"ask_{mid}.bin"
+        dst = assets_dir / safe
+        if not dst.exists():
+            try:
+                tg_file = await bot.get_file(file_id)
+                await bot.download_file(tg_file.file_path, destination=str(dst))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("ask: media download failed: %s: %r", type(exc).__name__, exc)
+                continue
+        rel = str(dst.relative_to(wiki.root)).replace("\\", "/")
+        results.append(rel)
+    return results
+
+
+async def _reply_html(msg: Message, markdown_text: str) -> list[int]:
+    """Возвращает список message_id отправленных сообщений."""
     """Отправить markdown-ответ агента в Telegram чанками.
 
     Устойчив к:
@@ -190,17 +244,16 @@ async def _reply_html(msg: Message, markdown_text: str) -> None:
     html_text = md_to_tg_html(markdown_text or "(пусто)", tg_chat_id=msg.chat.id)
     chunks = split_tg_chunks(html_text)
 
-    async def _send_chunk(chunk: str, use_reply: bool) -> bool:
+    async def _send_chunk(chunk: str, use_reply: bool) -> "Message | None":
         backoffs = [0, 2, 5]
         for i, delay in enumerate(backoffs):
             if delay:
                 await asyncio.sleep(delay)
             try:
                 if use_reply:
-                    await msg.reply(chunk, parse_mode="HTML")
+                    return await msg.reply(chunk, parse_mode="HTML")
                 else:
-                    await msg.answer(chunk, parse_mode="HTML")
-                return True
+                    return await msg.answer(chunk, parse_mode="HTML")
             except TelegramBadRequest as exc:
                 # Исходное сообщение удалили — переключаемся на answer.
                 if use_reply and "reply" in str(exc).lower():
@@ -208,19 +261,23 @@ async def _reply_html(msg: Message, markdown_text: str) -> None:
                     use_reply = False
                     continue
                 log.error("send chunk failed (BadRequest): %s", exc)
-                return False
+                return None
             except TelegramNetworkError as exc:
                 log.warning("send chunk net err (try %d/%d): %s", i + 1, len(backoffs), exc)
-        return False
+        return None
 
     use_reply = True
+    sent_ids: list[int] = []
     for chunk in chunks:
-        ok = await _send_chunk(chunk, use_reply=use_reply)
-        if not ok:
+        sent_msg = await _send_chunk(chunk, use_reply=use_reply)
+        if not sent_msg:
             log.error("chunk delivery failed; full agent answer follows:\n%s", markdown_text)
             break
+        if hasattr(sent_msg, 'message_id'):
+            sent_ids.append(sent_msg.message_id)
         # После первого успеха или фолбэка — остальные чанки простыми answer.
         use_reply = False
+    return sent_ids
 
 
 HELP_TEXT = (
@@ -312,7 +369,32 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
 
     @router.message(Command("ask"))
     async def cmd_ask(msg: Message, command: CommandObject, bot: Bot) -> None:
-        q = (command.args or "").strip()
+        q = (command.args or msg.caption or "").strip()
+        # Убираем саму команду из caption если там "/ask вопрос"
+        if q.startswith("/ask"):
+            q = q[4:].strip()
+        chat_wiki = _wiki_for_msg(msg)
+
+        # Скачать медиа прикреплённое к самому /ask-сообщению
+        attached_media: list[str] = await _download_ask_media(bot, msg, chat_wiki)
+
+        # Если /ask сделан reply'ем — добавим текст и медиа того сообщения
+        if msg.reply_to_message:
+            r = msg.reply_to_message
+            quoted = (r.text or r.caption or "").strip()
+            if quoted:
+                author = r.from_user.full_name if r.from_user else "anon"
+                quoted_block = f"[{author}]: {quoted}"
+                q = f"{q}\n\nКонтекст (реплай):\n{quoted_block}".strip() if q else quoted_block
+            # Скачать медиа из реплая
+            reply_media = await _download_ask_media(bot, r, chat_wiki)
+            attached_media.extend(reply_media)
+
+        # Добавить пути к медиа в вопрос чтобы агент мог вызвать describe_media
+        if attached_media:
+            media_block = "\n".join(f"- {p}" for p in attached_media)
+            q = f"{q}\n\n[ПРИКРЕПЛЕНО ПОЛЬЗОВАТЕЛЕМ — вызови describe_media для каждого:]\n{media_block}".strip()
+
         if not q:
             await msg.reply("Использование: /ask <вопрос>")
             return
@@ -329,14 +411,47 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
             await _reply_html(msg, display or "(пусто)")
             # Прикрепить картинки из ответа (если агент сослался на raw/assets/*.jpg|png|...)
             try:
+                import asyncio
+                from aiogram.exceptions import TelegramRetryAfter
+                _TG_MAX_BYTES = 50 * 1024 * 1024  # Telegram Bot API limit for video upload
                 chat_wiki = _wiki_for_msg(msg)
                 img_paths = _extract_image_refs(answer or "", chat_wiki.root)
+                # Фильтруем файлы > 50 МБ (Telegram не принимает)
+                oversized = [p for p in img_paths if os.path.getsize(p) > _TG_MAX_BYTES]
+                img_paths = [p for p in img_paths if os.path.getsize(p) <= _TG_MAX_BYTES]
+                if oversized:
+                    log.warning("ask: skipping %d oversized files: %s", len(oversized), oversized)
+                log.info("ask: image_refs found=%d paths=%s", len(img_paths), img_paths)
                 if img_paths:
-                    if len(img_paths) == 1:
-                        await msg.answer_photo(FSInputFile(img_paths[0]))
-                    else:
-                        media = [InputMediaPhoto(media=FSInputFile(p)) for p in img_paths[:10]]
-                        await msg.answer_media_group(media)
+                    def _ext(p: str) -> str:
+                        return "." + p.lower().rsplit(".", 1)[-1]
+                    def _make_media_item(p: str):
+                        f = FSInputFile(p)
+                        return InputMediaVideo(media=f) if _ext(p) in _VID_EXTS else InputMediaPhoto(media=f)
+
+                    gifs = [p for p in img_paths if _ext(p) in _GIF_EXTS]
+                    rest = [p for p in img_paths if _ext(p) not in _GIF_EXTS]
+
+                    for _attempt in range(3):
+                        try:
+                            if rest:
+                                if len(rest) == 1:
+                                    p = rest[0]
+                                    if _ext(p) in _VID_EXTS:
+                                        await msg.answer_video(FSInputFile(p))
+                                    else:
+                                        await msg.answer_photo(FSInputFile(p))
+                                else:
+                                    media = [_make_media_item(p) for p in rest[:10]]
+                                    await msg.answer_media_group(media)
+                            for gif in gifs:
+                                await msg.answer_animation(FSInputFile(gif))
+                            log.info("ask: media sent ok (%d files, %d gifs)", len(rest), len(gifs))
+                            break
+                        except TelegramRetryAfter as exc:
+                            wait = exc.retry_after + 1
+                            log.warning("ask: attach media flood control, waiting %ds (attempt %d/3)", wait, _attempt + 1)
+                            await asyncio.sleep(wait)
             except Exception as exc:  # noqa: BLE001
                 log.warning("ask: attach images failed: %s: %r", type(exc).__name__, exc)
             # Кнопка "Сохранить" — кладём ответ в in-memory кэш под коротким id
@@ -367,6 +482,107 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
                     log.warning("ask: send save-button failed: %s", exc)
         except Exception as exc:  # noqa: BLE001
             log.error("query failed: %s", exc)
+            await _react(bot, msg, "❌")
+            await msg.reply("⚠️ Ошибка при обращении к DeepSeek, попробуй ещё раз.")
+
+    @router.message(
+        F.reply_to_message,
+        F.func(lambda m: not any(
+            e.type == "bot_command" for e in (m.entities or [])
+        )),
+    )
+    async def cmd_followup(msg: Message, bot: Bot) -> None:
+        """Уточняющий вопрос реплаем на сообщение бота — продолжение треда /ask."""
+        r = msg.reply_to_message
+        if not r or not r.from_user or r.from_user.id != bot.id:
+            return  # не реплай на бота — игнорируем
+        # В форумных группах Telegram автоматически добавляет reply_to_message
+        # указывающий на первое сообщение топика (= message_thread_id).
+        # Это НЕ реальный реплай пользователя — игнорируем.
+        if msg.message_thread_id and r.message_id == msg.message_thread_id:
+            return
+
+        q = (msg.text or msg.caption or "").strip()
+        chat_wiki = _wiki_for_msg(msg)
+
+        # Медиа из уточняющего сообщения
+        attached_media: list[str] = await _download_ask_media(bot, msg, chat_wiki)
+
+        # Контекст: предыдущий ответ бота (обрезаем, чтобы не раздувать промпт)
+        prev_text = (r.text or r.caption or "").strip()
+        if prev_text:
+            q = f"[Предыдущий ответ бота]:\n{prev_text[:1500]}\n\n[Уточнение пользователя]:\n{q}".strip() if q else prev_text
+
+        if attached_media:
+            media_block = "\n".join(f"- {p}" for p in attached_media)
+            q = f"{q}\n\n[ПРИКРЕПЛЕНО ПОЛЬЗОВАТЕЛЕМ — вызови describe_media для каждого:]\n{media_block}".strip()
+
+        if not q:
+            return
+
+        log.info("followup: chat=%s user=%s q=%r", msg.chat.id,
+                 msg.from_user.username if msg.from_user else None, q[:80])
+        await _react(bot, msg, "👀")
+        await msg.chat.do("typing")
+        try:
+            answer = await orch.query(q)
+            display = answer or ""
+            _img_marker = re.search(r"(?im)^\s*IMAGES\s*:\s*$", display)
+            if _img_marker:
+                display = display[: _img_marker.start()].rstrip()
+            await _reply_html(msg, display or "(пусто)")
+
+            # Прикрепить картинки из ответа
+            try:
+                import asyncio
+                from aiogram.exceptions import TelegramRetryAfter
+                _TG_MAX_BYTES = 50 * 1024 * 1024
+                img_paths = _extract_image_refs(answer or "", chat_wiki.root)
+                img_paths = [p for p in img_paths if os.path.getsize(p) <= _TG_MAX_BYTES]
+                if img_paths:
+                    def _ext(p: str) -> str:
+                        return "." + p.lower().rsplit(".", 1)[-1]
+                    def _make_item(p: str):
+                        f = FSInputFile(p)
+                        return InputMediaVideo(media=f) if _ext(p) in _VID_EXTS else InputMediaPhoto(media=f)
+                    gifs = [p for p in img_paths if _ext(p) in _GIF_EXTS]
+                    rest = [p for p in img_paths if _ext(p) not in _GIF_EXTS]
+                    for _attempt in range(3):
+                        try:
+                            if rest:
+                                if len(rest) == 1:
+                                    p = rest[0]
+                                    if _ext(p) in _VID_EXTS:
+                                        await msg.answer_video(FSInputFile(p))
+                                    else:
+                                        await msg.answer_photo(FSInputFile(p))
+                                else:
+                                    await msg.answer_media_group([_make_item(p) for p in rest[:10]])
+                            for gif in gifs:
+                                await msg.answer_animation(FSInputFile(gif))
+                            break
+                        except TelegramRetryAfter as exc:
+                            await asyncio.sleep(exc.retry_after + 1)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("followup: attach images failed: %s: %r", type(exc).__name__, exc)
+
+            # Кнопки «Сохранить / Поправить»
+            if answer:
+                save_id = uuid.uuid4().hex[:12]
+                _pending_saves[save_id] = (q, answer, msg.chat.id)
+                _pending_fixes[save_id] = (q, answer, msg.chat.id)
+                _trim_pending_saves()
+                _trim_pending_fixes()
+                kb = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="💾 Сохранить", callback_data=f"qsave:{save_id}"),
+                    InlineKeyboardButton(text="✏️ Поправить", callback_data=f"qfix:{save_id}"),
+                ]])
+                try:
+                    await msg.answer("Сохранить как заметку или поправить ответ?", reply_markup=kb)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("followup: send save-button failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.error("followup failed: %s", exc)
             await _react(bot, msg, "❌")
             await msg.reply("⚠️ Ошибка при обращении к DeepSeek, попробуй ещё раз.")
 
