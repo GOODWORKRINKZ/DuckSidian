@@ -251,7 +251,8 @@ class Orchestrator:
         if not msgs:
             return f"Нет сообщений за {date_iso} в чате [{cfg.name}]."
 
-        rel = wiki.write_daily_raw(date_iso, msgs)
+        topics = await self.db.get_topics(cfg.chat_id)
+        rel = wiki.write_daily_raw(date_iso, msgs, topics=topics)
         batch_id = await self.db.create_batch(date_iso)
         await self.db.mark_processed([m["id"] for m in msgs], batch_id)
 
@@ -311,7 +312,8 @@ class Orchestrator:
         if not msgs:
             return "Нет сообщений в БД."
         date_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d_adhoc-%H%M%S")
-        rel = wiki.write_daily_raw(date_iso, msgs)
+        topics = await self.db.get_topics(cfg.chat_id)
+        rel = wiki.write_daily_raw(date_iso, msgs, topics=topics)
         batch_id = await self.db.create_batch(date_iso)
         executor = self._make_executor(wiki, cfg)
         user_prompt = (

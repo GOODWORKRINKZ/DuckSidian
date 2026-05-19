@@ -203,7 +203,8 @@ class Wiki:
         return f"https://t.me/c/{channel_id}/{message_id}"
 
     def write_daily_raw(
-        self, date_iso: str, messages: Iterable[dict]
+        self, date_iso: str, messages: Iterable[dict],
+        topics: dict[int, str] | None = None,
     ) -> str:
         """Сформировать raw/daily/<date>.md из сообщений и вернуть rel-путь."""
         lines: list[str] = [
@@ -223,8 +224,14 @@ class Wiki:
             chat_id = m.get("chat_id")
             text = (m.get("text") or "").strip()
             reply = m.get("reply_to_message_id")
+            topic_id = m.get("topic_id")
             tg_link = self._tg_link(chat_id, mid)
             head = f"### [{ts}] {who}"
+            if topic_id and topics:
+                topic_name = topics.get(int(topic_id), f"topic#{topic_id}")
+                head += f" · 📌 {topic_name}"
+            elif topic_id:
+                head += f" · 📌 topic#{topic_id}"
             if reply:
                 tg_reply_link = self._tg_link(chat_id, reply)
                 reply_ref = f"[^msg-{reply}]({tg_reply_link})" if tg_reply_link else f"^msg-{reply}"

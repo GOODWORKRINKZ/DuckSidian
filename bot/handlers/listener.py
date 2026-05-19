@@ -192,6 +192,19 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
 
         ts = msg.date or datetime.now(timezone.utc)
 
+        # Имя топика из service-сообщений
+        if msg.forum_topic_created and msg.message_thread_id:
+            name = msg.forum_topic_created.name
+            await db.save_topic(msg.chat.id, msg.message_thread_id, name)
+            log.info("topic saved: chat=%s topic_id=%s name=%r",
+                     msg.chat.id, msg.message_thread_id, name)
+        elif msg.forum_topic_edited and msg.message_thread_id:
+            name = msg.forum_topic_edited.name
+            if name:
+                await db.save_topic(msg.chat.id, msg.message_thread_id, name)
+                log.info("topic renamed: chat=%s topic_id=%s name=%r",
+                         msg.chat.id, msg.message_thread_id, name)
+
         # Скачиваем медиа
         media_type: str | None = None
         media_path: str | None = None

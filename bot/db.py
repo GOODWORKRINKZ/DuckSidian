@@ -64,6 +64,14 @@ CREATE TABLE IF NOT EXISTS disputes (
     answered_at TEXT,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS topics (
+    chat_id INTEGER NOT NULL,
+    topic_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, topic_id)
+);
 """
 
 
@@ -95,6 +103,15 @@ class DB:
                     answer TEXT,
                     answered_at TEXT,
                     created_at TEXT NOT NULL
+                )"""
+            )
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS topics (
+                    chat_id INTEGER NOT NULL,
+                    topic_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, topic_id)
                 )"""
             )
             await db.commit()
@@ -213,6 +230,28 @@ class DB:
                 ),
             )
             await db.commit()
+
+    # --- topics ---
+
+    async def save_topic(self, chat_id: int, topic_id: int, name: str) -> None:
+        async with self.conn() as db:
+            await db.execute(
+                """INSERT INTO topics (chat_id, topic_id, name, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(chat_id, topic_id) DO UPDATE
+                   SET name=excluded.name, updated_at=excluded.updated_at""",
+                (chat_id, topic_id, name, datetime.now(timezone.utc).isoformat()),
+            )
+            await db.commit()
+
+    async def get_topics(self, chat_id: int) -> dict[int, str]:
+        """Вернуть {topic_id: name} для чата."""
+        async with self.conn() as db:
+            async with db.execute(
+                "SELECT topic_id, name FROM topics WHERE chat_id=?", (chat_id,)
+            ) as cur:
+                rows = await cur.fetchall()
+        return {int(r["topic_id"]): r["name"] for r in rows}
 
     # --- state ---
 
