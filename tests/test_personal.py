@@ -617,3 +617,23 @@ def test_stage_accept_workspace_for_user(vault: Path) -> None:
     assert (dst.root / "raw/incoming/tok2").exists()
     discard_staged_workspace(dst, "tok2")
     assert not (dst.root / "raw/incoming/tok2").exists()
+
+
+def test_shared_space_and_convert(vault: Path) -> None:
+    from bot.personal import PersonalSpace, collect_workspace_pages, convert_workspace_to_shared, shared_slug_of
+    owner = PersonalSpace(1, "Иван")
+    slug = owner.ensure_project("Бизнес-кейсы")
+    (owner.root / "raw/assets/2026-01-01").mkdir(parents=True)
+    (owner.root / "raw/assets/2026-01-01/a.png").write_bytes(b"PNG")
+    owner.wiki.write_file("wiki/sources/v.md", "---\ntype: source\nproject: \"[[Бизнес-кейсы]]\"\n---\n# v\n![[raw/assets/2026-01-01/a.png]]\n")
+    shared = convert_workspace_to_shared(owner, slug)
+    assert shared.is_shared and shared.cfg.name == "shared/Бизнес-кейсы"
+    assert shared.root == vault / "shared" / "Бизнес-кейсы"
+    assert (shared.root / "wiki/projects/Бизнес-кейсы.md").exists() and not (owner.root / "wiki/projects/Бизнес-кейсы.md").exists()
+    assert (shared.root / "wiki/sources/v.md").exists() and (shared.root / "raw/assets/2026-01-01/a.png").exists()
+    assert len(collect_workspace_pages(shared, slug)) == 2
+    assert "shared/Бизнес-кейсы" in (owner.root / "index.md").read_text(encoding="utf-8")
+    assert shared_slug_of("shared/x") == "x" and shared_slug_of("x") is None
+    # второй участник открывает тот же общий vault
+    other = PersonalSpace.shared(slug, "Петя")
+    assert other.root == shared.root and other.wiki.read_file("wiki/sources/v.md").startswith("---")

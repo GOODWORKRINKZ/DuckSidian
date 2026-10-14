@@ -612,6 +612,11 @@ PERSONAL_EXTRA_TOOLS += [
                 "properties": {
                     "target": {"type": "string"},
                     "comment": {"type": "string", "default": ""},
+                    "mode": {
+                        "type": "string",
+                        "description": "Для человека: copy — снимок (копия), coop — совместный воркспейс (одна вкладка на двоих, общий vault). По умолчанию спроси пользователя или coop, если он сказал «вместе/совместно».",
+                        "default": "copy",
+                    },
                 },
                 "required": ["target"],
             },

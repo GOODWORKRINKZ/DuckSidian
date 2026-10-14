@@ -57,6 +57,8 @@ def _chat_wiki(chat_cfg: ChatConfig) -> Wiki:
     """
     if is_user_cfg(chat_cfg):
         return PersonalSpace(chat_cfg.chat_id).wiki
+    if chat_cfg.name.startswith("shared/"):
+        return PersonalSpace.shared(chat_cfg.name[len("shared/"):]).wiki
     root = settings.vault_path / chat_cfg.name
     root.mkdir(parents=True, exist_ok=True)
     # Если AGENTS.md отсутствует — скопируем из глобального vault-template

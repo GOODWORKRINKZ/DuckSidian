@@ -534,3 +534,12 @@ class DB:
             ) as cur:
                 row = await cur.fetchone()
         return int(row["user_id"]) if row else None
+
+
+    async def find_workspaces_by_slug(self, project_slug: str) -> list[aiosqlite.Row]:
+        """Все темы (всех пользователей), привязанные к project_slug (для shared/<slug>)."""
+        async with self.conn() as db:
+            async with db.execute(
+                "SELECT * FROM workspaces WHERE project_slug=? ORDER BY updated_at", (project_slug,)
+            ) as cur:
+                return list(await cur.fetchall())

@@ -55,12 +55,15 @@ from ..media_parser import (
 from ..orchestrator import Orchestrator
 from ..personal import (
     ARTIFACT_KINDS,
+    SHARED_PREFIX,
     Artifact,
     PersonalSpace,
     accept_staged_workspace,
     artifact_markdown_table,
+    convert_workspace_to_shared,
     describe_space,
     discard_staged_workspace,
+    shared_slug_of,
     slugify,
     stage_workspace_for_user,
 )
@@ -210,8 +213,25 @@ _PENDING_MAX = 300
 # Кому уже сказали «нет доступа» (чтобы не спамить на каждое сообщение)
 _denied_notified: set[int] = set()
 # Последовательная обработка сообщений одного пользователя
-_user_locks: dict[int, asyncio.Lock] = {}
-_queue_depth: dict[int, int] = {}
+_user_locks: dict[Any, asyncio.Lock] = {}
+_queue_depth: dict[Any, int] = {}
+
+
+def _space_for(space: PersonalSpace, ws: dict[str, Any] | None) -> PersonalSpace:
+    """Пространство, в котором работаем: общий vault для shared-воркспейса, иначе личный."""
+    sslug = shared_slug_of(ws.get("project_slug") if ws else None)
+    if sslug:
+        return PersonalSpace.shared(sslug, space.display_name)
+    return space
+
+
+def _ws_slug(ws: dict[str, Any]) -> str:
+    return shared_slug_of(ws.get("project_slug")) or str(ws.get("project_slug") or "")
+
+
+def _ws_path(ws: dict[str, Any]) -> str:
+    sslug = shared_slug_of(ws.get("project_slug"))
+    return f"shared/{sslug}/wiki/projects/{sslug}.md" if sslug else f"wiki/projects/{ws.get('project_slug')}.md"
 
 
 def _trim(d: dict) -> None:
@@ -219,7 +239,7 @@ def _trim(d: dict) -> None:
         d.pop(next(iter(d)))
 
 
-def _lock(user_id: int) -> asyncio.Lock:
+def _lock(user_id: Any) -> asyncio.Lock:
     lk = _user_locks.get(user_id)
     if lk is None:
         lk = _user_locks[user_id] = asyncio.Lock()
@@ -661,6 +681,120 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         except Exception:  # noqa: BLE001
             pass
 
+    async def _invite_coop(space: PersonalSpace, ws: dict[str, Any], tid: int, to_uid: int, *,
+                           author: str, comment: str = "") -> str:
+        """Совместный воркспейс: перенести проект в общий vault (если ещё нет) и пригласить человека."""
+        if to_uid == space.user_id:
+            return "ERROR: это ты сам"
+        if not await is_private_allowed(db, to_uid):
+            return f"ERROR: у пользователя {to_uid} нет доступа к личному режиму — админ: /allow {to_uid}"
+        sslug = shared_slug_of(ws.get("project_slug"))
+        if not sslug:
+            sslug = str(ws["project_slug"])
+            try:
+                convert_workspace_to_shared(space, sslug)
+            except Exception as exc:  # noqa: BLE001
+                return f"ERROR: не удалось перенести проект в общий vault: {exc}"
+            async with db.conn() as conn:
+                await conn.execute("UPDATE workspaces SET project_slug=? WHERE chat_id=? AND topic_id=?",
+                                   (SHARED_PREFIX + sslug, space.user_id, tid))
+                await conn.commit()
+        # уже участник?
+        rows = await db.find_workspaces_by_slug(SHARED_PREFIX + sslug)
+        if any(int(r["chat_id"]) == to_uid for r in rows):
+            return f"OK: пользователь {to_uid} уже участник «{ws['name']}»"
+        token = uuid.uuid4().hex[:10]
+        await db.set_state(f"wscoop_{token}", json.dumps({
+            "slug": sslug, "title": ws["name"], "from_user_id": space.user_id, "from": author,
+            "to_user_id": to_uid, "comment": comment,
+        }, ensure_ascii=False))
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🤝 Присоединиться", callback_data=f"pwscoop:{token}:y"),
+             InlineKeyboardButton(text="✖ Отклонить", callback_data=f"pwscoop:{token}:n")],
+        ])
+        text = (
+            f"🤝 <b>{_esc(author)}</b> приглашает тебя в совместный воркспейс <b>{_esc(ws['name'])}</b>."
+            + (f"\n💬 <i>{_esc(comment)}</i>" if comment else "")
+            + "\n\nПосле присоединения у тебя появится своя тема; всё, что в ней пишете вы оба, "
+            "ложится в общие страницы проекта."
+        )
+        try:
+            await bot.send_message(to_uid, text, parse_mode="HTML", reply_markup=kb)
+        except Exception as exc:  # noqa: BLE001
+            await db.set_state(f"wscoop_{token}", "")
+            return f"ERROR: не могу написать пользователю {to_uid} ({exc}). Он должен сначала написать боту /start."
+        return f"OK: приглашение в совместный воркспейс «{ws['name']}» отправлено пользователю {to_uid}; твоя тема теперь работает с общим vault shared/{sslug}."
+
+    @router.callback_query(F.data.startswith("pwsmode:"))
+    async def cb_ws_mode(cb: CallbackQuery) -> None:
+        parts = (cb.data or "").split(":")
+        if len(parts) != 3 or not cb.from_user or not cb.message:
+            await cb.answer("bad data")
+            return
+        token, mode = parts[1], parts[2]
+        entry = _pending_share.pop(token, None)
+        if not entry or entry[0] != cb.from_user.id or not entry[1].startswith("@wsu:"):
+            await cb.answer("⌛ устарело")
+            return
+        _, tid_s, uid_s = entry[1].split(":")
+        comment = entry[2]
+        space = orch.personal_space(cb.from_user.id, cb.from_user.full_name)
+        row = await db.get_workspace(cb.message.chat.id, int(tid_s))
+        if not row:
+            await cb.answer("воркспейс не найден")
+            return
+        await cb.answer("делюсь…")
+        if mode == "coop":
+            res = await _invite_coop(space, dict(row), int(tid_s), int(uid_s), author=cb.from_user.full_name, comment=comment)
+        else:
+            res = await _share_workspace_to_user(space, _ws_slug(dict(row)) if not shared_slug_of(row["project_slug"]) else _ws_slug(dict(row)),
+                                                 int(uid_s), author=cb.from_user.full_name, comment=comment) \
+                if not shared_slug_of(row["project_slug"]) else \
+                await _share_workspace_to_user(PersonalSpace.shared(_ws_slug(dict(row)), cb.from_user.full_name), _ws_slug(dict(row)),
+                                               int(uid_s), author=cb.from_user.full_name, comment=comment)
+        try:
+            await cb.message.edit_text(md_to_tg_html(("✅ " if res.startswith("OK") else "❌ ") + res)[:4000], parse_mode="HTML")
+        except Exception:  # noqa: BLE001
+            await cb.message.answer(md_to_tg_html(res)[:4000], parse_mode="HTML")
+
+    @router.callback_query(F.data.startswith("pwscoop:"))
+    async def cb_ws_coop(cb: CallbackQuery) -> None:
+        parts = (cb.data or "").split(":")
+        if len(parts) != 3 or not cb.from_user or not cb.message:
+            await cb.answer("bad data")
+            return
+        token, action = parts[1], parts[2]
+        raw = await db.get_state(f"wscoop_{token}", "")
+        if not raw:
+            await cb.answer("⌛ устарело")
+            return
+        inv = json.loads(raw)
+        if int(inv.get("to_user_id", 0)) != cb.from_user.id:
+            await cb.answer("не твоя кнопка")
+            return
+        await db.set_state(f"wscoop_{token}", "")
+        if action == "n":
+            await cb.answer("отклонено")
+            try:
+                await cb.message.edit_text("✖ Приглашение отклонено.")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        dst = orch.personal_space(cb.from_user.id, cb.from_user.full_name)
+        await cb.answer("присоединяю…")
+        ok, text, _tid = await _create_workspace_bound(dst, cb.message.chat.id, inv["title"], SHARED_PREFIX + inv["slug"])
+        try:
+            await cb.message.edit_text(("🤝 Ты в совместном воркспейсе <b>" + _esc(inv["title"]) + "</b>. " if ok else "⚠️ ")
+                                       + _esc(text), parse_mode="HTML")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await bot.send_message(int(inv["from_user_id"]),
+                                   f"🤝 {_esc(cb.from_user.full_name)} присоединился к «{_esc(inv['title'])}».",
+                                   parse_mode="HTML")
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _create_workspace_bound(space: PersonalSpace, chat_id: int, name: str, slug: str) -> tuple[bool, str, int | None]:
         """Создать тему и привязать к УЖЕ существующей странице проекта slug."""
         try:
@@ -672,9 +806,11 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             await conn.execute("UPDATE workspaces SET project_slug=? WHERE chat_id=? AND topic_id=?",
                                (slug, chat_id, topic.message_thread_id))
             await conn.commit()
+        sslug = shared_slug_of(slug)
+        where = f"shared/{sslug}/wiki/projects/{sslug}.md (совместный)" if sslug else f"wiki/projects/{slug}.md"
         try:
-            await bot.send_message(chat_id, f"📌 Воркспейс <b>{_esc(name)}</b> (получен) → "
-                                   f"<code>wiki/projects/{_esc(slug)}.md</code>. Пиши сюда по этому проекту.",
+            await bot.send_message(chat_id, f"📌 Воркспейс <b>{_esc(name)}</b> → <code>{_esc(where)}</code>. "
+                                   "Пиши сюда по этому проекту.",
                                    message_thread_id=topic.message_thread_id, parse_mode="HTML")
         except Exception:  # noqa: BLE001
             pass
@@ -705,8 +841,11 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             log.warning("ws greet failed: %s", exc)
         return True, f"тема «{name}» создана, проект wiki/projects/{slug}.md", topic.message_thread_id
 
-    def _workspace_tool_fn(msg: Message, space: PersonalSpace):
-        """Коллбек для агентских инструментов create_workspace / list_workspaces / rename_workspace."""
+    def _workspace_tool_fn(msg: Message, space: PersonalSpace, tspace: PersonalSpace | None = None):
+        """Коллбек для агентских инструментов воркспейсов. space — личное пространство,
+        tspace — рабочее (общий vault в совместной теме)."""
+        tspace = tspace or space
+
         async def fn(action: str, args: dict) -> str:
             if action == "create_workspace":
                 ok, text, _tid = await _create_workspace(space, msg.chat.id, str(args.get("name", "")))
@@ -725,15 +864,21 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                     return "ERROR: эта тема не привязана к проекту (/ws <имя>)"
                 target = str(args.get("target", "")).strip()
                 comment = str(args.get("comment") or "")
+                mode = str(args.get("mode") or "copy").lower()
+                rowd = dict(row)
                 if settings.get_chat_by_name(target.lstrip("#")):
-                    return await orch.share_workspace_to_chat(space, row["project_slug"], target.lstrip("#"),
+                    return await orch.share_workspace_to_chat(_space_for(space, rowd), _ws_slug(rowd), target.lstrip("#"),
                                                               comment=comment, author=space.display_name)
                 uid = await _resolve_user_target(target)
                 if uid is None:
                     return (f"ERROR: не понял адресата '{target}'. Нужен слаг чата "
                             f"({', '.join(c.name for c in settings.get_chats())}), @username человека, "
                             "который уже писал боту, или его числовой id.")
-                return await _share_workspace_to_user(space, row["project_slug"], uid,
+                if mode.startswith("coop") or mode in ("shared", "совместно", "together"):
+                    return await _invite_coop(space, rowd, tid, uid, author=space.display_name, comment=comment)
+                if shared_slug_of(rowd.get("project_slug")):
+                    return await _invite_coop(space, rowd, tid, uid, author=space.display_name, comment=comment)
+                return await _share_workspace_to_user(space, rowd["project_slug"], uid,
                                                       author=space.display_name, comment=comment)
             if action == "set_workspace_icon":
                 tid = _thread_id(msg)
@@ -750,6 +895,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 tid = _thread_id(msg)
                 if tid is None:
                     return "ERROR: разговор идёт не в теме — переименовывать нечего"
+                if tspace.is_shared:
+                    return "ERROR: совместный воркспейс переименовать нельзя (общий для участников)"
                 new_name = str(args.get("name", "")).strip()[:128]
                 if not new_name:
                     return "ERROR: пустое имя"
@@ -803,6 +950,25 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         except Exception as exc:  # noqa: BLE001
             log.debug("bind hint failed: %s", exc)
         return None
+
+    async def _notify_members(ws: dict[str, Any] | None, exclude_chat_id: int, author: str, text: str) -> None:
+        """В совместном воркспейсе — коротко сообщить остальным участникам, что добавил коллега."""
+        if not ws or not shared_slug_of(ws.get("project_slug")):
+            return
+        try:
+            rows = await db.find_workspaces_by_slug(ws["project_slug"])
+        except Exception:  # noqa: BLE001
+            return
+        snippet = text.strip().replace("\n", " ")
+        snippet = snippet[:300] + ("…" if len(snippet) > 300 else "")
+        for r in rows:
+            if int(r["chat_id"]) == exclude_chat_id:
+                continue
+            try:
+                await bot.send_message(int(r["chat_id"]), f"👥 <b>{_esc(author)}</b> в «{_esc(ws['name'])}»:\n<i>{_esc(snippet)}</i>",
+                                       message_thread_id=int(r["topic_id"]), parse_mode="HTML")
+            except Exception as exc:  # noqa: BLE001
+                log.debug("notify member failed: %s", exc)
 
     async def _bind_workspace(space: PersonalSpace, chat_id: int, tid: int, name: str) -> str:
         """Привязать тему к проекту (создать страницу при необходимости). Возвращает slug."""
@@ -913,7 +1079,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         abs_path = space.root / rel
         if not abs_path.is_file() or abs_path.suffix.lower() != ".md":
             return None
-        key = f"tgph_{space.user_id}_{hashlib.sha1(rel.encode()).hexdigest()[:12]}"
+        key = f"tgph_{hashlib.sha1(f'{space.cfg.name}:{rel}'.encode()).hexdigest()[:14]}"
         mtime = int(abs_path.stat().st_mtime)
         cached: dict = {}
         try:
@@ -948,8 +1114,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             return name[:-3] if name.endswith(".md") else name
 
         async def _token_for(rel: str) -> str:
-            tok = hashlib.sha1(f"{space.user_id}:{rel}".encode()).hexdigest()[:10]
-            await db.set_state(f"lnk_{tok}", f"{space.user_id}|{rel}")
+            tok = hashlib.sha1(f"{space.cfg.name}:{rel}".encode()).hexdigest()[:10]
+            await db.set_state(f"lnk_{tok}", f"{space.user_id}|{space.cfg.name}|{rel}")
             return tok
 
         # 1) пути wiki/.. raw/..md
@@ -1176,9 +1342,18 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         if arg.startswith("lnk_") and await is_private_allowed(db, uid):
             # deep-link «открыть страницу» из ответа бота
             raw = await db.get_state(arg, "")
-            owner, _, rel = raw.partition("|")
-            if rel and owner.isdigit() and int(owner) == uid:
-                await _show_artifact(msg, orch.personal_space(uid, _display_name(msg)), rel)  # type: ignore[arg-type]
+            parts = raw.split("|")
+            if len(parts) == 3:
+                owner, cfg_name, rel = parts
+            elif len(parts) == 2:
+                owner, rel = parts
+                cfg_name = f"users/{owner}"
+            else:
+                owner, cfg_name, rel = "", "", ""
+            sslug = shared_slug_of(cfg_name) if cfg_name.startswith("shared/") else None
+            if rel and (sslug or (owner.isdigit() and int(owner) == uid)):
+                sp = PersonalSpace.shared(sslug, _display_name(msg)) if sslug else orch.personal_space(uid, _display_name(msg))  # type: ignore[arg-type]
+                await _show_artifact(msg, sp, rel)
             else:
                 await msg.reply("Ссылка устарела или не твоя.")
             return
@@ -1322,10 +1497,19 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                     await msg.reply(f"Не нашёл пользователя {_esc(user_target)}: он должен хотя бы раз написать боту, "
                                     "либо укажи числовой id.", parse_mode="HTML")
                     return
-                await msg.chat.do("typing")
-                res = await _share_workspace_to_user(space, ws["project_slug"], uid,
-                                                     author=_display_name(msg), comment=comment)
-                await _reply_html(msg, ("✅ " if res.startswith("OK") else "❌ ") + res)
+                token = uuid.uuid4().hex[:10]
+                _pending_share[token] = (space.user_id, f"@wsu:{tid}:{uid}", comment)
+                _trim(_pending_share)
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🤝 Совместно (одна вкладка)", callback_data=f"pwsmode:{token}:coop")],
+                    [InlineKeyboardButton(text="📸 Копия (снимок)", callback_data=f"pwsmode:{token}:copy")],
+                ])
+                await msg.reply(
+                    f"Как поделиться «{_esc(ws['name'])}» с <code>{uid}</code>?\n"
+                    "🤝 <b>Совместно</b> — проект переезжает в общий vault, у каждого своя тема, пишете в одни страницы.\n"
+                    "📸 <b>Копия</b> — человек получит снимок и свою независимую копию.",
+                    parse_mode="HTML", reply_markup=kb,
+                )
                 return
             if chat is None and len(chats) == 1:
                 chat = chats[0].name
@@ -1338,7 +1522,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 return
             await msg.chat.do("typing")
             res = await orch.share_workspace_to_chat(
-                space, ws["project_slug"], chat, comment=comment,
+                _space_for(space, ws), _ws_slug(ws), chat, comment=comment,
                 author=_display_name(msg), as_topic=as_topic,
             )
             await _reply_html(msg, ("✅ " if res.startswith("OK") else "❌ ") + res)
@@ -1361,7 +1545,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 return
             lines = ["<b>Воркспейсы:</b>"]
             for r in rows:
-                lines.append(f"• 📌 <b>{_esc(r['name'])}</b> → <code>wiki/projects/{_esc(r['project_slug'] or '?')}.md</code>")
+                coop = " 🤝" if shared_slug_of(r["project_slug"]) else ""
+                lines.append(f"• 📌 <b>{_esc(r['name'])}</b>{coop} → <code>{_esc(_ws_path(dict(r)))}</code>")
             await msg.reply("\n".join(lines), parse_mode="HTML")
             return
         if sub == "new":
@@ -1395,11 +1580,13 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         token = uuid.uuid4().hex[:10]
         _pending_share[token] = (space.user_id, f"@ws:{ws['project_slug']}:0", "")
         _trim(_pending_share)
-        pages = len(__import__("bot.personal", fromlist=["collect_workspace_pages"]).collect_workspace_pages(space, ws["project_slug"]))
+        tspace = _space_for(space, ws)
+        pages = len(__import__("bot.personal", fromlist=["collect_workspace_pages"]).collect_workspace_pages(tspace, _ws_slug(ws)))
+        coop = " · 🤝 совместный" if tspace.is_shared else ""
         await msg.reply(
-            f"📌 Воркспейс <b>{_esc(ws['name'])}</b> → <code>wiki/projects/{_esc(ws['project_slug'])}.md</code>\n"
+            f"📌 Воркспейс <b>{_esc(ws['name'])}</b>{coop} → <code>{_esc(_ws_path(ws))}</code>\n"
             f"Связанных страниц: {pages}.\n"
-            "/ws <имя> — переименовать · /show " + _esc(ws['project_slug']) + " — страница проекта\n"
+            "/ws <имя> — переименовать · /show " + _esc(_ws_slug(ws)) + " — страница проекта\n"
             "/ws share <чат> [topic] [комментарий] — выгрузить весь воркспейс "
             "(topic = в отдельную тему группы с тем же именем) · /ws share @user — человеку "
             "(снимок с кнопкой «принять») · /ws icon [эмодзи] — значок.",
@@ -1413,6 +1600,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         space = await _guard(msg)
         if not space:
             return
+        space = _space_for(space, await _workspace(msg, space))
         kind = (command.args or "").strip().lower() or None
         if kind and kind not in ARTIFACT_KINDS:
             await msg.reply("Виды: " + ", ".join(ARTIFACT_KINDS))
@@ -1428,6 +1616,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         space = await _guard(msg)
         if not space:
             return
+        space = _space_for(space, await _workspace(msg, space))
         ref = (command.args or "").strip()
         rel = _resolve_ref(space, space.user_id, ref) if ref else None
         if not rel:
@@ -1494,6 +1683,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         space = await _guard(msg)
         if not space:
             return
+        space = _space_for(space, await _workspace(msg, space))
         ref = (command.args or "").strip()
         rel = _resolve_ref(space, space.user_id, ref) if ref else None
         if not rel:
@@ -1513,6 +1703,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         space = await _guard(msg)
         if not space:
             return
+        space = _space_for(space, await _workspace(msg, space))
         q = (command.args or "").strip()
         if not q:
             await msg.reply("Использование: /search <строка>")
@@ -1536,13 +1727,14 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             await msg.reply("Использование: /note <текст>")
             return
         ws = await _workspace(msg, space)
+        space = _space_for(space, ws)
         now = datetime.now(timezone.utc)
         date = now.strftime("%Y-%m-%d")
         title = text.splitlines()[0][:60]
         rel = f"wiki/notes/{date}-{slugify(title)}-{now.strftime('%H%M%S')}.md"
         inbox_rel = space.append_inbox(who=_display_name(msg) + (f" · 📌 {ws['name']}" if ws else ""),
                                        text=f"/note {text}", ts=now, message_id=msg.message_id)
-        project_line = f"project: \"[[{ws['project_slug']}]]\"\n" if ws else ""
+        project_line = f"project: \"[[{_ws_slug(ws)}]]\"\n" if ws else ""
         body = (
             "---\ntype: note\n"
             f"title: \"{title.replace(chr(34), chr(39))}\"\n"
@@ -1553,7 +1745,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         try:
             space.wiki.append_file("index.md", f"- [[{rel.rsplit('/', 1)[-1][:-3]}]] — {title}")
             if ws:
-                space.wiki.append_file(f"wiki/projects/{ws['project_slug']}.md",
+                space.wiki.append_file(f"wiki/projects/{_ws_slug(ws)}.md",
                                        f"- **{date}** — заметка [[{rel.rsplit('/', 1)[-1][:-3]}]]: {title}")
         except Exception:  # noqa: BLE001
             pass
@@ -1581,8 +1773,9 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             await msg.reply("Использование: /ask <вопрос>")
             return
         ws = await _workspace(msg, space)
+        space = _space_for(space, ws)
         if ws:
-            q = f"[Воркспейс: {ws['name']} → wiki/projects/{ws['project_slug']}.md]\n{q}"
+            q = f"[Воркспейс: {ws['name']} → wiki/projects/{_ws_slug(ws)}.md]\n{q}"
         await _react(bot, msg, "👀")
         stop = asyncio.Event()
         typing = asyncio.create_task(_typing_loop(bot, msg.chat.id, stop, _thread_id(msg)))
@@ -1604,6 +1797,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         space = await _guard(msg)
         if not space:
             return
+        space = _space_for(space, await _workspace(msg, space))
         ref, chat, comment = _split_share_args(command.args or "")
         chats = settings.get_chats()
         # Вариант 1: /share реплаем на ответ бота → сохранить ответ как research и пошарить.
@@ -2092,7 +2286,9 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             if await orch.deliver_answer(qid, msg.text):
                 await msg.reply("✅ ответ передан агенту")
                 return
-        lk = _lock(space.user_id)
+        ws_pre = await db.get_workspace(msg.chat.id, _thread_id(msg)) if _thread_id(msg) else None
+        lock_key: Any = ws_pre["project_slug"] if (ws_pre and shared_slug_of(ws_pre["project_slug"])) else space.user_id
+        lk = _lock(lock_key)
         if lk.locked():
             # Запросы одного пользователя идут строго по очереди (общие файлы, история
             # диалога). Покажем, что сообщение принято и ждёт.
@@ -2124,6 +2320,11 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         attached: list[str] = []
         ws = await _workspace(msg, space)
         ws_name = ws["name"] if ws else None
+        pspace = space                      # личное пространство (для create_workspace и т.п.)
+        space = _space_for(space, ws)        # рабочее: общий vault, если тема совместная
+        if ws and shared_slug_of(ws.get("project_slug")):
+            ws = dict(ws)
+            ws["project_slug"] = _ws_slug(ws)   # агенту — плоский slug внутри общего vault
 
         has_media = bool(msg.photo or msg.video or msg.document or msg.audio
                          or msg.voice or msg.video_note or msg.animation or msg.sticker)
@@ -2256,7 +2457,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 space, agent_text or "(без текста — см. вложение)",
                 message_id=msg.message_id, attached_media=attached, history=history,
                 workspace=ws, progress=_draft_progress(msg),
-                workspace_fn=_workspace_tool_fn(msg, space),
+                workspace_fn=_workspace_tool_fn(msg, pspace, space),
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("personal_turn failed")
@@ -2270,5 +2471,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         voice = mode == "on" or (mode == "auto" and spoke)
         title_hint = (text or transcript or "Ответ").splitlines()[0]
         await _send_agent_answer(msg, space, answer, title_hint=title_hint, ws_name=ws_name, voice=voice)
+        if space.is_shared:
+            await _notify_members(ws | {"project_slug": SHARED_PREFIX + ws["project_slug"]}, msg.chat.id,
+                                  _display_name(msg), (text or transcript or "") + "\n→ " + _strip_images_block(answer)[0])
 
     return router

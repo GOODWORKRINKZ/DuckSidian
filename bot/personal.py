@@ -33,6 +33,8 @@ from .wiki import Wiki, WikiPathError
 log = logging.getLogger(__name__)
 
 USERS_DIR = "users"
+SHARED_DIR = "shared"
+SHARED_PREFIX = "shared/"   # project_slug воркспейса вида "shared/<slug>" → общий vault
 PERSONAL_SUBDIRS = (
     "raw/inbox", "raw/assets",
     "wiki/projects", "wiki/notes", "wiki/ideas", "wiki/research", "wiki/queries",
@@ -114,13 +116,28 @@ class Artifact:
 class PersonalSpace:
     """Обёртка над личным vault'ом пользователя."""
 
-    def __init__(self, user_id: int, display_name: str | None = None):
+    def __init__(self, user_id: int, display_name: str | None = None, *,
+                 shared_slug: str | None = None):
         self.user_id = user_id
         self.display_name = display_name or str(user_id)
-        self.cfg = user_cfg(user_id)
-        self.root: Path = settings.vault_path / USERS_DIR / str(user_id)
+        self.shared_slug = shared_slug
+        if shared_slug:
+            # Совместный воркспейс: общий vault vault/shared/<slug>/, несколько участников.
+            self.cfg = ChatConfig(chat_id=0, name=f"{SHARED_DIR}/{shared_slug}", topic_id=None)
+            self.root = settings.vault_path / SHARED_DIR / shared_slug
+        else:
+            self.cfg = user_cfg(user_id)
+            self.root = settings.vault_path / USERS_DIR / str(user_id)
         self.ensure()
         self.wiki = Wiki(self.root)
+
+    @classmethod
+    def shared(cls, slug: str, display_name: str | None = None) -> "PersonalSpace":
+        return cls(0, display_name or "team", shared_slug=slug)
+
+    @property
+    def is_shared(self) -> bool:
+        return bool(self.shared_slug)
 
     # ----- seeding -----
 
@@ -598,9 +615,8 @@ def json_dumps(obj: Any) -> str:
 def accept_staged_workspace(dst: PersonalSpace, manifest: dict[str, Any]) -> tuple[str, list[str]]:
     """Разложить снимок по wiki/ получателя. Возвращает (slug проекта, список rel страниц)."""
     placed: list[str] = []
-    project_slug = project_slug_from = manifest["slug"]
-    suffix = f"от-{project_slug_from and str(manifest.get('from') or manifest.get('from_user_id'))}"
-    suffix = project_slug(suffix)[:30]
+    proj_slug = manifest["slug"]
+    suffix = project_slug(f"от-{manifest.get('from') or manifest.get('from_user_id')}")[:30]
     for page in manifest["pages"]:
         staged = dst.root / page["staged"]
         if not staged.is_file():
@@ -610,31 +626,81 @@ def accept_staged_workspace(dst: PersonalSpace, manifest: dict[str, Any]) -> tup
         rel = f"{target_dir}/{staged.name}"
         rel = _unique_rel(dst.root, rel, suffix)
         if ptype == "project":
-            project_slug = Path(rel).stem
+            proj_slug = Path(rel).stem
         (dst.root / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(staged), str(dst.root / rel))
         placed.append(rel)
     # если имя проекта изменилось (коллизия) — поправим ссылки [[old]] → [[new]] в принятых страницах
-    if project_slug != manifest["slug"]:
+    if proj_slug != manifest["slug"]:
         for rel in placed:
             p = dst.root / rel
             t = p.read_text(encoding="utf-8")
-            t2 = t.replace(f"[[{manifest['slug']}]]", f"[[{project_slug}]]").replace(
-                f"[[{manifest['slug']}|", f"[[{project_slug}|")
+            t2 = t.replace(f"[[{manifest['slug']}]]", f"[[{proj_slug}]]").replace(
+                f"[[{manifest['slug']}|", f"[[{proj_slug}|")
             if t2 != t:
                 p.write_text(t2, encoding="utf-8")
     try:
         dst.wiki.append_file(
             "index.md",
-            f"- [[{project_slug}]] — получено от {manifest.get('from')} ({manifest.get('created')}), "
+            f"- [[{proj_slug}]] — получено от {manifest.get('from')} ({manifest.get('created')}), "
             f"{len(placed)} страниц",
         )
     except Exception:  # noqa: BLE001
         pass
     shutil.rmtree(dst.root / f"raw/incoming/{manifest.get('token', '')}", ignore_errors=True)
-    dst.log(f"accept-workspace | {manifest['slug']} от users/{manifest.get('from_user_id')} | {len(placed)} pages → {project_slug}")
-    return project_slug, placed
+    dst.log(f"accept-workspace | {manifest['slug']} от users/{manifest.get('from_user_id')} | {len(placed)} pages → {proj_slug}")
+    return proj_slug, placed
 
 
 def discard_staged_workspace(dst: PersonalSpace, token: str) -> None:
     shutil.rmtree(dst.root / f"raw/incoming/{token}", ignore_errors=True)
+
+
+# ----- совместный воркспейс: общий vault для нескольких участников -----
+
+def convert_workspace_to_shared(owner: PersonalSpace, slug: str) -> PersonalSpace:
+    """Перенести проект (страница + связанные страницы + их вложения) из личного vault
+    владельца в общий vault/shared/<slug>/. Пути внутри сохраняются (ссылки не ломаются).
+    Если общий vault с таким slug уже есть — страницы докладываются (без перезаписи)."""
+    shared = PersonalSpace.shared(slug, owner.display_name)
+    pages = collect_workspace_pages(owner, slug)
+    moved: list[str] = []
+    for rel in pages:
+        src_p = owner.root / rel
+        dst_p = shared.root / rel
+        if not src_p.is_file():
+            continue
+        try:
+            text = src_p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in _ASSET_LINK_RE.finditer(text):
+            a_rel = m.group(1)
+            a_src = owner.root / a_rel
+            a_dst = shared.root / a_rel
+            if a_src.is_file() and not a_dst.exists():
+                a_dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(a_src), str(a_dst))
+        dst_p.parent.mkdir(parents=True, exist_ok=True)
+        if dst_p.exists():
+            dst_p = shared.root / _unique_rel(shared.root, rel, f"от-{project_slug(owner.display_name)[:20]}")
+        shutil.move(str(src_p), str(dst_p))
+        moved.append(rel)
+    try:
+        owner.wiki.append_file("index.md", f"- [[{slug}]] ➜ совместный воркспейс `shared/{slug}` (перенесён)")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        shared.wiki.append_file("index.md", f"- [[{slug}]] — совместный проект, владелец {owner.display_name}; {len(moved)} страниц")
+    except Exception:  # noqa: BLE001
+        pass
+    owner.log(f"convert-to-shared | {slug} | {len(moved)} pages → shared/{slug}")
+    shared.log(f"created from users/{owner.user_id} | {len(moved)} pages")
+    return shared
+
+
+def shared_slug_of(project_slug_value: str | None) -> str | None:
+    """'shared/<slug>' → '<slug>', иначе None."""
+    if project_slug_value and project_slug_value.startswith(SHARED_PREFIX):
+        return project_slug_value[len(SHARED_PREFIX):]
+    return None
