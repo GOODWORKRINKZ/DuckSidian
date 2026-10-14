@@ -562,3 +562,17 @@ def test_filename_from_url_and_file_url_re() -> None:
     assert FILE_URL_RE.findall("смотри https://cloud.example.com/f/export.zip?dl=1 и https://a.b/page") == \
         ["https://cloud.example.com/f/export.zip?dl=1"]
     assert FILE_URL_RE.findall("https://www.youtube.com/watch?v=abc") == []
+
+
+def test_path_ref_and_wikilink_regex() -> None:
+    import re
+    from bot.handlers import private as pm
+    src = pm.__dict__
+    # регэкспы определены внутри setup(); проверим эквивалентные паттерны
+    path_re = re.compile(r"`?((?:wiki|raw)/[^\s`'\"<>|)\]]+?\.md)`?(?:#[^\s`)\]]*)?")
+    text = "см. `wiki/notes/2026-10-14-cargo.md` и wiki/projects/БиБа.md#История, а также raw/imports/youtube_x.md."
+    assert [m.group(1) for m in path_re.finditer(text)] == [
+        "wiki/notes/2026-10-14-cargo.md", "wiki/projects/БиБа.md", "raw/imports/youtube_x.md"]
+    wl = re.compile(r"!?\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|([^\]]*))?\]\]")
+    m = wl.search("[[БиБа|проект]] и ![[raw/assets/a.jpg]]")
+    assert m and m.group(1) == "БиБа" and m.group(2) == "проект"

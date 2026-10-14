@@ -226,8 +226,16 @@ class TelegraphClient:
         self._token = tok
         return tok
 
-    async def publish_markdown(self, md: str, *, title: str, author: str | None = None) -> str:
-        """Создать страницу из markdown. Возвращает URL."""
+    async def publish_markdown(self, md: str, *, title: str, author: str | None = None,
+                               existing_path: str | None = None) -> str:
+        """Создать страницу из markdown (или обновить existing_path). Возвращает URL."""
+        url, _ = await self.publish_markdown_ex(md, title=title, author=author, existing_path=existing_path)
+        return url
+
+    async def publish_markdown_ex(self, md: str, *, title: str, author: str | None = None,
+                                  existing_path: str | None = None) -> tuple[str, str]:
+        """То же, но возвращает (url, path). path нужен для последующего editPage —
+        так у страницы vault'а остаётся стабильный URL."""
         import json
         token = await self._ensure_token()
         nodes = _trim_nodes(md_to_nodes(md))
@@ -239,11 +247,18 @@ class TelegraphClient:
             "return_content": "false",
         }
         async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(f"{TELEGRAPH_API}/createPage", data=payload)
+            if existing_path:
+                r = await c.post(f"{TELEGRAPH_API}/editPage/{existing_path}", data=payload)
+            else:
+                r = await c.post(f"{TELEGRAPH_API}/createPage", data=payload)
             r.raise_for_status()
             d = r.json()
         if not d.get("ok"):
+            if existing_path:
+                # страница пропала/чужой токен — создаём новую
+                return await self.publish_markdown_ex(md, title=title, author=author)
             raise RuntimeError(f"telegraph createPage: {d.get('error')}")
         url = d["result"]["url"]
-        log.info("telegraph page: %s (%d nodes)", url, len(nodes))
-        return url
+        path = d["result"].get("path") or url.rsplit("/", 1)[-1]
+        log.info("telegraph page: %s (%d nodes, %s)", url, len(nodes), "edit" if existing_path else "new")
+        return url, path

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -622,6 +623,144 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
     async def _voice_id(user_id: int) -> str:
         return await db.get_state(f"voice_id_{user_id}", settings.minimax_tts_voice)
 
+    _bot_user: dict[str, str] = {}
+
+    async def _bot_username() -> str:
+        if not _bot_user.get("name"):
+            try:
+                me = await bot.get_me()
+                _bot_user["name"] = me.username or ""
+            except Exception:  # noqa: BLE001
+                return ""
+        return _bot_user["name"]
+
+    async def _publish_page(space: PersonalSpace, rel: str) -> str | None:
+        """Опубликовать страницу vault в Telegraph со стабильным URL (кэш по mtime,
+        обновление через editPage). None — если Telegraph выключен/упал."""
+        if not settings.telegraph_enabled:
+            return None
+        abs_path = space.root / rel
+        if not abs_path.is_file() or abs_path.suffix.lower() != ".md":
+            return None
+        key = f"tgph_{space.user_id}_{hashlib.sha1(rel.encode()).hexdigest()[:12]}"
+        mtime = int(abs_path.stat().st_mtime)
+        cached: dict = {}
+        try:
+            cached = json.loads(await db.get_state(key, "{}"))
+        except Exception:  # noqa: BLE001
+            cached = {}
+        if cached.get("url") and cached.get("mtime") == mtime:
+            return cached["url"]
+        try:
+            md = space.read_artifact(rel)
+            url, path = await TelegraphClient(db, author_name=space.display_name).publish_markdown_ex(
+                md, title=page_title(md, rel.rsplit("/", 1)[-1][:-3]), author=space.display_name,
+                existing_path=cached.get("path"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("telegraph publish %s failed: %s", rel, exc)
+            return None
+        await db.set_state(key, json.dumps({"url": url, "path": path, "mtime": mtime}))
+        return url
+
+    _PATH_REF_RE = re.compile(r"`?((?:wiki|raw)/[^\s`'\"<>|)\]]+?\.md)`?(?:#[^\s`)\]]*)?")
+    _WIKILINK_RE = re.compile(r"!?\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|([^\]]*))?\]\]")
+
+    async def _linkify_answer(space: PersonalSpace, text: str) -> tuple[str, list[tuple[str, str]]]:
+        """Сделать упоминания страниц vault кликабельными (deep-link на бота) и собрать
+        список (rel, title) для кнопок «📰 открыть»."""
+        username = await _bot_username()
+        refs: dict[str, str] = {}
+
+        def _title_for(rel: str) -> str:
+            name = rel.rsplit("/", 1)[-1]
+            return name[:-3] if name.endswith(".md") else name
+
+        async def _token_for(rel: str) -> str:
+            tok = hashlib.sha1(f"{space.user_id}:{rel}".encode()).hexdigest()[:10]
+            await db.set_state(f"lnk_{tok}", f"{space.user_id}|{rel}")
+            return tok
+
+        # 1) пути wiki/.. raw/..md
+        out = text
+        for m in list(_PATH_REF_RE.finditer(text)):
+            rel = m.group(1)
+            resolved = space.resolve_artifact(rel)
+            if not resolved or not resolved.endswith(".md"):
+                continue
+            title = _title_for(resolved)
+            refs.setdefault(resolved, title)
+            if username:
+                tok = await _token_for(resolved)
+                out = out.replace(m.group(0), f"[📄 {title}](https://t.me/{username}?start=lnk_{tok})", 1)
+        # 2) [[wikilinks]]
+        for m in list(_WIKILINK_RE.finditer(out)):
+            target, alias = m.group(1).strip(), (m.group(2) or "").strip()
+            if target.startswith("raw/assets/") or m.group(0).startswith("!"):
+                continue
+            resolved = space.resolve_artifact(target)
+            if not resolved or not resolved.endswith(".md"):
+                continue
+            title = alias or _title_for(resolved)
+            refs.setdefault(resolved, title)
+            if username:
+                tok = await _token_for(resolved)
+                out = out.replace(m.group(0), f"[📄 {title}](https://t.me/{username}?start=lnk_{tok})", 1)
+        return out, list(refs.items())[:4]
+
+    async def _page_buttons(space: PersonalSpace, refs: list[tuple[str, str]]) -> list[list[InlineKeyboardButton]]:
+        """Кнопки открытия страниц: URL в Telegraph (один тап → читалка), иначе callback."""
+        rows: list[list[InlineKeyboardButton]] = []
+        for rel, title in refs[:4]:
+            url = await _publish_page(space, rel)
+            label = f"📰 {title[:28]}"
+            if url:
+                rows.append([InlineKeyboardButton(text=label, url=url)])
+            else:
+                token = uuid.uuid4().hex[:10]
+                _pending_view[token] = (space.user_id, rel)
+                _trim(_pending_view)
+                rows.append([InlineKeyboardButton(text=f"📄 {title[:28]}", callback_data=f"pshow:{token}")])
+        return rows
+
+    async def _show_artifact(msg: Message, space: PersonalSpace, rel: str) -> None:
+        """Показать артефакт: .md — превью + кнопки (статьёй / файлом), иначе файл."""
+        abs_path = space.root / rel
+        ext = abs_path.suffix.lower()
+        if ext == ".md":
+            text = space.read_artifact(rel)
+            preview = text if len(text) <= 3500 else text[:3500].rsplit("\n", 1)[0] + "\n\n_… (дальше — кнопками ниже)_"
+            await _reply_html(msg, f"`{rel}`\n\n{preview}")
+            url = await _publish_page(space, rel)
+            token = uuid.uuid4().hex[:10]
+            _pending_view[token] = (space.user_id, rel)
+            _trim(_pending_view)
+            row = []
+            if url:
+                row.append(InlineKeyboardButton(text="📰 Открыть статьёй", url=url))
+            row.append(InlineKeyboardButton(text="📄 .md файл", callback_data=f"pfile:{token}"))
+            await msg.answer("Как удобнее смотреть?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[row]))
+            return
+        try:
+            if ext in _IMG_EXTS:
+                await msg.answer_photo(FSInputFile(abs_path), caption=rel)
+            elif ext in _VID_EXTS:
+                await msg.answer_video(FSInputFile(abs_path), caption=rel)
+            else:
+                await msg.answer_document(FSInputFile(abs_path), caption=rel)
+        except Exception as exc:  # noqa: BLE001
+            await msg.reply(f"Не удалось отправить файл: {exc}")
+
+    @router.callback_query(F.data.startswith("pshow:"))
+    async def cb_show(cb: CallbackQuery) -> None:
+        token = (cb.data or "").split(":", 1)[1]
+        entry = _pending_view.get(token)
+        if not entry or not cb.from_user or cb.from_user.id != entry[0] or not cb.message:
+            await cb.answer("⌛ устарело")
+            return
+        await cb.answer()
+        await _show_artifact(cb.message, orch.personal_space(entry[0]), entry[1])
+
     async def _send_table_images(msg: Message, markdown: str) -> None:
         """Широкие markdown-таблицы (3+ колонок) дополнительно шлём картинкой:
         в тексте они превращаются в карточки, а PNG даёт привычный табличный вид."""
@@ -729,30 +868,49 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                                  title_hint: str, ws_name: str | None = None,
                                  voice: bool = False) -> None:
         display, has_images = _strip_images_block(answer)
-        sent_ids = await _reply_html(msg, display or "(пусто)")
+        linked, refs = await _linkify_answer(space, display)
+        sent_ids = await _reply_html(msg, linked or "(пусто)")
         if has_images:
             await _attach_media(msg, answer, space.wiki.root)
         await _send_table_images(msg, display)
         await _save_bot_reply(space, msg, display, sent_ids, ws_name)
         if voice and display:
             await _send_voice(msg, space, display, summarize=True)
-        # Кнопка «поделиться ответом» — только для содержательных ответов.
+        # Кнопки: открыть упомянутые страницы (Telegraph, один тап) + поделиться ответом.
+        rows: list[list[InlineKeyboardButton]] = []
+        if refs:
+            rows += await _page_buttons(space, refs)
+        share_kb = None
         if len(display) >= 200 and settings.get_chats():
             token = uuid.uuid4().hex[:10]
             _pending_share[token] = (space.user_id, display, title_hint[:80])
             _trim(_pending_share)
-            kb = _share_keyboard(token)
-            if kb:
-                try:
-                    await msg.answer("Поделиться этим ответом с командой?", reply_markup=kb)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("private: share-button failed: %s", exc)
+            share_kb = _share_keyboard(token)
+        if share_kb:
+            rows += share_kb.inline_keyboard
+        if rows:
+            caption = ("📰 Открыть страницы" if refs else "") + (
+                (" · " if refs else "") + "📤 поделиться с командой?" if share_kb else "")
+            try:
+                await msg.answer(caption or "Действия:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("private: action buttons failed: %s", exc)
 
     # ------------------------------------------------------------- commands
 
     @router.message(Command("start", "help"))
-    async def cmd_help(msg: Message) -> None:
+    async def cmd_help(msg: Message, command: CommandObject) -> None:
         uid = msg.from_user.id if msg.from_user else None
+        arg = (command.args or "").strip()
+        if arg.startswith("lnk_") and await is_private_allowed(db, uid):
+            # deep-link «открыть страницу» из ответа бота
+            raw = await db.get_state(arg, "")
+            owner, _, rel = raw.partition("|")
+            if rel and owner.isdigit() and int(owner) == uid:
+                await _show_artifact(msg, orch.personal_space(uid, _display_name(msg)), rel)  # type: ignore[arg-type]
+            else:
+                await msg.reply("Ссылка устарела или не твоя.")
+            return
         if not await is_private_allowed(db, uid):
             await msg.reply(
                 "👋 Это DuckSidian. Личный режим доступен по списку.\n"
@@ -978,24 +1136,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         if not rel:
             await msg.reply("Не нашёл. Использование: /show <№ из /list | имя | путь>")
             return
-        abs_path = space.root / rel
-        ext = abs_path.suffix.lower()
-        if ext == ".md":
-            text = space.read_artifact(rel)
-            # Длинные страницы не заваливаем чанками: первые ~3500 символов + кнопки.
-            preview = text if len(text) <= 3500 else text[:3500].rsplit("\n", 1)[0] + "\n\n_… (дальше — кнопками ниже)_"
-            await _reply_html(msg, f"`{rel}`\n\n{preview}")
-            await msg.answer("Как удобнее смотреть?", reply_markup=_view_kb(space.user_id, rel))
-        else:
-            try:
-                if ext in _IMG_EXTS:
-                    await msg.answer_photo(FSInputFile(abs_path), caption=rel)
-                elif ext in _VID_EXTS:
-                    await msg.answer_video(FSInputFile(abs_path), caption=rel)
-                else:
-                    await msg.answer_document(FSInputFile(abs_path), caption=rel)
-            except Exception as exc:  # noqa: BLE001
-                await msg.reply(f"Не удалось отправить файл: {exc}")
+        await _show_artifact(msg, space, rel)
 
     def _view_kb(user_id: int, rel: str) -> InlineKeyboardMarkup:
         token = uuid.uuid4().hex[:10]
