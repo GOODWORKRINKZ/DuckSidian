@@ -360,7 +360,9 @@ def extract_tables(md: str, min_cols: int = 3) -> list[list[list[str]]]:
             s = line.strip()
             if _is_table_sep(s):
                 continue
-            cells = [c.strip() for c in s[1:-1].split("|")]
+            # `|` внутри [[wikilink|alias]] не должен резать ячейку
+            s = re.sub(r"\[\[([^\]]*)\]\]", lambda m: "[[" + m.group(1).replace("|", "\x01") + "]]", s)
+            cells = [c.strip().replace("\x01", "|") for c in s[1:-1].split("|")]
             cells = [_MD_INLINE_RE.sub("", c) for c in cells]
             cells = [re.sub(r"\[\[([^\]|]*\|)?([^\]]*)\]\]", r"\2", c) for c in cells]
             cells = [re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", c) for c in cells]
