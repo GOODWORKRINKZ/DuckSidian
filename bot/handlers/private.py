@@ -42,7 +42,7 @@ from aiogram.types import (
 
 from ..config import settings
 from ..db import DB
-from ..intake import IntakeResult, process_attachment
+from ..intake import FILE_URL_RE, IntakeResult, download_url_to_vault, process_attachment
 from ..media_ai import MediaAIError, get_media_ai
 from ..media_parser import (
     AUDIO_EXTENSIONS,
@@ -1678,6 +1678,27 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             media_type, media_path = await _download_media(
                 bot, msg, settings.vault_path, space.cfg.name,
             )
+            if media_type and not media_path:
+                # Telegram Bot API не отдаёт ботам файлы > 20 МБ (getFile). Не зовём агента —
+                # иначе он найдёт в raw/assets старый файл и разберёт его повторно.
+                size = 0
+                for attr in ("document", "video", "audio", "animation"):
+                    obj = getattr(msg, attr, None)
+                    if obj is not None and getattr(obj, "file_size", None):
+                        size = int(obj.file_size)
+                        break
+                big = size > 20 * 1024 * 1024
+                await _react(bot, msg, "❌")
+                await msg.reply(
+                    "⚠️ Не смог скачать вложение" + (f" ({size // 1024 // 1024} МБ)" if size else "") + ".\n"
+                    + ("Telegram не отдаёт ботам файлы больше <b>20 МБ</b>. Варианты:\n"
+                       "• пришли <b>прямую ссылку</b> на файл (облако/сервер) — скачаю сам, лимит 512 МБ;\n"
+                       "• для экспорта чата выгрузи его <b>без медиа</b> (только текст/JSON) — он весит мало;\n"
+                       "• или разбей архив на части до 20 МБ."
+                       if big else "Попробуй ещё раз или пришли прямую ссылку на файл."),
+                    parse_mode="HTML",
+                )
+                return
             if media_path:
                 abs_path = space.root / media_path
                 ext = abs_path.suffix.lower()
@@ -1706,6 +1727,26 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                     log.warning("private: STT placeholder: %s", transcript)
                     await msg.reply(f"⚠️ Не смог распознать речь: {_esc(transcript)}", parse_mode="HTML")
                     transcript = None
+
+        # Ссылки на файлы в тексте (архив/док из облака) — скачиваем сами (обход лимита 20 МБ).
+        if text and not has_media:
+            for url in FILE_URL_RE.findall(text)[:2]:
+                stop = asyncio.Event()
+                typing = asyncio.create_task(_typing_loop(bot, msg.chat.id, stop, _thread_id(msg), "upload_document"))
+                try:
+                    rel = await download_url_to_vault(space.wiki, url)
+                    intake = await process_attachment(space.wiki, rel)
+                    attached.append(rel)
+                    media_type, media_path = "url_file", rel
+                    intake_block = (intake_block + "\n\n" if intake_block else "") + intake.agent_block()
+                    if intake.archive is not None and intake.archive.dates:
+                        await _offer_archive_ingest(msg, space, intake)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("url download failed %s: %s", url, exc)
+                    await msg.reply(f"⚠️ Не удалось скачать {_esc(url[:80])}: {_esc(str(exc)[:200])}", parse_mode="HTML")
+                finally:
+                    stop.set()
+                    typing.cancel()
 
         # Текст для агента и для журнала.
         parts: list[str] = []

@@ -374,6 +374,24 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "fetch_file",
+            "description": (
+                "Скачать ФАЙЛ по прямой ссылке (zip/pdf/docx/xlsx/txt/json/html…) в vault "
+                "raw/assets/<date>/ и сразу разобрать (архив → распаковка/импорт чата, документ → "
+                "текст). Нужен, когда пользователь прислал ссылку на файл вместо вложения "
+                "(Telegram не отдаёт ботам файлы > 20 МБ). Ссылка должна быть прямой (не страница "
+                "облака); до 512 МБ. Возвращает путь и сводку содержимого."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "fetch_image",
             "description": (
                 "Скачать картинку по URL (например фото товара с 1688/Taobao из fetch_url) в vault "
@@ -872,6 +890,17 @@ class ToolExecutor:
                 return await self._fetch_url(arguments["url"])
             if name == "fetch_image":
                 return await self._fetch_image(str(arguments.get("url", "")))
+            if name == "fetch_file":
+                from ..intake import download_url_to_vault, process_attachment  # noqa: PLC0415
+                url = str(arguments.get("url", "")).strip()
+                if not url.startswith(("http://", "https://")):
+                    return "ERROR: нужен http(s) URL"
+                try:
+                    rel = await download_url_to_vault(self.wiki, url)
+                except Exception as exc:  # noqa: BLE001
+                    return f"ERROR fetch_file: {exc}"
+                res = await process_attachment(self.wiki, rel)
+                return f"OK: скачано в `{rel}`\n" + res.agent_block()
             if name == "fetch_git_log":
                 return await self._fetch_git_log(
                     arguments["repo"],

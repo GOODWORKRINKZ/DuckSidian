@@ -551,3 +551,14 @@ def test_parse_1688_html() -> None:
     assert "https://detail.1688.com/offer/675067142927.html" in out
     assert "Цена: ¥0.02-4.00 / 个" in out and "Мин. заказ: 10 个" in out and "- 品牌: 伟粤" in out
     assert "fetch_image" in out
+
+
+def test_filename_from_url_and_file_url_re() -> None:
+    from bot.intake import FILE_URL_RE, filename_from_url
+    assert filename_from_url("https://x.y/dl/ChatExport.zip?token=1") == "ChatExport.zip"
+    assert filename_from_url("https://x.y/dl/abc", 'attachment; filename="report final.pdf"') == "report_final.pdf"
+    assert filename_from_url("https://x.y/dl/abc", "attachment; filename*=UTF-8''%D0%BE%D1%82%D1%87%D1%91%D1%82.docx") == "отчёт.docx"
+    assert filename_from_url("https://x.y/dl/abc", None, "application/zip") == "abc.zip"
+    assert FILE_URL_RE.findall("смотри https://cloud.example.com/f/export.zip?dl=1 и https://a.b/page") == \
+        ["https://cloud.example.com/f/export.zip?dl=1"]
+    assert FILE_URL_RE.findall("https://www.youtube.com/watch?v=abc") == []

@@ -235,3 +235,63 @@ async def process_attachment(wiki: Wiki, rel: str, media_type: str | None = None
 
 def b64_of(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode()
+
+
+FILE_URL_RE = re.compile(
+    r"https?://[^\s<>\"']+\.(?:zip|pdf|docx?|xlsx?|pptx?|txt|md|csv|json|html?)(?:\?[^\s<>\"']*)?",
+    re.IGNORECASE,
+)
+DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024
+
+
+def filename_from_url(url: str, content_disposition: str | None = None, content_type: str | None = None) -> str:
+    """Имя файла из Content-Disposition / пути URL / content-type."""
+    import urllib.parse
+    name = ""
+    if content_disposition:
+        m = re.search(r"filename\*=UTF-8''([^;]+)", content_disposition) or re.search(r'filename="?([^";]+)"?', content_disposition)
+        if m:
+            name = urllib.parse.unquote(m.group(1).strip())
+    if not name:
+        path = urllib.parse.urlparse(url).path
+        name = urllib.parse.unquote(path.rsplit("/", 1)[-1]) if path else ""
+    name = re.sub(r"[^\w.\-]+", "_", name).strip("._") or "download"
+    if "." not in name and content_type:
+        ext = {"application/zip": ".zip", "application/pdf": ".pdf", "text/plain": ".txt",
+               "application/json": ".json", "text/html": ".html"}.get(content_type.split(";")[0].strip())
+        if ext:
+            name += ext
+    return name[:100]
+
+
+async def download_url_to_vault(wiki: Wiki, url: str, *, max_bytes: int = DOWNLOAD_MAX_BYTES) -> str:
+    """Скачать файл по URL (стримом) в raw/assets/<date>/. Возвращает rel путь.
+
+    Обход лимита Telegram (боты не получают файлы > 20 МБ): пользователь кладёт
+    файл в облако и присылает прямую ссылку.
+    """
+    import httpx
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; DuckSidian/1.0)"}
+    date_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20, read=120, write=30, pool=10),
+                                 follow_redirects=True) as client:
+        async with client.stream("GET", url, headers=headers) as resp:
+            resp.raise_for_status()
+            ct = resp.headers.get("content-type", "")
+            if ct.split(";")[0].strip() == "text/html" and not url.lower().split("?")[0].endswith((".html", ".htm")):
+                raise ValueError("по ссылке отдаётся HTML-страница, а не файл — нужна ПРЯМАЯ ссылка на скачивание")
+            name = filename_from_url(str(resp.url), resp.headers.get("content-disposition"), ct)
+            safe = "".join(c for c in name if c.isalnum() or c in "._-") or "download.bin"
+            dst = wiki.root / "raw" / "assets" / date_iso / safe
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            total = 0
+            with dst.open("wb") as f:
+                async for chunk in resp.aiter_bytes(1024 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        f.close()
+                        dst.unlink(missing_ok=True)
+                        raise ValueError(f"файл больше {max_bytes // 1024 // 1024} МБ")
+                    f.write(chunk)
+    log.info("downloaded %s -> %s (%d KB)", url, dst.name, total // 1024)
+    return str(dst.relative_to(wiki.root)).replace("\\", "/")
