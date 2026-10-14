@@ -23,32 +23,40 @@ from aiogram.types import (
     InlineKeyboardMarkup,
 )
 
-from .agent.deepseek import DeepSeekClient
+from .agent.deepseek import LLMClient
 from .agent.loop import run_agent
 from .agent.prompts import (
     ENTITY_BUILD_SYSTEM,
     ENTITY_MERGE_SYSTEM,
     INGEST_SYSTEM,
     LINT_SYSTEM,
+    PERSONAL_SYSTEM,
     QUERY_SYSTEM,
     REVISE_SYSTEM,
     SUMMARY_SYSTEM,
     TRIZ_SYSTEM,
 )
-from .agent.tools import ToolExecutor
+from .agent.tools import ToolExecutor, personal_tool_schemas
 from .config import ChatConfig, settings
 from .db import DB
 from .git_sync import commit_and_push
-from .tg_format import md_to_tg_html
+from .personal import PersonalSpace, is_user_cfg, share_artifact
+from .tg_format import md_to_tg_html, split_tg_chunks
 from .topic_manager import ensure_bot_topic
-from .wiki import Wiki
+from .wiki import Wiki, WikiPathError
 
 log = logging.getLogger(__name__)
 tokens_log = logging.getLogger("bot.tokens")
 
 
 def _chat_wiki(chat_cfg: ChatConfig) -> Wiki:
-    """Вернуть Wiki для конкретного чата (vault/<name>/)."""
+    """Вернуть Wiki для конкретного чата (vault/<name>/).
+
+    Для личных пространств (users/<id>) — делегируем PersonalSpace, у него
+    другой шаблон и набор директорий.
+    """
+    if is_user_cfg(chat_cfg):
+        return PersonalSpace(chat_cfg.chat_id).wiki
     root = settings.vault_path / chat_cfg.name
     root.mkdir(parents=True, exist_ok=True)
     # Если AGENTS.md отсутствует — скопируем из глобального vault-template
@@ -100,8 +108,10 @@ class Orchestrator:
         self.bot = bot
         self.db = db
         self.wiki = wiki  # глобальный wiki (для /ask, /search, /lint, /summary)
-        self.client = DeepSeekClient()
+        self.client = LLMClient()
         self._waiters: dict[int, asyncio.Future[str]] = {}
+        # Личные пространства (DM): user_id → PersonalSpace
+        self._spaces: dict[int, PersonalSpace] = {}
         # Накапливаем статистику токенов с момента старта бота
         self._run_stats: list[_RunStat] = []
         # Per-file locks to prevent duplicate concurrent media analysis
@@ -174,11 +184,39 @@ class Orchestrator:
         return False
 
     def _make_executor(self, wiki: Wiki, chat_cfg: ChatConfig | None = None,
-                       file_cache: dict[str, str] | None = None) -> ToolExecutor:
+                       file_cache: dict[str, str] | None = None,
+                       team_wikis: dict[str, Wiki] | None = None,
+                       share_fn: Any = None) -> ToolExecutor:
         async def ask_user_cb(question: str, options: list[str] | None) -> str:
             return await self._ask_user(question, options, chat_cfg)
         return ToolExecutor(wiki, ask_user_cb, deepseek_client=self.client,
-                            file_cache=file_cache, db=self.db)
+                            file_cache=file_cache, db=self.db,
+                            team_wikis=team_wikis, share_fn=share_fn)
+
+    # --- LLM model switching ---
+
+    async def restore_model(self) -> None:
+        """Восстановить выбранный через /model провайдер после рестарта."""
+        raw = await self.db.get_state("llm_profile", "")
+        if not raw:
+            return
+        try:
+            prof = json.loads(raw)
+            self.client.switch(prof["provider"], prof.get("model"))
+            log.info("LLM profile restored: %s", self.client.describe())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("restore_model failed (%s), using .env defaults", exc)
+
+    async def set_model(self, provider: str, model: str | None = None) -> str:
+        desc = self.client.switch(provider, model)
+        await self.db.set_state(
+            "llm_profile",
+            json.dumps({"provider": self.client.provider.key, "model": self.client.model}),
+        )
+        return desc
+
+    def model_info(self) -> str:
+        return self.client.describe()
 
     def _record_run(self, op: str, run: Any) -> None:
         """Сохранить статистику токенов одного запуска агента."""
@@ -197,20 +235,14 @@ class Orchestrator:
         # Держим последние 50 запусков
         if len(self._run_stats) > 50:
             self._run_stats = self._run_stats[-50:]
-        # deepseek-v4-flash pricing: $0.07/M input, $0.28/M output, $0.014/M cached
-        run_cost = (
-            (stat.tokens_prompt - stat.tokens_cached) * 0.07
-            + stat.tokens_cached * 0.014
-            + stat.tokens_completion * 0.28
-        ) / 1_000_000
+        # Цены — из реестра провайдера (config.LLM_PROVIDERS), $/1M токенов.
+        run_cost = self.client.cost_usd(
+            stat.tokens_prompt, stat.tokens_completion, stat.tokens_cached,
+        )
         total_p = sum(s.tokens_prompt for s in self._run_stats)
         total_c = sum(s.tokens_completion for s in self._run_stats)
         total_ca = sum(s.tokens_cached for s in self._run_stats)
-        session_cost = (
-            (total_p - total_ca) * 0.07
-            + total_ca * 0.014
-            + total_c * 0.28
-        ) / 1_000_000
+        session_cost = self.client.cost_usd(total_p, total_c, total_ca)
         prev = self._run_stats[-2] if len(self._run_stats) >= 2 else None
         delta = f" delta={stat.tokens_total - prev.tokens_total:+d}" if prev else ""
         tokens_log.info(
@@ -233,8 +265,180 @@ class Orchestrator:
             "total_completion": total_c,
             "total_tokens": total_p + total_c,
             "total_cached": total_ca,
+            "cost_usd": self.client.cost_usd(total_p, total_c, total_ca),
+            "model": self.client.describe(),
             "recent": self._run_stats[-10:],
         }
+
+    # --- PERSONAL MODE (DM) ---
+
+    def personal_space(self, user_id: int, display_name: str | None = None) -> PersonalSpace:
+        sp = self._spaces.get(user_id)
+        if sp is None:
+            sp = PersonalSpace(user_id, display_name)
+            self._spaces[user_id] = sp
+        elif display_name:
+            sp.display_name = display_name
+        return sp
+
+    def _team_wikis(self) -> dict[str, Wiki]:
+        return {c.name: _chat_wiki(c) for c in settings.get_chats()}
+
+    async def personal_turn(
+        self,
+        space: PersonalSpace,
+        text: str,
+        *,
+        message_id: int | None = None,
+        attached_media: list[str] | None = None,
+        history: list[dict[str, str]] | None = None,
+    ) -> str:
+        """Один ход диалога в личном режиме: агент классифицирует сообщение
+        (запись / поиск / управление артефактами / разговор) и действует.
+        Возвращает текст ответа пользователю (markdown, возможно с блоком IMAGES:)."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        chats = settings.get_chats()
+        chats_desc = ", ".join(f"`{c.name}`" for c in chats) or "(нет)"
+
+        async def share_fn(path: str, chat: str, comment: str) -> str:
+            return await self.share_to_chat(space, path, chat, comment=comment)
+
+        executor = self._make_executor(
+            space.wiki, space.cfg, team_wikis=self._team_wikis(), share_fn=share_fn,
+        )
+
+        def _read_or(rel: str, cap: int) -> str:
+            try:
+                t = space.wiki.read_file(rel)
+            except Exception:  # noqa: BLE001
+                return "(нет файла)"
+            return t if len(t) <= cap else t[:cap] + "\n...[truncated]"
+
+        head_ctx = (
+            "=== AGENTS.md ===\n" + _read_or("AGENTS.md", 6_000)
+            + "\n\n=== index.md ===\n" + _read_or("index.md", 4_000)
+        )
+        media_block = ""
+        if attached_media:
+            media_block = (
+                "\n\n[ПРИКРЕПЛЕНО — путь в личном vault; при необходимости describe_media:]\n"
+                + "\n".join(f"- {m}" for m in attached_media)
+            )
+        user_prompt = (
+            f"Сегодня: {today}. Владелец: {space.display_name} (user_id={space.user_id}).\n"
+            f"Групповые чаты для search_team_wiki/share_to_chat: {chats_desc}.\n"
+            f"Бюджет шагов: {settings.personal_agent_max_steps}.\n"
+            f"Источник этой реплики: [[raw/inbox/{today}#msg-{message_id}]].\n\n"
+            f"--- КОНТЕКСТ VAULT (не читай эти файлы через read_file) ---\n{head_ctx}\n"
+            f"--- КОНЕЦ КОНТЕКСТА ---\n\n"
+            f"СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n{text.strip()}{media_block}"
+        )
+        run = await run_agent(
+            client=self.client,
+            executor=executor,
+            system_prompt=PERSONAL_SYSTEM,
+            user_prompt=user_prompt,
+            max_steps=settings.personal_agent_max_steps,
+            tools=personal_tool_schemas(),
+            history=history,
+            force_finish_hint=(
+                "СТОП. Шаги кончились, инструментов больше нет. Ответь пользователю "
+                "обычным текстом: что успел сделать/найти и что осталось."
+            ),
+        )
+        self._record_run(f"personal/{space.user_id}", run)
+        if settings.git_autocommit:
+            commit_and_push(f"personal {space.user_id}: turn")
+        return run.summary or "Не понял, переформулируй."
+
+    async def share_to_chat(
+        self,
+        space: PersonalSpace,
+        rel: str,
+        chat_name: str,
+        *,
+        comment: str = "",
+        author: str | None = None,
+    ) -> str:
+        """Поделиться артефактом личного vault с групповым чатом.
+
+        1) Копия в vault группы (raw/notes/ + raw/assets/shared/).
+        2) Запись в БД как сообщение группы — попадёт в ближайший ingest.
+        3) Анонс в Telegram (бот-топик группы) + файл, если бинарник.
+        Возвращает человекочитаемый результат (для агента и для /share).
+        """
+        target = settings.get_chat_by_name(chat_name.strip().lstrip("#"))
+        if target is None:
+            avail = ", ".join(c.name for c in settings.get_chats())
+            return f"ERROR: чат '{chat_name}' не найден. Доступны: {avail}"
+        resolved = space.resolve_artifact(rel)
+        if not resolved:
+            return f"ERROR: артефакт '{rel}' не найден в личном vault"
+        author = author or space.display_name
+        try:
+            res = share_artifact(space, resolved, target, author=author, comment=comment)
+        except WikiPathError as exc:
+            return f"ERROR: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            log.exception("share_artifact failed")
+            return f"ERROR: {exc}"
+
+        now = datetime.now(timezone.utc)
+        # 2) БД: синтетическое сообщение для ingest (как /note).
+        synthetic_id = -int(now.timestamp() * 1000)
+        db_text = f"📤 shared by {author}: {res.title}\n\n{res.body_md[:3000]}"
+        try:
+            await self.db.save_message(
+                chat_id=target.chat_id, message_id=synthetic_id, topic_id=None,
+                user_id=space.user_id, username=None, full_name=author,
+                text=db_text, media_type="shared", media_path=res.dst_note,
+                reply_to_message_id=None, ts=now,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("share: db.save_message failed: %s", exc)
+
+        # 3) Telegram-анонс в бот-топик группы.
+        posted_id: int | None = None
+        try:
+            topic_id = await ensure_bot_topic(self.bot, self.db, target.chat_id)
+            header = f"📤 **{author}** поделился: **{res.title}**\n`{res.dst_note}`\n\n"
+            html = md_to_tg_html(header + res.body_md[:3500], tg_chat_id=target.chat_id)
+            chunks = split_tg_chunks(html)
+            for chunk in chunks[:3]:
+                sent = await self.bot.send_message(
+                    chat_id=target.chat_id, text=chunk,
+                    message_thread_id=topic_id, parse_mode="HTML",
+                )
+                posted_id = posted_id or sent.message_id
+            if res.is_binary and res.copied_assets:
+                from aiogram.types import FSInputFile  # noqa: PLC0415
+                f_abs = _chat_wiki(target).root / res.copied_assets[0]
+                if f_abs.is_file() and f_abs.stat().st_size <= 50 * 1024 * 1024:
+                    ext = f_abs.suffix.lower()
+                    if ext in {".jpg", ".jpeg", ".png", ".webp"}:
+                        await self.bot.send_photo(target.chat_id, FSInputFile(f_abs),
+                                                  message_thread_id=topic_id)
+                    else:
+                        await self.bot.send_document(target.chat_id, FSInputFile(f_abs),
+                                                     message_thread_id=topic_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("share: telegram post failed: %s", exc)
+
+        try:
+            await self.db.add_share(space.user_id, resolved, target.chat_id,
+                                    res.dst_note, posted_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("share: db.add_share failed: %s", exc)
+        self._append_log(_chat_wiki(target),
+                         f"share | from users/{space.user_id}/{resolved} → {res.dst_note}")
+        if settings.git_autocommit:
+            commit_and_push(f"share {target.name}: {res.dst_note}")
+        assets = f", файлов: {len(res.copied_assets)}" if res.copied_assets else ""
+        posted = " и анонсировано в Telegram" if posted_id else ""
+        return (
+            f"OK: «{res.title}» → чат {target.name}: `{res.dst_note}`{assets}{posted}. "
+            f"Попадёт в wiki чата при ближайшем ingest."
+        )
 
     # --- INGEST ---
 

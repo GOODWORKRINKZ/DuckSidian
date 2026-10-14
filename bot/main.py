@@ -16,6 +16,7 @@ from .db import DB
 from .git_sync import ensure_repo
 from .handlers import commands as cmd_router_mod
 from .handlers import listener as listener_mod
+from .handlers import private as private_mod
 from .orchestrator import Orchestrator
 from .scheduler import build_scheduler
 from .topic_manager import ensure_bot_topic
@@ -89,6 +90,7 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=None),
     )
     orch = Orchestrator(bot, db, wiki)
+    await orch.restore_model()
 
     # Инициализировать форум-топик бота для каждого чата
     for chat_cfg in settings.get_chats():
@@ -105,6 +107,9 @@ async def main() -> None:
         )
         return await handler(event, data)
 
+    # Личный режим (DM) — первым: его фильтр F.chat.type == "private" отсекает
+    # приватные сообщения до chat_guard группового роутера.
+    dp.include_router(private_mod.setup(db, orch, bot))
     dp.include_router(cmd_router_mod.setup(db, wiki, orch))
     dp.include_router(listener_mod.setup(db, orch, bot))
 
@@ -114,7 +119,7 @@ async def main() -> None:
     await _run_health_server()
 
     log.info("starting polling for chat_id=%s", settings.telegram_chat_id)
-    log.info("DeepSeek model: %s | base_url: %s", settings.deepseek_model, settings.deepseek_base_url)
+    log.info("LLM: %s", orch.model_info())
     try:
         # Retry-обёртка: при потере DNS / сети aiogram может вылететь с
         # TelegramNetworkError ещё до старта polling-цикла. Не падаем — ждём.

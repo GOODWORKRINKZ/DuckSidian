@@ -110,14 +110,38 @@ def _extract_text(path: Path) -> str:
 
 # ── VOICE / AUDIO STT ─────────────────────────────────────────────────────────
 
-def _transcribe_audio_sync(path: Path) -> str:
-    """Синхронная транскрипция через openai-whisper (модель tiny, ffmpeg-based)."""
+_WHISPER_MODEL = None
+_WHISPER_MODEL_NAME = ""
+
+
+def _whisper_model_name() -> str:
     try:
-        import whisper  # type: ignore[import]
+        from .config import settings  # noqa: PLC0415
+        return settings.whisper_model or "small"
+    except Exception:  # noqa: BLE001
+        return "small"
+
+
+def _get_whisper_model():
+    """Лениво загрузить и закэшировать модель whisper (загрузка — секунды)."""
+    global _WHISPER_MODEL, _WHISPER_MODEL_NAME
+    import whisper  # type: ignore[import]
+    name = _whisper_model_name()
+    if _WHISPER_MODEL is None or _WHISPER_MODEL_NAME != name:
+        log.info("loading whisper model %r", name)
+        _WHISPER_MODEL = whisper.load_model(name)
+        _WHISPER_MODEL_NAME = name
+    return _WHISPER_MODEL
+
+
+def _transcribe_audio_sync(path: Path) -> str:
+    """Синхронная транскрипция через openai-whisper (ffmpeg-based)."""
+    try:
+        import whisper  # type: ignore[import]  # noqa: F401
     except ImportError:
         return "(openai-whisper не установлен — pip install openai-whisper)"
     try:
-        model = whisper.load_model("tiny")
+        model = _get_whisper_model()
         result = model.transcribe(str(path))
         text = (result.get("text") or "").strip()
         lang = result.get("language", "?")
@@ -281,6 +305,17 @@ async def analyze_video(video_path: Path, describe_image_fn) -> str:
     if not parts:
         return "(не удалось проанализировать видео)"
     return "\n\n".join(parts)
+
+
+async def transcribe_video(video_path: Path) -> str:
+    """Только STT из видео/кружочка (без vision). Для личного режима: быстро
+    получить текст голоса из video_note / видео."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        audio_path = Path(tmpdir) / "audio.wav"
+        ok = await _extract_video_audio_async(video_path, audio_path)
+        if not ok or not audio_path.exists():
+            return "(не удалось извлечь аудио из видео — ffmpeg?)"
+        return await transcribe_audio(audio_path)
 
 
 async def extract_text_from_file(path: Path) -> str | None:

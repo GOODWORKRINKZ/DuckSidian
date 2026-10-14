@@ -2,8 +2,11 @@
 
 Telegram-бот, который слушает рабочий чат команды и ведёт LLM-Wiki в Obsidian
 по [паттерну Karpathy LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f).
-LLM — DeepSeek через OpenAI-совместимый API. Вся система поднимается одним
-скриптом в Docker.
+Плюс **личный режим**: каждый сотрудник в личке с ботом ведёт своё пространство
+(мысли, идеи, проекты, голосовые → текст, подборки фактов) и делится артефактами
+с групповым чатом. LLM — любой OpenAI-совместимый вендор (DeepSeek, MiniMax,
+Qwen, OpenAI, OpenRouter, Ollama) с переключением на лету. Вся система
+поднимается одним скриптом в Docker.
 
 ## Что внутри
 
@@ -16,25 +19,29 @@ DuckSidian/
 ├── bot/                      # aiogram 3 + DeepSeek tool-calling агент
 │   ├── main.py               # entrypoint
 │   ├── config.py             # pydantic-settings
-│   ├── db.py                 # SQLite (messages, batches, pending_questions)
+│   ├── db.py                 # SQLite (messages, batches, pending_questions, shares, allowlist)
 │   ├── wiki.py               # FS-обёртки + path traversal guard
-│   ├── orchestrator.py       # ingest / query / lint / summary + ask_user
+│   ├── orchestrator.py       # ingest / query / lint / summary / personal_turn / share_to_chat
+│   ├── personal.py           # личные пространства users/<id>/, артефакты, шаринг
 │   ├── scheduler.py          # APScheduler cron daily ingest
 │   ├── git_sync.py           # auto-commit & push vault
 │   ├── handlers/
 │   │   ├── listener.py       # пишет все сообщения чата в SQLite
-│   │   └── commands.py       # /ask /ingest /lint /summary /note ...
+│   │   ├── commands.py       # групповые команды /ask /ingest /lint /summary /note ...
+│   │   ├── private.py        # личный режим (DM): агент, голос, артефакты, /share
+│   │   └── admin_shared.py   # /model /allow /deny /users
 │   └── agent/
-│       ├── deepseek.py       # OpenAI-compatible client
+│       ├── deepseek.py       # LLMClient — OpenAI-compatible, мульти-вендор
 │       ├── tools.py          # JSON-schemas + ToolExecutor
 │       ├── loop.py           # tool-calling loop
-│       └── prompts.py        # system prompts
+│       └── prompts.py        # system prompts (ingest/query/lint/.../personal)
 ├── vault-template/           # эталонный скелет vault'а
 │   ├── AGENTS.md             # СХЕМА — главный конфиг агента
 │   ├── index.md
 │   ├── log.md
 │   ├── raw/{daily,notes,assets}/
-│   └── wiki/{entities,concepts,sources,daily,queries}/
+│   ├── wiki/{entities,concepts,sources,daily,queries}/
+│   └── personal/             # скелет личного пространства (AGENTS.md, index, шаблон проекта)
 ├── tests/                    # pytest
 └── scripts/smoke.sh
 ```
@@ -84,7 +91,69 @@ DuckSidian/
 | `/lint` | админ | health-check вики |
 | `/pause` / `/resume` | админ | приостановить cron |
 
+| `/model [provider] [model]` | админ | показать/переключить LLM-вендора (см. ниже) |
+| `/allow <id>` / `/deny <id>` / `/users` | админ | доступ сотрудников к личному режиму |
+
 Список админов — `TELEGRAM_ADMINS` в `.env` (через запятую).
+
+## Личный режим (DM с ботом)
+
+Сотрудник из allowlist (`TELEGRAM_ADMINS`, `TELEGRAM_PRIVATE_USERS` или
+добавленный через `/allow <id>`) пишет боту в личку и получает своё
+изолированное пространство `vault/users/<user_id>/` с той же трёхслойной
+структурой (`raw/inbox`, `raw/assets`, `wiki/{projects,notes,ideas,research}`,
+`AGENTS.md`, `index.md`, `log.md`). Чужой пользователь по `/start` видит свой id
+и подсказку, что попросить у админа.
+
+Любое сообщение проходит через агента (`PERSONAL_SYSTEM`), который сам
+классифицирует его:
+
+- **Запись** — мысль, идея, статус по проекту, расшифровка голосового →
+  страница проекта / `wiki/notes` / `wiki/ideas` + строка в `index.md`,
+  ответ «что и куда записал».
+- **Поиск и проверка** — «посмотри / проверь / найди / сравни …» → поиск по
+  личному vault, по wiki групповых чатов (`search_team_wiki`, read-only) и в
+  интернете (`web_search`, `fetch_url`, `fetch_git_log`) → подборка с
+  источниками, сохраняется в `wiki/research/`.
+- **Управление артефактами** — «покажи / удали / отправь в чат» →
+  `list_dir`/`edit_file`/`delete_file`/`share_to_chat`.
+
+Входные данные: текст, **голосовые и аудио** (Whisper, модель `WHISPER_MODEL`),
+видео и кружочки (STT дорожки через ffmpeg), документы (PDF/DOCX/XLSX/текст),
+фото (агент смотрит через `describe_media`). Всё складывается в
+`raw/inbox/<date>.md` и `raw/assets/<date>/`, диалог хранится в SQLite — агент
+получает последние `PERSONAL_HISTORY_SIZE` реплик как контекст.
+
+Команды в личке: `/ask`, `/note`, `/search`, `/projects`, `/list [kind]`,
+`/show <№|имя|путь>`, `/del <…>`, `/share <…> [чат] [комментарий]`
+(или `/share` реплаем на ответ бота), `/space`, `/log`, `/chats`, `/help`.
+
+**Шаринг в групповой чат** (`/share`, кнопка «📤 в <chat>» под ответом или
+просьба агенту) делает три вещи: копирует артефакт в `vault/<chat>/raw/notes/`
+(вложения — в `raw/assets/shared/<date>/`, ссылки переписываются), кладёт его
+в БД как сообщение чата (попадёт в ближайший ingest и в общую wiki) и
+анонсирует в бот-топике группы. Все шаринги пишутся в таблицу `shares`.
+
+## LLM-вендоры
+
+Все вендоры — OpenAI-совместимые `chat/completions` с tool-calling.
+Реестр — `LLM_PROVIDERS` в `bot/config.py`:
+
+| provider | base_url по умолчанию | ключ |
+|---|---|---|
+| `deepseek` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
+| `minimax` | `https://api.minimax.io/v1` | `MINIMAX_API_KEY` |
+| `qwen` | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
+| `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| `ollama` | `http://localhost:11434/v1` | — |
+| `custom` | `LLM_BASE_URL` | `LLM_API_KEY` |
+
+`LLM_PROVIDER` задаёт стартового вендора, `LLM_MODEL`/`LLM_BASE_URL`/`LLM_API_KEY`
+переопределяют его параметры. Админ переключает на лету: `/model` — список и
+статус ключей, `/model qwen qwen-max` — переключить; выбор сохраняется в БД и
+переживает рестарт. Расход токенов (`/balance`) считается по ценам из реестра.
+Старые переменные `DEEPSEEK_*` продолжают работать.
 
 ## Запуск
 
@@ -138,8 +207,8 @@ $EDITOR .env
   пришедшие после момента добавления.
 - Не строит vector-search/RAG индекс — `index.md` достаточно по Карпатому
   до сотен страниц.
-- Не обрабатывает медиа (фото/видео/файлы) в текстовом виде. Расширение —
-  скачивание в `raw/assets/<date>/` + OCR-сайдкар.
+- Vision для фото — через локальную Ollama `moondream` (если поднята); без неё
+  агент видит только метаданные изображения.
 
 ## Тесты
 

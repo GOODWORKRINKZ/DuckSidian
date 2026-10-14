@@ -379,7 +379,101 @@ TOOL_SCHEMAS: list[dict] = [
 ]
 
 
+# Инструменты, доступные ТОЛЬКО в личном режиме (DM): доступ к командным wiki
+# (read-only) и шаринг артефактов в групповой чат.
+PERSONAL_EXTRA_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_team_wiki",
+            "description": (
+                "Подстроковый поиск по wiki ГРУППОВОГО чата (командные знания, read-only). "
+                "chat — слаг чата из списка в контексте (например 'main'). "
+                "Возвращает JSON hit'ов {path, line, text, before, after}."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat": {"type": "string"},
+                    "query": {"type": "string"},
+                    "context": {"type": "integer", "default": 2},
+                },
+                "required": ["chat", "query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_team_file",
+            "description": (
+                "Прочитать файл из vault'а ГРУППОВОГО чата (read-only). "
+                "chat — слаг чата, path — относительный путь (например 'index.md', "
+                "'wiki/projects/X.md'). Для больших файлов используй start/end (1-based строки)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat": {"type": "string"},
+                    "path": {"type": "string"},
+                    "start": {"type": "integer", "default": 0},
+                    "end": {"type": "integer", "default": 0},
+                },
+                "required": ["chat", "path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_team_dir",
+            "description": "Список файлов в директории vault'а ГРУППОВОГО чата (read-only).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat": {"type": "string"},
+                    "path": {"type": "string", "default": ""},
+                },
+                "required": ["chat"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "share_to_chat",
+            "description": (
+                "Поделиться артефактом из личного vault с групповым чатом: файл "
+                "копируется в raw/notes/ (или raw/assets/shared/) vault'а чата, "
+                "регистрируется в БД для ingest и анонсируется в Telegram-топике бота. "
+                "ТОЛЬКО по явной просьбе владельца. path — rel путь в личном vault "
+                "(wiki/... или raw/assets/...), chat — слаг чата, comment — "
+                "необязательная подпись."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "chat": {"type": "string"},
+                    "comment": {"type": "string", "default": ""},
+                },
+                "required": ["path", "chat"],
+            },
+        },
+    },
+]
+
+_PERSONAL_EXCLUDE = {"ask_user", "defer_question", "tag_media"}
+
+
+def personal_tool_schemas() -> list[dict]:
+    """Набор инструментов для личного режима."""
+    base = [t for t in TOOL_SCHEMAS if t["function"]["name"] not in _PERSONAL_EXCLUDE]
+    return base + PERSONAL_EXTRA_TOOLS
+
+
 AskUserFn = Callable[[str, list[str] | None], Awaitable[str]]
+ShareFn = Callable[[str, str, str], Awaitable[str]]
 
 
 class ToolExecutor:
@@ -387,11 +481,16 @@ class ToolExecutor:
     не может писать в raw/."""
 
     def __init__(self, wiki: Wiki, ask_user: AskUserFn, deepseek_client: Any = None,
-                 file_cache: dict[str, str] | None = None, db: Any = None):
+                 file_cache: dict[str, str] | None = None, db: Any = None,
+                 team_wikis: dict[str, Wiki] | None = None,
+                 share_fn: ShareFn | None = None):
         self.wiki = wiki
         self.ask_user = ask_user
         self._ds = deepseek_client
         self._db = db
+        # Личный режим: read-only доступ к wiki групповых чатов + коллбек шаринга.
+        self._team_wikis: dict[str, Wiki] = team_wikis or {}
+        self._share_fn = share_fn
         self._media_index = MediaIndex(wiki.root)
         # Кэш содержимого файлов в рамках run_agent (или прокинутый снаружи —
         # тогда живёт между несколькими run_agent одного дня). Ключ — rel path.
@@ -670,6 +769,45 @@ class ToolExecutor:
                         pass
                 self._media_index.tag(rel, project, desc=cached_desc, notes=notes or None)
                 return f"OK: {rel} → {project}" + (f" ({notes})" if notes else "")
+            if name in ("search_team_wiki", "read_team_file", "list_team_dir"):
+                chat = str(arguments.get("chat", "")).strip()
+                twiki = self._team_wikis.get(chat)
+                if twiki is None:
+                    avail = ", ".join(sorted(self._team_wikis)) or "(нет)"
+                    return f"ERROR: неизвестный чат '{chat}'. Доступны: {avail}"
+                if name == "search_team_wiki":
+                    hits = twiki.search(
+                        arguments["query"], context=int(arguments.get("context", 2)),
+                    )
+                    for h in hits:
+                        h["chat"] = chat
+                    return json.dumps(hits, ensure_ascii=False, indent=2)
+                if name == "list_team_dir":
+                    return "\n".join(twiki.list_dir(arguments.get("path", "")))
+                path = twiki.find_md(arguments["path"])
+                if path.endswith("log.md"):
+                    text = twiki.read_file(path, max_bytes=2_000_000)
+                else:
+                    text = twiki.read_file(path)
+                start = int(arguments.get("start") or 0)
+                end = int(arguments.get("end") or 0)
+                if start > 0:
+                    lines = text.splitlines()
+                    if end <= 0 or end > len(lines):
+                        end = len(lines)
+                    slc = lines[start - 1:end]
+                    text = "\n".join(f"{i:>5}: {ln}" for i, ln in enumerate(slc, start))
+                    return f"[{chat}:{path} строки {start}–{end} из {len(lines)}]\n{text}"
+                return f"[{chat}:{path}]\n{text}"
+            if name == "share_to_chat":
+                if self._share_fn is None:
+                    return "ERROR: шаринг недоступен в этом режиме"
+                path = str(arguments.get("path", "")).strip()
+                chat = str(arguments.get("chat", "")).strip()
+                comment = str(arguments.get("comment") or "").strip()
+                if not path or not chat:
+                    return "ERROR: нужны 'path' и 'chat'"
+                return await self._share_fn(path, chat, comment)
             return f"ERROR: unknown tool {name}"
         except WikiPathError as exc:
             return f"ERROR: {exc}"

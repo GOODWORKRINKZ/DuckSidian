@@ -27,6 +27,12 @@ from ..orchestrator import Orchestrator, _chat_wiki
 from ..tg_format import md_to_tg_html, split_tg_chunks
 from ..topic_manager import ensure_bot_topic, reset_bot_topic
 from ..wiki import Wiki
+from .admin_shared import (
+    handle_allow_command,
+    handle_deny_command,
+    handle_model_command,
+    handle_users_command,
+)
 
 log = logging.getLogger(__name__)
 
@@ -298,6 +304,10 @@ HELP_TEXT = (
     "/topic — создать/пересоздать служебный топик <i>(admin)</i>\n"
     "/pause /resume — авто-ingest <i>(admin)</i>\n"
     "/resolve — разобрать спорные вопросы агента по одному <i>(admin)</i>\n"
+    "/model [provider] [model] — показать/переключить LLM (DeepSeek, MiniMax, Qwen, …) <i>(admin)</i>\n"
+    "/allow &lt;id&gt; /deny &lt;id&gt; /users — доступ к личному режиму (DM с ботом) <i>(admin)</i>\n"
+    "\n<i>Личный режим:</i> напиши боту в личку — своё пространство заметок, идей, "
+    "подборок и артефактов с шарингом в этот чат."
 )
 
 # Белый список чатов (chat_id) из конфига — вычисляется один раз при старте.
@@ -927,7 +937,7 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
         # Баланс DeepSeek
         bal_data = await orch.client.fetch_balance()
         if "error" in bal_data:
-            bal_text = f"⚠️ Ошибка запроса баланса: {bal_data['error']}"
+            bal_text = f"ℹ️ Баланс: {bal_data['error']}"
         else:
             lines = []
             for b in bal_data.get("balance_infos", []):
@@ -946,13 +956,9 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
         if runs == 0:
             stats_text = "\n\n📊 Токенов с момента старта: нет данных"
         else:
-            # deepseek-v4-flash pricing: $0.07/M input, $0.28/M output, $0.014/M cached
-            cost_usd = (
-                (stats["total_prompt"] - stats["total_cached"]) * 0.07
-                + stats["total_cached"] * 0.014
-                + stats["total_completion"] * 0.28
-            ) / 1_000_000
+            cost_usd = stats["cost_usd"]
             stats_text = (
+                f"\n\n🧠 Модель: <b>{stats['model']}</b>"
                 f"\n\n📊 Токены с момента старта (<b>{runs}</b> запусков):\n"
                 f"  prompt: <b>{stats['total_prompt']:,}</b> "
                 f"(cached: {stats['total_cached']:,})\n"
@@ -978,6 +984,22 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
                     prev_total = s.tokens_total
         await msg.reply(bal_text + stats_text, parse_mode="HTML")
 
+    @router.message(Command("model"))
+    async def cmd_model(msg: Message, command: CommandObject) -> None:
+        await handle_model_command(msg, command.args or "", orch)
+
+    @router.message(Command("allow"))
+    async def cmd_allow(msg: Message, command: CommandObject) -> None:
+        await handle_allow_command(msg, command.args or "", db)
+
+    @router.message(Command("deny"))
+    async def cmd_deny(msg: Message, command: CommandObject) -> None:
+        await handle_deny_command(msg, command.args or "", db)
+
+    @router.message(Command("users"))
+    async def cmd_users(msg: Message) -> None:
+        await handle_users_command(msg, db)
+
     @router.message(Command("pause"))
     async def cmd_pause(msg: Message) -> None:
         if not _is_admin(msg.from_user.id if msg.from_user else None):
@@ -987,13 +1009,6 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
         await msg.reply("⏸ авто-ingest приостановлен")
 
     @router.message(Command("resume"))
-    async def cmd_resume(msg: Message) -> None:
-        if not _is_admin(msg.from_user.id if msg.from_user else None):
-            await msg.reply("⛔ только для админов")
-            return
-        await db.set_state("paused", "0")
-        await msg.reply("▶️ авто-ingest возобновлён")
-
     async def cmd_resume(msg: Message) -> None:
         if not _is_admin(msg.from_user.id if msg.from_user else None):
             await msg.reply("⛔ только для админов")

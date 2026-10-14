@@ -97,7 +97,7 @@ class Wiki:
         p = self.resolve(rel, for_write=True)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-        return str(p.relative_to(self.root))
+        return str(p.relative_to(self.root)).replace("\\", "/")
 
     def append_file(self, rel: str, content: str) -> str:
         p = self.resolve(rel, for_write=True)
@@ -106,7 +106,7 @@ class Wiki:
             if not content.endswith("\n"):
                 content += "\n"
             f.write(content)
-        return str(p.relative_to(self.root))
+        return str(p.relative_to(self.root)).replace("\\", "/")
 
     def list_dir(self, rel: str = "") -> list[str]:
         p = self.resolve(rel) if rel else self.root

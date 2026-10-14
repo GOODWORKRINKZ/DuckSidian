@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from .deepseek import DeepSeekClient
+from .deepseek import LLMClient, extract_usage
 from .tools import TOOL_SCHEMAS, ToolExecutor
 
 log = logging.getLogger(__name__)
@@ -28,7 +28,7 @@ def _ctx_chars(messages: list[dict[str, Any]]) -> int:
 
 
 async def _compress_old_tool_results(
-    client: DeepSeekClient,
+    client: LLMClient,
     messages: list[dict[str, Any]],
     *,
     keep_last: int = 4,
@@ -94,21 +94,29 @@ async def _compress_old_tool_results(
 
 async def run_agent(
     *,
-    client: DeepSeekClient,
+    client: LLMClient,
     executor: ToolExecutor,
     system_prompt: str,
     user_prompt: str,
     max_steps: int = 30,
+    tools: list[dict] | None = None,
+    history: list[dict[str, Any]] | None = None,
+    force_finish_hint: str | None = None,
     tool_result_cap: int = 6_000,
     ctx_char_budget: int = 400_000,
     compress_ctx_threshold: int = 80_000,
 ) -> AgentRun:
     """Один прогон агента до вызова finish() или исчерпания шагов."""
 
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    tool_schemas = tools if tools is not None else TOOL_SCHEMAS
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    # История диалога (для личного режима): plain user/assistant реплики без tool_calls.
+    for h in history or []:
+        role = h.get("role")
+        content = str(h.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user_prompt})
     run = AgentRun(transcript=messages)
 
     for step in range(max_steps):
@@ -138,11 +146,11 @@ async def run_agent(
                     "что у тебя уже есть. Лучше неполный отчёт, чем пустой."
                 ),
             })
-        resp = await client.chat(messages=messages, tools=TOOL_SCHEMAS)
-        usage = resp.get("usage") or {}
-        run.tokens_prompt += usage.get("prompt_tokens", 0)
-        run.tokens_completion += usage.get("completion_tokens", 0)
-        run.tokens_cached += usage.get("prompt_cache_hit_tokens", 0)
+        resp = await client.chat(messages=messages, tools=tool_schemas)
+        _p, _c, _ca = extract_usage(resp)
+        run.tokens_prompt += _p
+        run.tokens_completion += _c
+        run.tokens_cached += _ca
         try:
             choice = resp["choices"][0]
             msg = choice["message"]
@@ -246,18 +254,17 @@ async def run_agent(
         try:
             messages.append({
                 "role": "system",
-                "content": (
+                "content": force_finish_hint or (
                     "СТОП. Шаги кончились. Никаких tool-вызовов — их у тебя "
-                    "больше нет. Ответь обычным текстом: ТРИЗ-разбор по тому, "
-                    "что уже собрано. Структура: Проблема / Противоречие / "
-                    "Идеальный конечный результат / 2-4 решения. На русском, кратко."
+                    "больше нет. Ответь обычным текстом итоговым результатом по тому, "
+                    "что уже собрано: кратко, по делу, на русском."
                 ),
             })
             final = await client.chat(messages=messages, tools=None)
-            fusage = final.get("usage") or {}
-            run.tokens_prompt += fusage.get("prompt_tokens", 0)
-            run.tokens_completion += fusage.get("completion_tokens", 0)
-            run.tokens_cached += fusage.get("prompt_cache_hit_tokens", 0)
+            _p, _c, _ca = extract_usage(final)
+            run.tokens_prompt += _p
+            run.tokens_completion += _c
+            run.tokens_cached += _ca
             forced_text = (
                 final["choices"][0]["message"].get("content")
                 or run.summary

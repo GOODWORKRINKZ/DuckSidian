@@ -1,0 +1,409 @@
+"""Личный режим: персональное пространство сотрудника в vault'е.
+
+Каждый разрешённый пользователь получает свой изолированный мини-vault:
+
+    vault/users/<user_id>/
+      AGENTS.md            — схема личного пространства (из vault-template/personal/)
+      index.md, log.md
+      raw/inbox/<date>.md  — сырой журнал диалога с ботом (текст, транскрипты, файлы)
+      raw/assets/<date>/   — присланные файлы
+      wiki/projects/       — проекты сотрудника
+      wiki/notes/          — заметки/мысли
+      wiki/ideas/          — идеи
+      wiki/research/       — подборки/фактчеки, собранные агентом по запросу
+      wiki/queries/        — сохранённые ответы /ask
+
+«Артефакт» = любой файл в wiki/ (markdown) или raw/assets/ (бинарник).
+Артефакт можно отправить («пошарить») в vault группового чата — он ложится в
+raw/notes/ группы и в БД как сообщение, чтобы ingest затащил его в общую wiki.
+"""
+from __future__ import annotations
+
+import logging
+import re
+import shutil
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .config import ChatConfig, settings
+from .wiki import Wiki, WikiPathError
+
+log = logging.getLogger(__name__)
+
+USERS_DIR = "users"
+PERSONAL_SUBDIRS = (
+    "raw/inbox", "raw/assets",
+    "wiki/projects", "wiki/notes", "wiki/ideas", "wiki/research", "wiki/queries",
+)
+ARTIFACT_KINDS = {
+    "projects": "wiki/projects",
+    "notes": "wiki/notes",
+    "ideas": "wiki/ideas",
+    "research": "wiki/research",
+    "queries": "wiki/queries",
+    "files": "raw/assets",
+}
+
+
+def user_cfg(user_id: int) -> ChatConfig:
+    """ChatConfig для личного пространства: chat_id == user_id (DM), name — путь."""
+    return ChatConfig(chat_id=user_id, name=f"{USERS_DIR}/{user_id}", topic_id=None)
+
+
+def is_user_cfg(cfg: ChatConfig | None) -> bool:
+    return bool(cfg) and cfg.name.startswith(f"{USERS_DIR}/")
+
+
+def slugify(text: str, max_len: int = 40) -> str:
+    s = (text or "").strip().lower()
+    s = re.sub(r"[^\w\s-]", "", s, flags=re.UNICODE)
+    s = re.sub(r"[\s_-]+", "-", s).strip("-")
+    if not s:
+        s = "item"
+    if len(s) > max_len:
+        s = s[:max_len].rstrip("-")
+    return s
+
+
+def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    """Грубый YAML-frontmatter парсер: {key: value} + тело."""
+    fm: dict[str, str] = {}
+    if not text.startswith("---\n"):
+        return fm, text
+    end = text.find("\n---", 4)
+    if end < 0:
+        return fm, text
+    for line in text[4:end].splitlines():
+        if ":" in line and not line.startswith(" "):
+            k, _, v = line.partition(":")
+            fm[k.strip()] = v.strip().strip('"').strip("'")
+    body = text[end + 4:].lstrip("\n")
+    return fm, body
+
+
+def _first_heading(body: str) -> str:
+    for line in body.splitlines():
+        s = line.strip()
+        if s.startswith("#"):
+            return s.lstrip("#").strip()
+    return ""
+
+
+@dataclass
+class Artifact:
+    path: str          # rel path внутри личного vault
+    kind: str          # projects | notes | ideas | research | queries | files | other
+    title: str
+    updated: str       # YYYY-MM-DD или ""
+    size: int
+
+    def label(self) -> str:
+        upd = f" · {self.updated}" if self.updated else ""
+        return f"{self.title or Path(self.path).stem}{upd}"
+
+
+class PersonalSpace:
+    """Обёртка над личным vault'ом пользователя."""
+
+    def __init__(self, user_id: int, display_name: str | None = None):
+        self.user_id = user_id
+        self.display_name = display_name or str(user_id)
+        self.cfg = user_cfg(user_id)
+        self.root: Path = settings.vault_path / USERS_DIR / str(user_id)
+        self.ensure()
+        self.wiki = Wiki(self.root)
+
+    # ----- seeding -----
+
+    def ensure(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        for sub in PERSONAL_SUBDIRS:
+            (self.root / sub).mkdir(parents=True, exist_ok=True)
+        tmpl_dir = Path(__file__).resolve().parent.parent / "vault-template" / "personal"
+        agents = self.root / "AGENTS.md"
+        if not agents.exists():
+            src = tmpl_dir / "AGENTS.md"
+            if src.exists():
+                shutil.copy2(src, agents)
+            else:
+                agents.write_text("# AGENTS.md — личное пространство\n", encoding="utf-8")
+        for fname in ("index.md", "log.md"):
+            p = self.root / fname
+            if not p.exists():
+                src = tmpl_dir / fname
+                if src.exists():
+                    shutil.copy2(src, p)
+                else:
+                    p.write_text(f"# {fname}\n", encoding="utf-8")
+        tmpl = self.root / "wiki" / "projects" / "_template.md"
+        if not tmpl.exists():
+            src = tmpl_dir / "wiki" / "projects" / "_template.md"
+            if src.exists():
+                shutil.copy2(src, tmpl)
+
+    # ----- inbox (raw journal) -----
+
+    def append_inbox(
+        self,
+        *,
+        who: str,
+        text: str,
+        ts: datetime | None = None,
+        message_id: int | None = None,
+        media_type: str | None = None,
+        media_path: str | None = None,
+    ) -> str:
+        """Дописать реплику в raw/inbox/<date>.md. Возвращает rel путь файла."""
+        ts = ts or datetime.now(timezone.utc)
+        date_iso = ts.strftime("%Y-%m-%d")
+        rel = f"raw/inbox/{date_iso}.md"
+        p = self.root / rel
+        if not p.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(
+                f"# Inbox — {date_iso}\n\n"
+                "Сырой журнал диалога с ботом (read-only для агента). "
+                "Каждая реплика помечена якорем `^msg-<id>`.\n\n",
+                encoding="utf-8",
+            )
+        lines = [f"### [{ts.strftime('%H:%M')}] {who}"]
+        if media_type and media_path:
+            lines.append(f"> 📎 *{media_type}*: `[[{media_path}]]`")
+        for ln in (text or "").strip().splitlines():
+            lines.append(f"> {ln}")
+        if not (text or "").strip() and not media_path:
+            lines.append("> *(пусто)*")
+        if message_id is not None:
+            lines.append(f"^msg-{message_id}")
+        lines.append("")
+        with p.open("a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return rel
+
+    def log(self, line: str) -> None:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        try:
+            self.wiki.append_file("log.md", f"## [{ts}] {line}")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("personal log append failed: %s", exc)
+
+    # ----- artifacts -----
+
+    def _kind_of(self, rel: str) -> str:
+        for kind, prefix in ARTIFACT_KINDS.items():
+            if rel.startswith(prefix + "/"):
+                return kind
+        return "other"
+
+    def list_artifacts(self, kind: str | None = None, limit: int = 60) -> list[Artifact]:
+        """Все артефакты (wiki/**.md + raw/assets/**), свежие сверху."""
+        out: list[Artifact] = []
+        roots: list[Path] = []
+        if kind and kind in ARTIFACT_KINDS:
+            roots = [self.root / ARTIFACT_KINDS[kind]]
+        else:
+            roots = [self.root / "wiki", self.root / "raw" / "assets"]
+        for base in roots:
+            if not base.exists():
+                continue
+            for p in base.rglob("*"):
+                if not p.is_file() or p.name.startswith(("_", ".")):
+                    continue
+                rel = str(p.relative_to(self.root)).replace("\\", "/")
+                k = self._kind_of(rel)
+                title, updated = "", ""
+                if p.suffix.lower() == ".md":
+                    try:
+                        text = p.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+                    fm, body = parse_frontmatter(text)
+                    title = fm.get("title") or _first_heading(body) or p.stem
+                    updated = fm.get("updated") or fm.get("created") or ""
+                else:
+                    title = p.name
+                if not updated:
+                    updated = datetime.fromtimestamp(
+                        p.stat().st_mtime, tz=timezone.utc
+                    ).strftime("%Y-%m-%d")
+                out.append(Artifact(rel, k, title, updated, p.stat().st_size))
+        out.sort(key=lambda a: (a.updated, a.path), reverse=True)
+        return out[:limit]
+
+    def resolve_artifact(self, ref: str) -> str | None:
+        """Найти артефакт по точному пути, basename или уникальной подстроке."""
+        ref = (ref or "").strip().strip("`").lstrip("/")
+        if not ref:
+            return None
+        try:
+            if (self.root / ref).is_file():
+                return ref.replace("\\", "/")
+            if not ref.endswith(".md") and (self.root / f"{ref}.md").is_file():
+                return f"{ref}.md"
+        except OSError:
+            pass
+        arts = self.list_artifacts(limit=10_000)
+        low = ref.lower()
+        exact = [a for a in arts if Path(a.path).name.lower() in (low, f"{low}.md")]
+        if len(exact) == 1:
+            return exact[0].path
+        sub = [a for a in arts if low in a.path.lower() or low in a.title.lower()]
+        if len(sub) == 1:
+            return sub[0].path
+        return None
+
+    def read_artifact(self, rel: str, max_bytes: int = 200_000) -> str:
+        return self.wiki.read_file(rel, max_bytes=max_bytes)
+
+    def delete_artifact(self, rel: str) -> str:
+        """Удалить артефакт. Разрешено только в wiki/ и raw/assets/."""
+        p = self.wiki.resolve(rel)
+        rel_norm = str(p.relative_to(self.root)).replace("\\", "/")
+        if not (rel_norm.startswith("wiki/") or rel_norm.startswith("raw/assets/")):
+            raise WikiPathError(f"удалять можно только из wiki/ или raw/assets/: {rel_norm}")
+        if rel_norm.endswith("_template.md"):
+            raise WikiPathError("шаблон не удаляется")
+        if not p.is_file():
+            raise WikiPathError(f"файл не найден: {rel_norm}")
+        p.unlink()
+        self.log(f"delete | {rel_norm}")
+        return rel_norm
+
+    def save_research(self, title: str, body_md: str, query: str = "") -> str:
+        """Сохранить подборку агента в wiki/research/<date>-<slug>.md."""
+        now = datetime.now(timezone.utc)
+        rel = f"wiki/research/{now.strftime('%Y-%m-%d')}-{slugify(title)}.md"
+        fm = (
+            "---\n"
+            "type: research\n"
+            f"title: \"{title.replace(chr(34), chr(39))}\"\n"
+            f"created: {now.strftime('%Y-%m-%d')}\n"
+            f"updated: {now.strftime('%Y-%m-%d')}\n"
+            f"query: \"{(query or '').replace(chr(34), chr(39))[:200]}\"\n"
+            "---\n\n"
+        )
+        self.wiki.write_file(rel, fm + f"# {title}\n\n{body_md.strip()}\n")
+        return rel
+
+
+# ----- sharing -----
+
+_ASSET_LINK_RE = re.compile(r"!?\[\[(raw/assets/[^\]|#]+)(?:\|[^\]]*)?\]\]")
+
+
+def _target_wiki(target: ChatConfig) -> Wiki:
+    from .orchestrator import _chat_wiki  # noqa: PLC0415  (избегаем цикла импорта)
+    return _chat_wiki(target)
+
+
+@dataclass
+class ShareResult:
+    dst_note: str                 # rel путь заметки в vault группы
+    copied_assets: list[str]      # rel пути скопированных файлов (в vault группы)
+    title: str
+    body_md: str                  # что постить в группу (markdown)
+    is_binary: bool
+
+
+def share_artifact(
+    space: PersonalSpace,
+    rel: str,
+    target: ChatConfig,
+    *,
+    author: str,
+    comment: str = "",
+) -> ShareResult:
+    """Скопировать артефакт из личного vault в vault группового чата.
+
+    Markdown → raw/notes/<ts>-shared-<slug>.md в группе (+ копии вложенных
+    raw/assets/* файлов в raw/assets/shared/<date>/). Бинарник → копия в
+    raw/assets/shared/<date>/ и короткая сопроводительная заметка.
+    Запись в БД/Telegram делает вызывающий (orchestrator.share_to_chat).
+    """
+    src_abs = space.wiki.resolve(rel)
+    if not src_abs.is_file():
+        raise WikiPathError(f"файл не найден: {rel}")
+    twiki = _target_wiki(target)
+    now = datetime.now(timezone.utc)
+    date_iso = now.strftime("%Y-%m-%d")
+    ts = now.strftime("%Y%m%dT%H%M%SZ")
+    shared_dir_rel = f"raw/assets/shared/{date_iso}"
+    (twiki.root / shared_dir_rel).mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+
+    def _copy_asset(asset_rel: str) -> str | None:
+        try:
+            a_abs = space.wiki.resolve(asset_rel)
+        except WikiPathError:
+            return None
+        if not a_abs.is_file():
+            return None
+        safe = "".join(c for c in a_abs.name if c.isalnum() or c in "._-") or "file.bin"
+        dst_rel = f"{shared_dir_rel}/u{space.user_id}_{safe}"
+        dst_abs = twiki.root / dst_rel
+        if not dst_abs.exists():
+            shutil.copy2(a_abs, dst_abs)
+        copied.append(dst_rel)
+        return dst_rel
+
+    is_binary = src_abs.suffix.lower() != ".md"
+    if is_binary:
+        dst_rel = _copy_asset(rel)
+        title = src_abs.name
+        body = (
+            f"Файл от {author}: `[[{dst_rel}]]`"
+            + (f"\n\n{comment.strip()}" if comment.strip() else "")
+        )
+    else:
+        text = src_abs.read_text(encoding="utf-8", errors="replace")
+        fm, body = parse_frontmatter(text)
+        title = fm.get("title") or _first_heading(body) or src_abs.stem
+        # Копируем вложения и переписываем ссылки на новый путь.
+        def _sub(m: re.Match) -> str:
+            new_rel = _copy_asset(m.group(1))
+            if not new_rel:
+                return m.group(0)
+            return m.group(0).replace(m.group(1), new_rel)
+        body = _ASSET_LINK_RE.sub(_sub, body)
+        if comment.strip():
+            body = f"> 💬 {comment.strip()}\n\n{body}"
+
+    slug = slugify(title)
+    dst_note = f"raw/notes/{ts}-shared-{slug}.md"
+    note = (
+        "---\n"
+        "type: shared\n"
+        f"from: \"{author}\"\n"
+        f"from_user_id: {space.user_id}\n"
+        f"source: \"users/{space.user_id}/{rel}\"\n"
+        f"created: {date_iso}\n"
+        "---\n\n"
+        f"# {title}\n\n"
+        f"_📤 Поделился {author} из личного пространства ({date_iso})._\n\n"
+        f"{body.strip()}\n"
+    )
+    twiki.write_file(dst_note, note)
+    space.log(f"share | {rel} → {target.name}:{dst_note}")
+    return ShareResult(dst_note, copied, title, body.strip(), is_binary)
+
+
+def artifact_markdown_table(arts: list[Artifact]) -> str:
+    if not arts:
+        return "_(пусто)_"
+    icons = {"projects": "📁", "notes": "📝", "ideas": "💡", "research": "🔎",
+             "queries": "❓", "files": "📎", "other": "📄"}
+    lines = []
+    for i, a in enumerate(arts, 1):
+        lines.append(f"{i}. {icons.get(a.kind, '📄')} **{a.title}** — `{a.path}`"
+                     + (f" _{a.updated}_" if a.updated else ""))
+    return "\n".join(lines)
+
+
+def describe_space(space: PersonalSpace) -> dict[str, Any]:
+    counts = {k: 0 for k in ARTIFACT_KINDS}
+    for a in space.list_artifacts(limit=10_000):
+        if a.kind in counts:
+            counts[a.kind] += 1
+    return {"root": str(space.root), "counts": counts}

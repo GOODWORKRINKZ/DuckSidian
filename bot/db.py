@@ -72,6 +72,16 @@ CREATE TABLE IF NOT EXISTS topics (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (chat_id, topic_id)
 );
+
+CREATE TABLE IF NOT EXISTS shares (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    src_path TEXT NOT NULL,
+    target_chat_id INTEGER NOT NULL,
+    dst_path TEXT NOT NULL,
+    posted_message_id INTEGER,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -112,6 +122,17 @@ class DB:
                     name TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (chat_id, topic_id)
+                )"""
+            )
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS shares (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    src_path TEXT NOT NULL,
+                    target_chat_id INTEGER NOT NULL,
+                    dst_path TEXT NOT NULL,
+                    posted_message_id INTEGER,
+                    created_at TEXT NOT NULL
                 )"""
             )
             await db.commit()
@@ -366,3 +387,59 @@ class DB:
                 (answer, datetime.now(timezone.utc).isoformat(), dispute_id),
             )
             await db.commit()
+
+    # --- private mode: allowlist (хранится в state как JSON-список) ---
+
+    _PRIVATE_USERS_KEY = "private_users"
+
+    async def get_private_users(self) -> list[int]:
+        import json
+        raw = await self.get_state(self._PRIVATE_USERS_KEY, "[]")
+        try:
+            return [int(x) for x in json.loads(raw)]
+        except Exception:  # noqa: BLE001
+            return []
+
+    async def add_private_user(self, user_id: int) -> bool:
+        import json
+        users = await self.get_private_users()
+        if user_id in users:
+            return False
+        users.append(int(user_id))
+        await self.set_state(self._PRIVATE_USERS_KEY, json.dumps(users))
+        return True
+
+    async def remove_private_user(self, user_id: int) -> bool:
+        import json
+        users = await self.get_private_users()
+        if user_id not in users:
+            return False
+        users.remove(int(user_id))
+        await self.set_state(self._PRIVATE_USERS_KEY, json.dumps(users))
+        return True
+
+    # --- shares ---
+
+    async def add_share(
+        self, user_id: int, src_path: str, target_chat_id: int,
+        dst_path: str, posted_message_id: int | None = None,
+    ) -> int:
+        async with self.conn() as db:
+            cur = await db.execute(
+                """INSERT INTO shares
+                   (user_id, src_path, target_chat_id, dst_path, posted_message_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (user_id, src_path, target_chat_id, dst_path, posted_message_id,
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            await db.commit()
+            return cur.lastrowid or 0
+
+    async def fetch_shares(self, user_id: int, limit: int = 20) -> list[aiosqlite.Row]:
+        async with self.conn() as db:
+            async with db.execute(
+                """SELECT * FROM shares WHERE user_id=?
+                   ORDER BY created_at DESC LIMIT ?""",
+                (user_id, limit),
+            ) as cur:
+                return list(await cur.fetchall())

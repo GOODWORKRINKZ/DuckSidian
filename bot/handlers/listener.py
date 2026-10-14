@@ -106,6 +106,56 @@ async def _download_media(
         return media_type, None
 
 
+async def handle_answer_callback(cb: CallbackQuery, db: DB, orch: Orchestrator) -> None:
+    """Кнопка-ответ на вопрос агента (`ans:<qid>:<idx>`). Общая для групп и DM."""
+    try:
+        _, qid_s, idx_s = (cb.data or "").split(":", 2)
+        qid = int(qid_s)
+        idx = int(idx_s)
+    except ValueError:
+        await cb.answer("bad payload")
+        return
+    row = await db.get_question(qid)
+    if not row:
+        await cb.answer("вопрос не найден")
+        return
+    opts_raw = row["options"]
+    options = json.loads(opts_raw) if opts_raw else []
+    if idx >= len(options):
+        await cb.answer("bad option")
+        return
+    chosen = options[idx]
+    delivered = await orch.deliver_answer(qid, chosen)
+    await cb.answer("принято" if delivered else "уже отвечено")
+    if cb.message:
+        try:
+            from html import escape as _esc
+            await cb.message.edit_text(
+                _esc(cb.message.text or "") + f"\n\n✅ <b>Ответ:</b> {_esc(chosen)}",
+                parse_mode="HTML",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def question_id_from_reply(msg: Message) -> int:
+    """Если msg — reply на вопрос агента (текст бота содержит `id=N.`), вернуть N, иначе -1."""
+    if not (
+        msg.reply_to_message
+        and msg.reply_to_message.from_user
+        and msg.reply_to_message.from_user.is_bot
+        and msg.text
+    ):
+        return -1
+    replied_text = msg.reply_to_message.text or ""
+    if "id=" not in replied_text:
+        return -1
+    try:
+        return int(replied_text.split("id=", 1)[1].split(".", 1)[0].strip())
+    except ValueError:
+        return -1
+
+
 def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
     chat_ids: set[int] = {cfg.chat_id for cfg in settings.get_chats()}
     chat_name_by_id: dict[int, str] = {
@@ -114,34 +164,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
 
     @router.callback_query(F.data.startswith("ans:"))
     async def on_callback(cb: CallbackQuery) -> None:
-        try:
-            _, qid_s, idx_s = (cb.data or "").split(":", 2)
-            qid = int(qid_s)
-            idx = int(idx_s)
-        except ValueError:
-            await cb.answer("bad payload")
-            return
-        row = await db.get_question(qid)
-        if not row:
-            await cb.answer("вопрос не найден")
-            return
-        opts_raw = row["options"]
-        options = json.loads(opts_raw) if opts_raw else []
-        if idx >= len(options):
-            await cb.answer("bad option")
-            return
-        chosen = options[idx]
-        delivered = await orch.deliver_answer(qid, chosen)
-        await cb.answer("принято" if delivered else "уже отвечено")
-        if cb.message:
-            try:
-                from html import escape as _esc
-                await cb.message.edit_text(
-                    _esc(cb.message.text or "") + f"\n\n✅ <b>Ответ:</b> {_esc(chosen)}",
-                    parse_mode="HTML",
-                )
-            except Exception:  # noqa: BLE001
-                pass
+        await handle_answer_callback(cb, db, orch)
 
     @router.message()
     async def on_any_message(msg: Message) -> None:
