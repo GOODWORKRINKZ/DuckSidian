@@ -40,7 +40,7 @@ from .agent.tools import ToolExecutor, personal_tool_schemas
 from .config import ChatConfig, settings
 from .db import DB
 from .git_sync import commit_and_push
-from .personal import PersonalSpace, is_user_cfg, share_artifact
+from .personal import PersonalSpace, is_user_cfg, share_artifact, share_workspace
 from .tg_format import md_to_tg_html, split_tg_chunks
 from .topic_manager import ensure_bot_topic
 from .wiki import Wiki, WikiPathError
@@ -292,6 +292,8 @@ class Orchestrator:
         message_id: int | None = None,
         attached_media: list[str] | None = None,
         history: list[dict[str, str]] | None = None,
+        workspace: dict[str, Any] | None = None,
+        progress: Any = None,
     ) -> str:
         """Один ход диалога в личном режиме: агент классифицирует сообщение
         (запись / поиск / управление артефактами / разговор) и действует.
@@ -324,10 +326,19 @@ class Orchestrator:
                 "\n\n[ПРИКРЕПЛЕНО — путь в личном vault; при необходимости describe_media:]\n"
                 + "\n".join(f"- {m}" for m in attached_media)
             )
+        ws_block = ""
+        if workspace:
+            slug = workspace.get("project_slug") or ""
+            ws_block = (
+                f"Текущий воркспейс: «{workspace.get('name')}»"
+                + (f" → проект wiki/projects/{slug}.md" if slug else "")
+                + ". Всё ниже относится к нему, если не сказано иное.\n"
+            )
         user_prompt = (
             f"Сегодня: {today}. Владелец: {space.display_name} (user_id={space.user_id}).\n"
             f"Групповые чаты для search_team_wiki/share_to_chat: {chats_desc}.\n"
             f"Бюджет шагов: {settings.personal_agent_max_steps}.\n"
+            f"{ws_block}"
             f"Источник этой реплики: [[raw/inbox/{today}#msg-{message_id}]].\n\n"
             f"--- КОНТЕКСТ VAULT (не читай эти файлы через read_file) ---\n{head_ctx}\n"
             f"--- КОНЕЦ КОНТЕКСТА ---\n\n"
@@ -345,6 +356,7 @@ class Orchestrator:
                 "СТОП. Шаги кончились, инструментов больше нет. Ответь пользователю "
                 "обычным текстом: что успел сделать/найти и что осталось."
             ),
+            on_step=progress,
         )
         self._record_run(f"personal/{space.user_id}", run)
         if settings.git_autocommit:
@@ -438,6 +450,90 @@ class Orchestrator:
         return (
             f"OK: «{res.title}» → чат {target.name}: `{res.dst_note}`{assets}{posted}. "
             f"Попадёт в wiki чата при ближайшем ingest."
+        )
+
+    async def share_workspace_to_chat(
+        self,
+        space: PersonalSpace,
+        slug: str,
+        chat_name: str,
+        *,
+        comment: str = "",
+        author: str | None = None,
+        as_topic: bool = False,
+    ) -> str:
+        """Поделиться целым воркспейсом (проект + связанные заметки/подборки/файлы).
+
+        Каждая страница ложится отдельной заметкой в raw/notes/ группы и отдельным
+        сообщением в БД (для ingest). Анонс один: в бот-топик, либо (as_topic) в
+        отдельную тему группы с именем воркспейса — «вкладка в вкладку».
+        """
+        target = settings.get_chat_by_name(chat_name.strip().lstrip("#"))
+        if target is None:
+            avail = ", ".join(c.name for c in settings.get_chats())
+            return f"ERROR: чат '{chat_name}' не найден. Доступны: {avail}"
+        author = author or space.display_name
+        try:
+            res = share_workspace(space, slug, target, author=author, comment=comment)
+        except WikiPathError as exc:
+            return f"ERROR: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            log.exception("share_workspace failed")
+            return f"ERROR: {exc}"
+
+        now = datetime.now(timezone.utc)
+        base_id = -int(now.timestamp() * 1000)
+        for i, page in enumerate(res.pages):
+            try:
+                await self.db.save_message(
+                    chat_id=target.chat_id, message_id=base_id - i, topic_id=None,
+                    user_id=space.user_id, username=None, full_name=author,
+                    text=f"📤 workspace «{res.title}» / {page.title} (shared by {author})\n\n{page.body_md[:3000]}",
+                    media_type="shared", media_path=page.dst_note,
+                    reply_to_message_id=None, ts=now,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("share_workspace: db.save_message failed: %s", exc)
+
+        posted_id: int | None = None
+        thread_id: int | None = None
+        try:
+            if as_topic:
+                key = f"ws_topic_{target.chat_id}_{slug}"
+                stored = await self.db.get_state(key, "")
+                if stored:
+                    thread_id = int(stored)
+                else:
+                    topic = await self.bot.create_forum_topic(chat_id=target.chat_id, name=res.title[:128])
+                    thread_id = topic.message_thread_id
+                    await self.db.set_state(key, str(thread_id))
+                    await self.db.save_topic(target.chat_id, thread_id, res.title[:128])
+            else:
+                thread_id = await ensure_bot_topic(self.bot, self.db, target.chat_id)
+            html = md_to_tg_html(res.summary_md, tg_chat_id=target.chat_id)
+            for chunk in split_tg_chunks(html)[:3]:
+                sent = await self.bot.send_message(
+                    chat_id=target.chat_id, text=chunk,
+                    message_thread_id=thread_id, parse_mode="HTML",
+                )
+                posted_id = posted_id or sent.message_id
+        except Exception as exc:  # noqa: BLE001
+            log.warning("share_workspace: telegram post failed: %s", exc)
+
+        try:
+            await self.db.add_share(space.user_id, f"workspace:{slug}", target.chat_id,
+                                    res.pages[0].dst_note if res.pages else "", posted_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("share_workspace: db.add_share failed: %s", exc)
+        self._append_log(_chat_wiki(target),
+                         f"share-workspace | users/{space.user_id}:{slug} | {len(res.pages)} pages | "
+                         f"{len(res.copied_assets)} assets")
+        if settings.git_autocommit:
+            commit_and_push(f"share-workspace {target.name}: {slug}")
+        where = (f"в тему «{res.title}»" if as_topic and thread_id else "в бот-топик") if posted_id else "(анонс не отправлен)"
+        return (
+            f"OK: воркспейс «{res.title}» → чат {target.name}: {len(res.pages)} страниц(ы), "
+            f"{len(res.copied_assets)} файл(ов), анонс {where}. Попадёт в wiki чата при ближайшем ingest."
         )
 
     # --- INGEST ---

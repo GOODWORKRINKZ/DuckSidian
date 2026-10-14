@@ -50,9 +50,10 @@ LLM_PROVIDERS: dict[str, LLMProvider] = {
         key="minimax", title="MiniMax",
         base_url="https://api.minimax.io/v1",
         api_key_env="MINIMAX_API_KEY",
-        default_model="MiniMax-M2.1",
-        models=["MiniMax-M2.1", "MiniMax-M2", "MiniMax-Text-01"],
-        price_in=0.30, price_out=1.20, price_cached=0.03,
+        default_model="MiniMax-M3",
+        models=["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.1"],
+        # Ориентировочно (OpenRouter-прайс M3); официальные цены — в кабинете MiniMax.
+        price_in=0.23, price_out=0.96, price_cached=0.05,
     ),
     "qwen": LLMProvider(
         key="qwen", title="Qwen (Alibaba DashScope)",
@@ -135,6 +136,27 @@ class Settings(BaseSettings):
     # Backward compat: старые переменные DeepSeek.
     deepseek_base_url: str = ""
     deepseek_model: str = ""
+
+    # --- Медиа-ИИ (MiniMax): речь → текст, текст → речь, зрение, картинки ---
+    # Режимы: auto (MiniMax если есть MINIMAX_API_KEY, иначе локальный fallback),
+    # minimax (принудительно), off.
+    minimax_base_url: str = "https://api.minimax.io"
+    stt_provider: str = "auto"        # auto | minimax | whisper | off
+    stt_language: str = "ru"          # подсказка языка для ASR ('' = автоопределение)
+    vision_provider: str = "auto"     # auto | minimax | ollama | off
+    tts_provider: str = "auto"        # auto | minimax | off
+    image_provider: str = "auto"      # auto | minimax | off
+    minimax_asr_model: str = "asr-1.0"
+    minimax_vision_model: str = "MiniMax-M3"
+    minimax_vision_detail: str = "default"   # low | default | high
+    minimax_tts_model: str = "speech-2.8-hd"
+    minimax_tts_voice: str = "Russian_ReliableMan"   # см. /voices — другие голоса
+    minimax_tts_speed: float = 1.0
+    minimax_tts_language_boost: str = "Russian"
+    minimax_image_model: str = "image-01"
+    # Голосовые ответы в личке: auto — отвечать голосом, если пользователь прислал голос;
+    # on — всегда; off — никогда. Переключается per-user командой /voice.
+    personal_voice_reply: str = "auto"
 
     # --- Личный режим ---
     personal_agent_max_steps: int = 20

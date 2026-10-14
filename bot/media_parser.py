@@ -152,10 +152,49 @@ def _transcribe_audio_sync(path: Path) -> str:
         return f"(ошибка STT: {exc})"
 
 
-async def transcribe_audio(path: Path) -> str:
-    """Асинхронная обёртка для STT (запускает в thread-pool)."""
+async def _transcribe_whisper(path: Path) -> str:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _transcribe_audio_sync, path)
+
+
+async def transcribe_audio(path: Path) -> str:
+    """STT: MiniMax ASR (если включён), иначе/при ошибке — локальный Whisper.
+
+    Возвращает текст; при полном провале — строку-заглушку в скобках "(…)".
+    """
+    try:
+        from .config import settings  # noqa: PLC0415
+        from .media_ai import ASR_FORMATS, extract_audio_for_asr, get_media_ai  # noqa: PLC0415
+        mode = (settings.stt_provider or "auto").lower()
+    except Exception:  # noqa: BLE001
+        mode = "whisper"
+    if mode == "off":
+        return "(STT выключен: STT_PROVIDER=off)"
+    if mode != "whisper":
+        ai = get_media_ai()
+        if ai.stt_enabled:
+            src = path
+            tmp: Path | None = None
+            try:
+                if path.suffix.lower() not in ASR_FORMATS:
+                    tmp = await extract_audio_for_asr(path)
+                    if tmp is None:
+                        raise RuntimeError("ffmpeg не смог извлечь аудио")
+                    src = tmp
+                text = await ai.transcribe(src)
+                return text or "(пустая транскрипция)"
+            except Exception as exc:  # noqa: BLE001
+                log.warning("minimax STT failed (%s), falling back to whisper", exc)
+                if mode == "minimax":
+                    return f"(ошибка STT MiniMax: {exc})"
+            finally:
+                if tmp is not None:
+                    try:
+                        tmp.unlink()
+                        tmp.parent.rmdir()
+                    except OSError:
+                        pass
+    return await _transcribe_whisper(path)
 
 
 # ── MAIN ENTRY ────────────────────────────────────────────────────────────────
@@ -315,6 +354,8 @@ async def transcribe_video(video_path: Path) -> str:
         ok = await _extract_video_audio_async(video_path, audio_path)
         if not ok or not audio_path.exists():
             return "(не удалось извлечь аудио из видео — ffmpeg?)"
+        if audio_path.stat().st_size <= 44:
+            return "(в видео нет звуковой дорожки)"
         return await transcribe_audio(audio_path)
 
 

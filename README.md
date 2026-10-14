@@ -126,7 +126,44 @@ DuckSidian/
 
 Команды в личке: `/ask`, `/note`, `/search`, `/projects`, `/list [kind]`,
 `/show <№|имя|путь>`, `/del <…>`, `/share <…> [чат] [комментарий]`
-(или `/share` реплаем на ответ бота), `/space`, `/log`, `/chats`, `/help`.
+(или `/share` реплаем на ответ бота), `/say`, `/voice`, `/voices`, `/imagine`,
+`/ws`, `/space`, `/log`, `/chats`, `/help`.
+
+### Воркспейсы = темы в личке
+
+Telegram с Bot API 9.3/9.4 поддерживает темы (topics) в личных чатах с ботом.
+Включи у бота в @BotFather «Threaded mode / Topics» — и каждая тема в личке
+становится **воркспейсом**: при создании темы бот заводит страницу
+`wiki/projects/<Имя>.md`, всё написанное в теме агент относит к этому проекту
+(идеи, задачи, решения, подборки с `project: "[[Имя]]"`), история диалога —
+своя на тему. Общий чат без темы — «входящие» без привязки.
+
+- `/ws` — текущий воркспейс и кнопки «📤 в <chat>»; `/ws <имя>` — переименовать;
+  `/ws new <имя>` — создать тему+проект; `/ws list` — все.
+- `/ws share <чат> [topic] [комментарий]` — выгрузить **весь воркспейс**: страница
+  проекта и все связанные заметки/идеи/подборки ложатся отдельными заметками в
+  `raw/notes/` группы (вложения — в `raw/assets/shared/`), каждая попадает в БД
+  для ingest, а анонс уходит в бот-топик группы или, с флагом `topic`, в отдельную
+  тему группы с тем же названием («вкладка в вкладку»).
+
+Пока агент работает, в личке виден черновик с прогрессом («🔎 ищу в wiki
+команды…», «✍️ пишу…») — через `sendMessageDraft`. Меню команд регистрируется
+отдельно для лички и групп (`setMyCommands` со скоупами).
+
+### Голос и картинки (MiniMax)
+
+- **Распознавание речи** — MiniMax ASR (`/v1/speech_to_text`, ~2–3 с на
+  голосовое, русский с `STT_LANGUAGE=ru`), fallback — локальный Whisper.
+- **Синтез речи** — `speech-2.8-hd`, русские голоса (`/voices`, по умолчанию
+  `Russian_ReliableMan`). `/say <текст>` озвучивает, `/voice on|off|auto` —
+  отвечать голосом (auto: голосом на голосовые). Файл перекодируется ffmpeg в
+  OGG/Opus и уходит как голосовое сообщение.
+- **Зрение** — фото и кадры видео описывает `MiniMax-M3` через
+  `/v1/chat/completions` с base64 `image_url`; используется и в групповом ingest
+  (`describe_media`) вместо Ollama moondream, если задан ключ.
+- **Картинки** — `image-01` (`/v1/image_generation`): `/imagine <описание> [16:9]`
+  или просьба агенту «нарисуй…» (tool `generate_image`); результат ложится в
+  `raw/assets/<date>/gen_*.jpg` личного vault.
 
 **Шаринг в групповой чат** (`/share`, кнопка «📤 в <chat>» под ответом или
 просьба агенту) делает три вещи: копирует артефакт в `vault/<chat>/raw/notes/`
@@ -142,7 +179,7 @@ DuckSidian/
 | provider | base_url по умолчанию | ключ |
 |---|---|---|
 | `deepseek` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
-| `minimax` | `https://api.minimax.io/v1` | `MINIMAX_API_KEY` |
+| `minimax` | `https://api.minimax.io/v1` (модель по умолчанию `MiniMax-M3`) | `MINIMAX_API_KEY` |
 | `qwen` | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
 | `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
 | `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |

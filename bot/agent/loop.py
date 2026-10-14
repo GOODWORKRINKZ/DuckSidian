@@ -102,6 +102,7 @@ async def run_agent(
     tools: list[dict] | None = None,
     history: list[dict[str, Any]] | None = None,
     force_finish_hint: str | None = None,
+    on_step: Any = None,
     tool_result_cap: int = 6_000,
     ctx_char_budget: int = 400_000,
     compress_ctx_threshold: int = 80_000,
@@ -197,7 +198,7 @@ async def run_agent(
 
         if not tool_calls:
             # Модель решила ответить без tool-call → считаем что закончила.
-            run.summary = raw_content
+            run.summary = _strip_think(raw_content)
             run.finished = True
             break
 
@@ -229,6 +230,11 @@ async def run_agent(
                 continue
 
             log.info("agent step %d: tool=%s args=%s", step, name, str(args)[:200])
+            if on_step is not None:
+                try:
+                    await on_step(name, args)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("on_step failed: %s", exc)
             result = await executor.call(name, args)
             log.info("agent step %d: tool=%s result_len=%d head=%r",
                      step, name, len(result), result[:120])
@@ -299,8 +305,27 @@ async def run_agent(
 import re as _re
 
 
+_THINK_RE = _re.compile(r"<think>.*?</think>", _re.DOTALL | _re.IGNORECASE)
+
+
+def _strip_think(s: str) -> str:
+    """Убрать блоки рассуждений `<think>…</think>` (MiniMax M2, Qwen3 и др.
+    отдают их прямо в content). Незакрытый <think> — отрезаем до конца."""
+    if not s or "<think" not in s.lower():
+        return s
+    s = _THINK_RE.sub("", s)
+    low = s.lower()
+    idx = low.find("<think>")
+    if idx != -1:
+        s = s[:idx]
+    return s.strip()
+
+
 def _sanitize_summary(s: str) -> str:
-    if not s or "DSML" not in s:
+    if not s:
+        return ""
+    s = _strip_think(s)
+    if "DSML" not in s:
         return s.strip()
     idx = s.find("DSML")
     lt = s.rfind("<", 0, idx)

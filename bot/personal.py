@@ -67,6 +67,13 @@ def slugify(text: str, max_len: int = 40) -> str:
     return s
 
 
+def project_slug(name: str, max_len: int = 48) -> str:
+    """Slug страницы проекта: кириллица/латиница сохраняются, пробелы → дефис."""
+    s = re.sub(r"[^\w\s-]", "", (name or "").strip(), flags=re.UNICODE)
+    s = re.sub(r"[\s_]+", "-", s).strip("-")
+    return (s[:max_len].rstrip("-")) or "Project"
+
+
 def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
     """Грубый YAML-frontmatter парсер: {key: value} + тело."""
     fm: dict[str, str] = {}
@@ -271,6 +278,26 @@ class PersonalSpace:
         self.log(f"delete | {rel_norm}")
         return rel_norm
 
+    def ensure_project(self, name: str) -> str:
+        """Создать страницу проекта из шаблона (если нет). Возвращает slug."""
+        slug = project_slug(name)
+        rel = f"wiki/projects/{slug}.md"
+        if (self.root / rel).exists():
+            return slug
+        tmpl = self.root / "wiki" / "projects" / "_template.md"
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if tmpl.exists():
+            body = tmpl.read_text(encoding="utf-8").replace("{{name}}", name).replace("{{date}}", today)
+        else:
+            body = f"---\ntype: project\ntitle: \"{name}\"\nstatus: active\ncreated: {today}\nupdated: {today}\n---\n\n# {name}\n"
+        self.wiki.write_file(rel, body)
+        try:
+            self.wiki.append_file("index.md", f"- [[{slug}]] — active; воркспейс создан {today}")
+        except Exception:  # noqa: BLE001
+            pass
+        self.log(f"project | {rel} | created from workspace")
+        return slug
+
     def save_research(self, title: str, body_md: str, query: str = "") -> str:
         """Сохранить подборку агента в wiki/research/<date>-<slug>.md."""
         now = datetime.now(timezone.utc)
@@ -387,6 +414,75 @@ def share_artifact(
     twiki.write_file(dst_note, note)
     space.log(f"share | {rel} → {target.name}:{dst_note}")
     return ShareResult(dst_note, copied, title, body.strip(), is_binary)
+
+
+@dataclass
+class WorkspaceShareResult:
+    title: str
+    slug: str
+    pages: list[ShareResult]
+    copied_assets: list[str]
+    summary_md: str
+
+
+_PROJECT_FM_RE = re.compile(r'^project:\s*"?\[\[([^\]|]+)(?:\|[^\]]*)?\]\]"?', re.MULTILINE)
+
+
+def collect_workspace_pages(space: PersonalSpace, slug: str) -> list[str]:
+    """Страница проекта + все wiki-страницы, привязанные к ней
+    (frontmatter `project: "[[Slug]]"` или wikilink [[Slug]] в теле)."""
+    project_rel = f"wiki/projects/{slug}.md"
+    out: list[str] = []
+    if (space.root / project_rel).is_file():
+        out.append(project_rel)
+    needle = f"[[{slug}]]".lower()
+    needle_alias = f"[[{slug}|".lower()
+    for a in space.list_artifacts(limit=10_000):
+        if a.kind == "files" or a.path == project_rel or not a.path.endswith(".md"):
+            continue
+        try:
+            text = (space.root / a.path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        low = text.lower()
+        m = _PROJECT_FM_RE.search(text)
+        if (m and m.group(1).strip().lower() == slug.lower()) or needle in low or needle_alias in low:
+            out.append(a.path)
+    return out
+
+
+def share_workspace(
+    space: PersonalSpace,
+    slug: str,
+    target: ChatConfig,
+    *,
+    author: str,
+    comment: str = "",
+) -> WorkspaceShareResult:
+    """Поделиться воркспейсом целиком: каждая страница → отдельная shared-заметка
+    в vault группы, вложения копируются. Возвращает сводку для анонса."""
+    pages_rel = collect_workspace_pages(space, slug)
+    if not pages_rel:
+        raise WikiPathError(f"у воркспейса {slug} нет страниц (нет wiki/projects/{slug}.md)")
+    results: list[ShareResult] = []
+    assets: list[str] = []
+    for i, rel in enumerate(pages_rel):
+        res = share_artifact(space, rel, target, author=author, comment=comment if i == 0 else "")
+        results.append(res)
+        assets.extend(res.copied_assets)
+    title = results[0].title or slug
+    lines = [f"📦 **{author}** поделился воркспейсом **{title}**", ""]
+    if comment.strip():
+        lines += [f"> 💬 {comment.strip()}", ""]
+    lines.append(f"Страниц: {len(results)}, файлов: {len(assets)}. В vault чата:")
+    for r in results:
+        lines.append(f"- {r.title} — `{r.dst_note}`")
+    # Краткое содержание проекта (первые ~1200 символов).
+    body = results[0].body_md.strip()
+    if body:
+        lines += ["", "---", body[:1200] + ("…" if len(body) > 1200 else "")]
+    space.log(f"share-workspace | {slug} → {target.name} | {len(results)} pages")
+    return WorkspaceShareResult(title, slug, results, assets, "\n".join(lines))
 
 
 def artifact_markdown_table(arts: list[Artifact]) -> str:

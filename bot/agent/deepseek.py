@@ -163,6 +163,24 @@ class LLMClient:
             return {"error": str(exc)}
 
     async def describe_image(self, base64_data: str, mime: str = "image/jpeg") -> str:
+        """Описание изображения: MiniMax vision (MiniMax-M3), если включён;
+        иначе локальная Ollama moondream."""
+        mode = (settings.vision_provider or "auto").lower()
+        if mode == "off":
+            return "(vision выключен: VISION_PROVIDER=off)"
+        if mode != "ollama":
+            try:
+                from ..media_ai import get_media_ai  # noqa: PLC0415
+                ai = get_media_ai()
+                if ai.vision_enabled:
+                    return await ai.describe_image_b64(base64_data, mime)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("minimax vision failed: %s", exc)
+                if mode == "minimax":
+                    return f"(vision error: {exc})"
+        return await self._describe_image_ollama(base64_data, mime)
+
+    async def _describe_image_ollama(self, base64_data: str, mime: str = "image/jpeg") -> str:
         """Описание изображения через локальную Ollama moondream (нативный API)."""
         payload: dict[str, Any] = {
             "model": "moondream",

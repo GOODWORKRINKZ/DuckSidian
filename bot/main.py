@@ -8,7 +8,12 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import Update
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    Update,
+)
 from aiohttp import web
 
 from .config import settings
@@ -58,6 +63,63 @@ async def _run_health_server() -> None:
     log.info("healthz listening on :8080")
 
 
+PRIVATE_COMMANDS = [
+    ("help", "что я умею в личке"),
+    ("ws", "воркспейс (тема): /ws, /ws new <имя>, /ws list, /ws share <чат>"),
+    ("ask", "вопрос к моему личному vault"),
+    ("note", "быстрая заметка без агента"),
+    ("list", "мои артефакты"),
+    ("show", "показать артефакт (№ / имя / путь)"),
+    ("share", "поделиться артефактом с чатом"),
+    ("projects", "мои проекты"),
+    ("search", "поиск по личному vault"),
+    ("say", "озвучить текст голосом"),
+    ("voice", "голосовые ответы: on / off / auto"),
+    ("imagine", "сгенерировать картинку"),
+    ("space", "состояние пространства и медиа-ИИ"),
+    ("del", "удалить артефакт"),
+    ("model", "LLM-модель (admin)"),
+]
+GROUP_COMMANDS = [
+    ("ask", "спросить wiki команды"),
+    ("triz", "ТРИЗ-разбор проблемы"),
+    ("projects", "проекты в вики"),
+    ("search", "поиск по vault"),
+    ("summary", "сводка day|week"),
+    ("note", "заметка в raw/notes"),
+    ("help", "все команды"),
+    ("ingest", "внеплановый ingest (admin)"),
+    ("model", "LLM-модель (admin)"),
+    ("allow", "доступ к личному режиму (admin)"),
+]
+
+
+async def _setup_bot_menu(bot: Bot) -> None:
+    """Меню команд по скоупам (личка / группы) + проверка режима тем в личке."""
+    try:
+        await bot.set_my_commands(
+            [BotCommand(command=c, description=d[:256]) for c, d in PRIVATE_COMMANDS],
+            scope=BotCommandScopeAllPrivateChats(),
+        )
+        await bot.set_my_commands(
+            [BotCommand(command=c, description=d[:256]) for c, d in GROUP_COMMANDS],
+            scope=BotCommandScopeAllGroupChats(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("set_my_commands failed: %s", exc)
+    try:
+        me = await bot.get_me()
+        topics = getattr(me, "has_topics_enabled", None)
+        log.info("bot @%s: topics in private chats = %s", me.username, topics)
+        if topics is False:
+            log.warning(
+                "Темы в личке выключены: включи в @BotFather → Bot Settings → "
+                "Threaded mode (Topics), иначе воркспейсы (/ws new) не заработают."
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("get_me failed: %s", exc)
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -91,6 +153,7 @@ async def main() -> None:
     )
     orch = Orchestrator(bot, db, wiki)
     await orch.restore_model()
+    await _setup_bot_menu(bot)
 
     # Инициализировать форум-топик бота для каждого чата
     for chat_cfg in settings.get_chats():

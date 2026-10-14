@@ -463,6 +463,30 @@ PERSONAL_EXTRA_TOOLS: list[dict] = [
     },
 ]
 
+PERSONAL_EXTRA_TOOLS.append({
+    "type": "function",
+    "function": {
+        "name": "generate_image",
+        "description": (
+            "Сгенерировать картинку по текстовому описанию (MiniMax image-01). "
+            "Используй ТОЛЬКО когда пользователь явно просит нарисовать/сгенерировать/"
+            "визуализировать. prompt — подробное описание на английском или русском "
+            "(до 1500 символов), aspect_ratio — 1:1 | 16:9 | 4:3 | 3:2 | 2:3 | 3:4 | 9:16 | 21:9. "
+            "Возвращает rel-пути сохранённых файлов (raw/assets/<date>/gen_*.jpg) — "
+            "перечисли их в блоке IMAGES в finish(), чтобы отправить пользователю."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "aspect_ratio": {"type": "string", "default": "1:1"},
+                "n": {"type": "integer", "default": 1, "description": "1–4"},
+            },
+            "required": ["prompt"],
+        },
+    },
+})
+
 _PERSONAL_EXCLUDE = {"ask_user", "defer_question", "tag_media"}
 
 
@@ -799,6 +823,32 @@ class ToolExecutor:
                     text = "\n".join(f"{i:>5}: {ln}" for i, ln in enumerate(slc, start))
                     return f"[{chat}:{path} строки {start}–{end} из {len(lines)}]\n{text}"
                 return f"[{chat}:{path}]\n{text}"
+            if name == "generate_image":
+                from ..media_ai import MediaAIError, get_media_ai  # noqa: PLC0415
+                from datetime import datetime as _dt, timezone as _tz  # noqa: PLC0415
+                ai = get_media_ai()
+                if not ai.image_enabled:
+                    return "ERROR: генерация картинок недоступна (нужен MINIMAX_API_KEY / IMAGE_PROVIDER)"
+                prompt = str(arguments.get("prompt", "")).strip()
+                if not prompt:
+                    return "ERROR: пустой prompt"
+                try:
+                    images = await ai.generate_images(
+                        prompt,
+                        aspect_ratio=str(arguments.get("aspect_ratio") or "1:1"),
+                        n=int(arguments.get("n") or 1),
+                    )
+                except MediaAIError as exc:
+                    return f"ERROR: {exc}"
+                now = _dt.now(_tz.utc)
+                date_iso = now.strftime("%Y-%m-%d")
+                stamp = now.strftime("%H%M%S")
+                paths: list[str] = []
+                for i, data in enumerate(images, 1):
+                    rel = self.wiki.save_asset(data, f"gen_{stamp}_{i}.jpg", date_iso)
+                    paths.append(rel.replace("\\", "/"))
+                return "OK: сгенерировано " + str(len(paths)) + " файл(ов):\n" + "\n".join(paths) + \
+                    "\nДобавь нужные в блок IMAGES: в finish()."
             if name == "share_to_chat":
                 if self._share_fn is None:
                     return "ERROR: шаринг недоступен в этом режиме"

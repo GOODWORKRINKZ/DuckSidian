@@ -293,3 +293,79 @@ def test_private_users_parse(monkeypatch: pytest.MonkeyPatch) -> None:
     assert Settings._parse_id_list("1, 2;3") == [1, 2, 3]
     assert Settings._parse_id_list("") == []
     assert Settings._parse_id_list(7) == [7]
+
+
+# ---------------------------------------------------------------- media_ai helpers / workspaces
+
+def test_md_for_tts_and_strip_think() -> None:
+    from bot.media_ai import _md_for_tts, _strip_think
+    src = ("**Жирный** и `код`, ссылка [тут](https://x.y/z) и [[Slug|алиас]] ![[raw/assets/a.jpg]]\n\n"
+           "```py\nprint(1)\n```\nhttps://example.com\n\nIMAGES:\nraw/assets/x.jpg")
+    out = _md_for_tts(src)
+    assert "Жирный" in out and "код" in out and "тут" in out and "алиас" in out
+    assert "https://" not in out and "print" not in out and "IMAGES" not in out and "[[" not in out
+    assert _strip_think("<think>a</think>Ответ") == "Ответ"
+
+
+def test_project_slug_and_ensure_project(space: PersonalSpace) -> None:
+    from bot.personal import project_slug
+    assert project_slug("Роббокс v2 / тесты!") == "Роббокс-v2-тесты"
+    assert project_slug("") == "Project"
+    slug = space.ensure_project("Доставочный робот")
+    assert slug == "Доставочный-робот"
+    text = (space.root / f"wiki/projects/{slug}.md").read_text(encoding="utf-8")
+    assert "# Доставочный робот" in text and "type: project" in text and "{{" not in text
+    assert f"[[{slug}]]" in (space.root / "index.md").read_text(encoding="utf-8")
+    assert space.ensure_project("Доставочный робот") == slug  # идемпотентно
+
+
+@pytest.mark.asyncio
+async def test_db_workspaces_and_topic_history(tmp_path: Path) -> None:
+    from datetime import datetime, timezone
+    from bot.db import DB
+    db = DB(tmp_path / "t.sqlite3")
+    await db.init()
+    await db.upsert_workspace(42, 7, "Роббокс", "Роббокс")
+    await db.upsert_workspace(42, 7, "Роббокс 2", None)       # rename, slug сохраняется
+    ws = await db.get_workspace(42, 7)
+    assert ws["name"] == "Роббокс 2" and ws["project_slug"] == "Роббокс"
+    assert len(await db.list_workspaces(42)) == 1
+    now = datetime.now(timezone.utc)
+    for mid, topic, text in ((1, 7, "в теме"), (2, None, "общее"), (3, 7, "ещё в теме")):
+        await db.save_message(chat_id=42, message_id=mid, topic_id=topic, user_id=1, username=None,
+                              full_name="x", text=text, reply_to_message_id=None, ts=now)
+    assert [r["text"] for r in await db.fetch_last_messages_in_topic(42, 7, 10)] == ["в теме", "ещё в теме"]
+    assert [r["text"] for r in await db.fetch_last_messages_in_topic(42, None, 10)] == ["общее"]
+    await db.delete_workspace(42, 7)
+    assert await db.get_workspace(42, 7) is None
+    assert await db.add_private_user(5) and not await db.add_private_user(5)
+    assert await db.get_private_users() == [5]
+    assert await db.remove_private_user(5)
+
+
+def test_share_workspace_bundle(space: PersonalSpace, vault: Path) -> None:
+    from bot.personal import collect_workspace_pages, share_workspace
+    target = ChatConfig(chat_id=-100500, name="main")
+    slug = space.ensure_project("Роббокс")
+    (space.root / "raw/assets/2026-01-01").mkdir(parents=True)
+    (space.root / "raw/assets/2026-01-01/d.png").write_bytes(b"PNG")
+    space.wiki.write_file("wiki/notes/2026-01-02-n.md",
+                          "---\ntype: note\ntitle: \"Н\"\nproject: \"[[Роббокс]]\"\n---\n# Н\n![[raw/assets/2026-01-01/d.png]]\n")
+    space.wiki.write_file("wiki/ideas/2026-01-03-i.md", "# Идея\nсм. [[Роббокс|проект]]\n")
+    space.wiki.write_file("wiki/notes/2026-01-04-other.md", "# Другое\nне связано\n")
+    pages = collect_workspace_pages(space, slug)
+    assert pages[0] == f"wiki/projects/{slug}.md"
+    assert set(pages) == {f"wiki/projects/{slug}.md", "wiki/notes/2026-01-02-n.md", "wiki/ideas/2026-01-03-i.md"}
+    res = share_workspace(space, slug, target, author="Иван", comment="всё по роббоксу")
+    assert res.title == "Роббокс" and len(res.pages) == 3 and len(res.copied_assets) == 1
+    assert all((vault / "main" / p.dst_note).exists() for p in res.pages)
+    assert "всё по роббоксу" in res.summary_md and "Страниц: 3" in res.summary_md
+    with pytest.raises(WikiPathError):
+        share_workspace(space, "Нет-такого", target, author="x")
+
+
+def test_step_line() -> None:
+    from bot.handlers.private import _step_line
+    assert _step_line("search_team_wiki", {"chat": "main", "query": "biba"}) == "🔎 ищу в wiki команды: main: biba"
+    assert _step_line("web_search", {"query": "x" * 100}).endswith("x" * 60)
+    assert _step_line("unknown_tool", {}) == "⚙️ unknown_tool"

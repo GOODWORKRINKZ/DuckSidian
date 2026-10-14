@@ -73,6 +73,16 @@ CREATE TABLE IF NOT EXISTS topics (
     PRIMARY KEY (chat_id, topic_id)
 );
 
+CREATE TABLE IF NOT EXISTS workspaces (
+    chat_id INTEGER NOT NULL,
+    topic_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    project_slug TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, topic_id)
+);
+
 CREATE TABLE IF NOT EXISTS shares (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -120,6 +130,17 @@ class DB:
                     chat_id INTEGER NOT NULL,
                     topic_id INTEGER NOT NULL,
                     name TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, topic_id)
+                )"""
+            )
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS workspaces (
+                    chat_id INTEGER NOT NULL,
+                    topic_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    project_slug TEXT,
+                    created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (chat_id, topic_id)
                 )"""
@@ -441,5 +462,60 @@ class DB:
                 """SELECT * FROM shares WHERE user_id=?
                    ORDER BY created_at DESC LIMIT ?""",
                 (user_id, limit),
+            ) as cur:
+                return list(await cur.fetchall())
+
+    # --- workspaces: topic в личке с ботом = воркспейс/проект ---
+
+    async def upsert_workspace(
+        self, chat_id: int, topic_id: int, name: str, project_slug: str | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        async with self.conn() as db:
+            await db.execute(
+                """INSERT INTO workspaces (chat_id, topic_id, name, project_slug, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(chat_id, topic_id) DO UPDATE SET
+                     name=excluded.name,
+                     project_slug=COALESCE(excluded.project_slug, workspaces.project_slug),
+                     updated_at=excluded.updated_at""",
+                (chat_id, topic_id, name, project_slug, now, now),
+            )
+            await db.commit()
+
+    async def get_workspace(self, chat_id: int, topic_id: int) -> aiosqlite.Row | None:
+        async with self.conn() as db:
+            async with db.execute(
+                "SELECT * FROM workspaces WHERE chat_id=? AND topic_id=?", (chat_id, topic_id)
+            ) as cur:
+                return await cur.fetchone()
+
+    async def list_workspaces(self, chat_id: int) -> list[aiosqlite.Row]:
+        async with self.conn() as db:
+            async with db.execute(
+                "SELECT * FROM workspaces WHERE chat_id=? ORDER BY updated_at DESC", (chat_id,)
+            ) as cur:
+                return list(await cur.fetchall())
+
+    async def delete_workspace(self, chat_id: int, topic_id: int) -> None:
+        async with self.conn() as db:
+            await db.execute(
+                "DELETE FROM workspaces WHERE chat_id=? AND topic_id=?", (chat_id, topic_id)
+            )
+            await db.commit()
+
+    async def fetch_last_messages_in_topic(
+        self, chat_id: int, topic_id: int | None, n: int
+    ) -> list[aiosqlite.Row]:
+        """Последние n сообщений чата в конкретном топике (None = вне топиков)."""
+        cond = "topic_id IS NULL" if topic_id is None else "topic_id=?"
+        params: tuple = (chat_id, n) if topic_id is None else (chat_id, topic_id, n)
+        async with self.conn() as db:
+            async with db.execute(
+                f"""SELECT * FROM (
+                       SELECT * FROM messages WHERE chat_id=? AND {cond}
+                       ORDER BY ts DESC LIMIT ?
+                   ) ORDER BY ts ASC""",
+                params,
             ) as cur:
                 return list(await cur.fetchall())

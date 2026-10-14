@@ -100,3 +100,23 @@ async def test_agent_cannot_write_raw(wiki: Wiki) -> None:
     )
     assert run.finished
     assert not (wiki.root / "raw/daily/x.md").exists()
+
+
+def test_sanitize_strips_think_blocks() -> None:
+    from bot.agent.loop import _sanitize_summary
+    assert _sanitize_summary("<think>думаю\nдолго</think>\n\nОтвет готов.") == "Ответ готов."
+    assert _sanitize_summary("Текст <THINK>x</THINK> хвост") == "Текст  хвост"
+    assert _sanitize_summary("Ответ.\n<think>обрыв без закрытия") == "Ответ."
+    assert _sanitize_summary("без размышлений") == "без размышлений"
+
+
+@pytest.mark.asyncio
+async def test_agent_plain_answer_strips_think(wiki: Wiki) -> None:
+    async def ask_user(_q, _opts):
+        return ""
+    executor = ToolExecutor(wiki, ask_user)
+    client = FakeClient([{"choices": [{"message": {
+        "content": "<think>рассуждаю</think>Готовый ответ"}}]}])
+    run = await run_agent(client=client, executor=executor,  # type: ignore[arg-type]
+                          system_prompt="s", user_prompt="u", max_steps=3)
+    assert run.finished and run.summary == "Готовый ответ"
