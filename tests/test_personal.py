@@ -499,3 +499,35 @@ async def test_intake_document_and_archive(space: PersonalSpace, monkeypatch: py
     (assets / "pic.png").write_bytes(b"PNG")
     res3 = await process_attachment(space.wiki, "raw/assets/2026-10-14/pic.png", "photo")
     assert res3.kind == "image" and res3.sidecar is None and res3.notes
+
+
+def test_search_or_terms_prefix_and_grep_dir(space: PersonalSpace) -> None:
+    space.wiki.write_file("raw/daily/2025-10-09.md", "# d\n> винты M3*12 500шт\n^msg-1\n> ответ: 0.04 юаней\n")
+    space.wiki.write_file("raw/daily/2025-10-10.md", "# d\n> колесо 4.10/3.50-4 建大\n")
+    space.wiki.write_file("wiki/notes/x.md", "# x\nвинты в заметке\n")
+    hits = space.wiki.search("建大|M3*12")
+    assert {h["path"] for h in hits} == {"raw/daily/2025-10-09.md", "raw/daily/2025-10-10.md"}
+    assert {h["path"] for h in space.wiki.search("винты", path_prefix="raw/daily")} == {"raw/daily/2025-10-09.md"}
+    assert space.wiki.search("нет такого") == []
+    res = space.wiki.grep_dir("raw/daily", r"4\.10|M3\*12", context=1)
+    assert res["files_scanned"] == 2 and len(res["matches"]) == 2 and not res["truncated"]
+    assert res["matches"][0]["path"] == "raw/daily/2025-10-09.md" and res["matches"][0]["after"] == ["^msg-1"]
+    assert space.wiki.grep_dir("raw/daily", "zzz")["matches"] == []
+    res2 = space.wiki.grep_dir("raw/daily", ".", max_matches=1)
+    assert res2["truncated"] and len(res2["matches"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_executor_grep_dir_and_search_hint(space: PersonalSpace) -> None:
+    async def ask(_q, _o):
+        return ""
+    space.wiki.write_file("raw/daily/2025-10-09.md", "# d\n> винты M3*12\n")
+    ex = ToolExecutor(space.wiki, ask)
+    out = await ex.call("grep_dir", {"path": "raw/daily", "pattern": r"M3\*12"})
+    assert "2025-10-09.md" in out and "files_scanned" in out
+    assert "ERROR: неверный regex" in await ex.call("grep_dir", {"path": "raw/daily", "pattern": "("})
+    out = await ex.call("search_wiki", {"query": "zzqq|yyxx"})
+    assert "ничего не найдено" in out and "grep_dir" in out
+    out = await ex.call("search_wiki", {"query": "винты", "path_prefix": "raw/daily"})
+    assert "2025-10-09.md" in out
+    assert any(t["function"]["name"] == "grep_dir" for t in personal_tool_schemas())

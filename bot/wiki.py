@@ -125,22 +125,32 @@ class Wiki:
         query: str,
         max_hits: int = 20,
         context: int = 2,
+        path_prefix: str = "",
     ) -> list[dict]:
         """Подстрочный поиск с N строк контекста до/после.
 
+        Несколько вариантов через `|` — ИЛИ (любая из подстрок), регистр не важен.
+        path_prefix ограничивает область (например 'raw/daily' или 'wiki/projects').
         Каждый hit: {path, line, text, before: [...], after: [...]}.
         Контекст помогает LLM-агенту самому отсеять false-positive
         (например, query='СОРИК' и матч на 'Сенсорика' внутри слова).
         """
-        if not query.strip():
+        terms = [t.strip().lower() for t in (query or "").split("|") if t.strip()]
+        if not terms:
             return []
-        q = query.lower()
+        prefix = (path_prefix or "").strip().strip("/")
         hits: list[dict] = []
         ctx = max(0, int(context))
-        for md in self.root.rglob("*.md"):
+        base = self.root / prefix if prefix else self.root
+        if not base.exists():
+            return []
+        files = [base] if base.is_file() else base.rglob("*.md")
+        for md in files:
             try:
                 rel = str(md.relative_to(self.root)).replace("\\", "/")
             except ValueError:
+                continue
+            if "/.cache/" in f"/{rel}":
                 continue
             try:
                 text = md.read_text(encoding="utf-8", errors="replace")
@@ -148,7 +158,8 @@ class Wiki:
                 continue
             lines = text.splitlines()
             for i, line in enumerate(lines, start=1):
-                if q in line.lower():
+                low = line.lower()
+                if any(t in low for t in terms):
                     before = [
                         lines[j].strip()
                         for j in range(max(0, i - 1 - ctx), i - 1)
@@ -169,6 +180,48 @@ class Wiki:
                     if len(hits) >= max_hits:
                         return hits
         return hits
+
+    def grep_dir(
+        self,
+        rel_dir: str,
+        pattern: str,
+        *,
+        context: int = 1,
+        max_matches: int = 40,
+        exts: tuple[str, ...] = (".md", ".txt"),
+    ) -> dict:
+        """Regex-поиск по всем файлам директории (рекурсивно). Возвращает
+        {files_scanned, matches: [{path, line, text, before, after}], truncated}."""
+        import re
+        rx = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+        base = self.resolve(rel_dir) if rel_dir.strip() else self.root
+        out: dict = {"files_scanned": 0, "matches": [], "truncated": False}
+        if not base.exists():
+            return out
+        ctx = max(0, int(context))
+        files = [base] if base.is_file() else sorted(
+            p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in exts
+        )
+        for f in files:
+            rel = str(f.relative_to(self.root)).replace("\\", "/")
+            if "/.cache/" in f"/{rel}":
+                continue
+            try:
+                lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            out["files_scanned"] += 1
+            for i, line in enumerate(lines, start=1):
+                if rx.search(line):
+                    out["matches"].append({
+                        "path": rel, "line": i, "text": line.strip(),
+                        "before": [lines[j].strip() for j in range(max(0, i - 1 - ctx), i - 1)],
+                        "after": [lines[j].strip() for j in range(i, min(len(lines), i + ctx))],
+                    })
+                    if len(out["matches"]) >= max_matches:
+                        out["truncated"] = True
+                        return out
+        return out
 
     # ----- asset saver (вызывается ботом, не агентом) -----
 

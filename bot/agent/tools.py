@@ -84,20 +84,45 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "search_wiki",
             "description": (
-                "Подстроковый поиск по всем .md в vault. Возвращает JSON-массив "
-                "hit'ов c полями path, line, text + before/after — по 'context' "
-                "строк контекста до и после. Используй контекст, чтобы самому "
-                "отсеять false-positive: например, query='СОРИК' может "
-                "совпасть со словом 'сенСОРИКа' — тогда смотри before/after и "
-                "игнорируй. Регистронезависимо, без regex."
+                "Подстроковый поиск по всем .md в vault (raw/ и wiki/, включая raw/daily и "
+                "raw/imports). НЕ regex: несколько вариантов задавай через '|' — это ИЛИ "
+                "(query='винты|M3*12|1688'). Регистронезависимо. path_prefix ограничивает "
+                "область: 'raw/daily', 'raw/imports', 'wiki/projects'. Возвращает JSON-массив "
+                "hit'ов c полями path, line, text + before/after ('context' строк вокруг). "
+                "По контексту сам отсеивай false-positive (СОРИК ⊂ сенСОРИКа)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
                     "context": {"type": "integer", "default": 2},
+                    "path_prefix": {"type": "string", "default": ""},
+                    "max_hits": {"type": "integer", "default": 30},
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep_dir",
+            "description": (
+                "Regex-поиск (как grep -r) по ВСЕМ файлам директории vault'а рекурсивно: "
+                "например grep_dir('raw/daily', 'винт|M3\\*12|1688') или "
+                "grep_dir('raw/imports', 'колес|轮') — ищет сразу во всех днях/файлах, не нужно "
+                "перебирать файлы по одному. Возвращает JSON {files_scanned, matches:[{path, line, "
+                "text, before, after}], truncated}. Регистронезависимо."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Директория, например raw/daily"},
+                    "pattern": {"type": "string", "description": "Python-regex"},
+                    "context": {"type": "integer", "default": 1},
+                    "max_matches": {"type": "integer", "default": 40},
+                },
+                "required": ["path", "pattern"],
             },
         },
     },
@@ -682,8 +707,26 @@ class ToolExecutor:
                 hits = self.wiki.search(
                     arguments["query"],
                     context=int(arguments.get("context", 2)),
+                    path_prefix=str(arguments.get("path_prefix") or ""),
+                    max_hits=max(1, min(int(arguments.get("max_hits") or 30), 100)),
                 )
+                if not hits:
+                    return ("[] — ничего не найдено. Подсказка: search_wiki ищет подстроку "
+                            "(не regex); варианты — через '|'. Для regex используй grep_dir.")
                 return json.dumps(hits, ensure_ascii=False, indent=2)
+            if name == "grep_dir":
+                import re as _re
+                try:
+                    res = self.wiki.grep_dir(
+                        str(arguments.get("path") or ""), arguments["pattern"],
+                        context=int(arguments.get("context", 1)),
+                        max_matches=max(1, min(int(arguments.get("max_matches") or 40), 200)),
+                    )
+                except _re.error as exc:
+                    return f"ERROR: неверный regex: {exc}"
+                if not res["matches"]:
+                    return f"[нет совпадений для /{arguments['pattern']}/ в {arguments.get('path')}: просмотрено файлов {res['files_scanned']}]"
+                return json.dumps(res, ensure_ascii=False, indent=1)
             if name == "write_file":
                 path = arguments.get("path") or arguments.get("filename") or arguments.get("file_path") or arguments.get("filepath")
                 if not path:
