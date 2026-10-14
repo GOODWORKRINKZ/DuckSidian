@@ -586,3 +586,34 @@ def test_icon_by_rules_and_auto_names() -> None:
     assert _icon_by_rules("Закупки 1688") == "🛒"
     assert _icon_by_rules("Что-то непонятное") is None
     assert _looks_auto_topic("New Chat", "") and _looks_auto_topic("Новый чат", "")
+
+
+def test_stage_accept_workspace_for_user(vault: Path) -> None:
+    from bot.personal import PersonalSpace, accept_staged_workspace, discard_staged_workspace, stage_workspace_for_user
+    src = PersonalSpace(1, "Иван")
+    dst = PersonalSpace(2, "Петя")
+    slug = src.ensure_project("Бизнес-кейсы")
+    (src.root / "raw/assets/2026-01-01").mkdir(parents=True)
+    (src.root / "raw/assets/2026-01-01/s.png").write_bytes(b"PNG")
+    src.wiki.write_file("wiki/sources/2026-01-02-video.md",
+                        "---\ntype: source\ntitle: \"Видео\"\nproject: \"[[Бизнес-кейсы]]\"\n---\n# Видео\n![[raw/assets/2026-01-01/s.png]]\n")
+    man = stage_workspace_for_user(src, slug, dst, "tok1", author="Иван", comment="глянь")
+    assert man["title"] == "Бизнес-кейсы" and len(man["pages"]) == 2 and len(man["assets"]) == 1
+    staged_src = (dst.root / man["pages"][1]["staged"]).read_text(encoding="utf-8")
+    assert "shared_from: Иван" in staged_src and "raw/assets/shared/" in staged_src
+    assert (dst.root / man["assets"][0]).read_bytes() == b"PNG"
+    man["token"] = "tok1"
+    # у получателя уже есть свой проект с таким именем → коллизия решается суффиксом
+    dst.ensure_project("Бизнес-кейсы")
+    new_slug, placed = accept_staged_workspace(dst, man)
+    assert new_slug != "Бизнес-кейсы" and new_slug.startswith("Бизнес-кейсы-от-")
+    assert any(p.startswith("wiki/sources/") for p in placed) and f"wiki/projects/{new_slug}.md" in placed
+    src_page = next(p for p in placed if p.startswith("wiki/sources/"))
+    assert f"[[{new_slug}]]" in (dst.root / src_page).read_text(encoding="utf-8")
+    assert not (dst.root / "raw/incoming/tok1").exists()
+    assert f"[[{new_slug}]]" in (dst.root / "index.md").read_text(encoding="utf-8")
+    # discard
+    stage_workspace_for_user(src, slug, dst, "tok2", author="Иван")
+    assert (dst.root / "raw/incoming/tok2").exists()
+    discard_staged_workspace(dst, "tok2")
+    assert not (dst.root / "raw/incoming/tok2").exists()

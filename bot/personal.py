@@ -503,3 +503,138 @@ def describe_space(space: PersonalSpace) -> dict[str, Any]:
         if a.kind in counts:
             counts[a.kind] += 1
     return {"root": str(space.root), "counts": counts}
+
+
+# ----- sharing: user → user (снимок воркспейса) -----
+
+_TYPE_DIRS = {
+    "project": "wiki/projects", "note": "wiki/notes", "idea": "wiki/ideas",
+    "research": "wiki/research", "source": "wiki/sources", "query": "wiki/queries",
+}
+
+
+def _unique_rel(root: Path, rel: str, suffix: str) -> str:
+    """Если файл существует — добавить суффикс к имени."""
+    if not (root / rel).exists():
+        return rel
+    p = Path(rel)
+    cand = f"{p.parent.as_posix()}/{p.stem}-{suffix}{p.suffix}"
+    i = 2
+    while (root / cand).exists():
+        cand = f"{p.parent.as_posix()}/{p.stem}-{suffix}-{i}{p.suffix}"
+        i += 1
+    return cand
+
+
+def stage_workspace_for_user(
+    src: PersonalSpace, slug: str, dst: PersonalSpace, token: str, *, author: str, comment: str = "",
+) -> dict[str, Any]:
+    """Положить снимок воркспейса в raw/incoming/<token>/ получателя (ожидает принятия).
+
+    Вложения сразу копируются в raw/assets/shared/<date>/ получателя, ссылки переписаны.
+    Возвращает манифест {title, slug, from, pages:[{src, staged, type}], assets:[...]}.
+    """
+    pages_rel = collect_workspace_pages(src, slug)
+    if not pages_rel:
+        raise WikiPathError(f"у воркспейса {slug} нет страниц (нет wiki/projects/{slug}.md)")
+    date_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    stage_dir = f"raw/incoming/{token}"
+    (dst.root / stage_dir).mkdir(parents=True, exist_ok=True)
+    assets_dir_rel = f"raw/assets/shared/{date_iso}"
+    (dst.root / assets_dir_rel).mkdir(parents=True, exist_ok=True)
+    copied_assets: list[str] = []
+
+    def _copy_asset(asset_rel: str) -> str | None:
+        try:
+            a_abs = src.wiki.resolve(asset_rel)
+        except WikiPathError:
+            return None
+        if not a_abs.is_file():
+            return None
+        safe = "".join(c for c in a_abs.name if c.isalnum() or c in "._-") or "file.bin"
+        new_rel = f"{assets_dir_rel}/u{src.user_id}_{safe}"
+        if not (dst.root / new_rel).exists():
+            shutil.copy2(a_abs, dst.root / new_rel)
+        copied_assets.append(new_rel)
+        return new_rel
+
+    pages: list[dict[str, str]] = []
+    title = slug
+    for i, rel in enumerate(pages_rel):
+        text = (src.root / rel).read_text(encoding="utf-8", errors="replace")
+        fm, body = parse_frontmatter(text)
+        ptype = fm.get("type") or ("project" if rel.startswith("wiki/projects/") else "note")
+        if i == 0:
+            title = fm.get("title") or _first_heading(body) or slug
+        body = _ASSET_LINK_RE.sub(
+            lambda m: m.group(0).replace(m.group(1), _copy_asset(m.group(1)) or m.group(1)), body,
+        )
+        fm_out = dict(fm)
+        fm_out["shared_from"] = author
+        fm_out["shared_from_user_id"] = str(src.user_id)
+        fm_out["shared_at"] = date_iso
+        fm_out.setdefault("type", ptype)
+        head = "---\n" + "\n".join(f"{k}: {v}" for k, v in fm_out.items()) + "\n---\n\n"
+        staged = f"{stage_dir}/{Path(rel).name}"
+        (dst.root / staged).write_text(head + body.lstrip("\n"), encoding="utf-8")
+        pages.append({"src": rel, "staged": staged, "type": ptype})
+    manifest = {
+        "title": title, "slug": slug, "from": author, "from_user_id": src.user_id,
+        "to_user_id": dst.user_id, "comment": comment, "pages": pages, "assets": copied_assets,
+        "created": date_iso,
+    }
+    (dst.root / stage_dir / "_manifest.json").write_text(
+        json_dumps(manifest), encoding="utf-8",
+    )
+    src.log(f"share-workspace-to-user | {slug} → users/{dst.user_id} | {len(pages)} pages")
+    return manifest
+
+
+def json_dumps(obj: Any) -> str:
+    import json
+    return json.dumps(obj, ensure_ascii=False, indent=1)
+
+
+def accept_staged_workspace(dst: PersonalSpace, manifest: dict[str, Any]) -> tuple[str, list[str]]:
+    """Разложить снимок по wiki/ получателя. Возвращает (slug проекта, список rel страниц)."""
+    placed: list[str] = []
+    project_slug = project_slug_from = manifest["slug"]
+    suffix = f"от-{project_slug_from and str(manifest.get('from') or manifest.get('from_user_id'))}"
+    suffix = project_slug(suffix)[:30]
+    for page in manifest["pages"]:
+        staged = dst.root / page["staged"]
+        if not staged.is_file():
+            continue
+        ptype = page.get("type") or "note"
+        target_dir = _TYPE_DIRS.get(ptype, "wiki/notes")
+        rel = f"{target_dir}/{staged.name}"
+        rel = _unique_rel(dst.root, rel, suffix)
+        if ptype == "project":
+            project_slug = Path(rel).stem
+        (dst.root / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(staged), str(dst.root / rel))
+        placed.append(rel)
+    # если имя проекта изменилось (коллизия) — поправим ссылки [[old]] → [[new]] в принятых страницах
+    if project_slug != manifest["slug"]:
+        for rel in placed:
+            p = dst.root / rel
+            t = p.read_text(encoding="utf-8")
+            t2 = t.replace(f"[[{manifest['slug']}]]", f"[[{project_slug}]]").replace(
+                f"[[{manifest['slug']}|", f"[[{project_slug}|")
+            if t2 != t:
+                p.write_text(t2, encoding="utf-8")
+    try:
+        dst.wiki.append_file(
+            "index.md",
+            f"- [[{project_slug}]] — получено от {manifest.get('from')} ({manifest.get('created')}), "
+            f"{len(placed)} страниц",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    shutil.rmtree(dst.root / f"raw/incoming/{manifest.get('token', '')}", ignore_errors=True)
+    dst.log(f"accept-workspace | {manifest['slug']} от users/{manifest.get('from_user_id')} | {len(placed)} pages → {project_slug}")
+    return project_slug, placed
+
+
+def discard_staged_workspace(dst: PersonalSpace, token: str) -> None:
+    shutil.rmtree(dst.root / f"raw/incoming/{token}", ignore_errors=True)

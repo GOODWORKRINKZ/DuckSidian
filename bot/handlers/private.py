@@ -26,6 +26,7 @@ import random
 import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from html import escape as _esc
 from typing import Any
 
@@ -56,9 +57,12 @@ from ..personal import (
     ARTIFACT_KINDS,
     Artifact,
     PersonalSpace,
+    accept_staged_workspace,
     artifact_markdown_table,
     describe_space,
+    discard_staged_workspace,
     slugify,
+    stage_workspace_for_user,
 )
 from ..telegraph import TelegraphClient, page_title
 from ..tg_format import extract_tables, md_to_tg_html, render_table_png
@@ -549,6 +553,133 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         else:
             await msg.reply("Фоновых задач нет.")
 
+    async def _resolve_user_target(target: str) -> int | None:
+        t = (target or "").strip()
+        if t.lstrip("-").isdigit():
+            return int(t)
+        if t.startswith("@"):
+            return await db.find_user_id_by_username(t)
+        return None
+
+    async def _share_workspace_to_user(space: PersonalSpace, slug: str, to_uid: int, *,
+                                       author: str, comment: str = "") -> str:
+        """Снимок воркспейса → личка другого пользователя с кнопками принять/посмотреть."""
+        if to_uid == space.user_id:
+            return "ERROR: это ты сам"
+        if not await is_private_allowed(db, to_uid):
+            return (f"ERROR: у пользователя {to_uid} нет доступа к личному режиму — "
+                    f"админ должен выполнить /allow {to_uid}")
+        dst = orch.personal_space(to_uid)
+        token = uuid.uuid4().hex[:10]
+        try:
+            manifest = stage_workspace_for_user(space, slug, dst, token, author=author, comment=comment)
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR: {exc}"
+        manifest["token"] = token
+        await db.set_state(f"wsshare_{token}", json.dumps(manifest, ensure_ascii=False))
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📥 Принять как воркспейс", callback_data=f"pwsacc:{token}:y")],
+            [InlineKeyboardButton(text="👀 Посмотреть", callback_data=f"pwsacc:{token}:v"),
+             InlineKeyboardButton(text="✖ Отклонить", callback_data=f"pwsacc:{token}:n")],
+        ])
+        text = (
+            f"📦 <b>{_esc(author)}</b> делится с тобой воркспейсом <b>{_esc(manifest['title'])}</b>: "
+            f"{len(manifest['pages'])} страниц, {len(manifest['assets'])} файлов."
+            + (f"\n💬 <i>{_esc(comment)}</i>" if comment else "")
+            + "\n\n«Принять» — скопирую проект и страницы в твоё пространство и создам тему."
+        )
+        try:
+            await bot.send_message(to_uid, text, parse_mode="HTML", reply_markup=kb)
+        except Exception as exc:  # noqa: BLE001
+            await db.set_state(f"wsshare_{token}", "")
+            discard_staged_workspace(dst, token)
+            return (f"ERROR: не могу написать пользователю {to_uid} ({exc}). Он должен сначала сам "
+                    f"написать боту /start.")
+        return f"OK: воркспейс «{manifest['title']}» отправлен пользователю {to_uid} — ждёт принятия."
+
+    @router.callback_query(F.data.startswith("pwsacc:"))
+    async def cb_ws_accept(cb: CallbackQuery) -> None:
+        parts = (cb.data or "").split(":")
+        if len(parts) != 3 or not cb.from_user or not cb.message:
+            await cb.answer("bad data")
+            return
+        token, action = parts[1], parts[2]
+        raw = await db.get_state(f"wsshare_{token}", "")
+        if not raw:
+            await cb.answer("⌛ устарело")
+            return
+        manifest = json.loads(raw)
+        if int(manifest.get("to_user_id", 0)) != cb.from_user.id:
+            await cb.answer("не твоя кнопка")
+            return
+        dst = orch.personal_space(cb.from_user.id, cb.from_user.full_name)
+        if action == "v":
+            await cb.answer()
+            rows: list[list[InlineKeyboardButton]] = []
+            for page in manifest["pages"][:4]:
+                rel = page["staged"]
+                url = await _publish_page(dst, rel)
+                if url:
+                    rows.append([InlineKeyboardButton(text=f"📰 {Path(rel).stem[:28]}", url=url)])
+            if rows:
+                await cb.message.answer("Страницы (снимок):", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+            else:
+                await cb.message.answer("Не удалось опубликовать для просмотра — прими и смотри через /show.")
+            return
+        if action == "n":
+            discard_staged_workspace(dst, token)
+            await db.set_state(f"wsshare_{token}", "")
+            await cb.answer("отклонено")
+            try:
+                await cb.message.edit_text("✖ Отклонено.")
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        # accept
+        await cb.answer("принимаю…")
+        try:
+            slug, placed = accept_staged_workspace(dst, manifest)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("accept workspace failed")
+            await cb.message.answer(f"❌ {_esc(str(exc))}", parse_mode="HTML")
+            return
+        await db.set_state(f"wsshare_{token}", "")
+        name = manifest.get("title") or slug
+        ok, text, _tid = await _create_workspace_bound(dst, cb.message.chat.id, name, slug)
+        try:
+            await cb.message.edit_text(
+                f"📥 Принято: <b>{_esc(name)}</b> → {len(placed)} страниц в твоём пространстве "
+                f"(<code>wiki/projects/{_esc(slug)}.md</code>).\n" + ("✅ " if ok else "⚠️ ") + _esc(text),
+                parse_mode="HTML",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await bot.send_message(int(manifest["from_user_id"]),
+                                   f"✅ {_esc(cb.from_user.full_name)} принял воркспейс «{_esc(name)}».",
+                                   parse_mode="HTML")
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _create_workspace_bound(space: PersonalSpace, chat_id: int, name: str, slug: str) -> tuple[bool, str, int | None]:
+        """Создать тему и привязать к УЖЕ существующей странице проекта slug."""
+        try:
+            topic = await _create_topic(chat_id, name[:128])
+        except Exception as exc:  # noqa: BLE001
+            return False, f"тему создать не удалось ({exc}); страницы лежат в wiki/, проект /show {slug}", None
+        await db.upsert_workspace(chat_id, topic.message_thread_id, name[:128], slug)
+        async with db.conn() as conn:
+            await conn.execute("UPDATE workspaces SET project_slug=? WHERE chat_id=? AND topic_id=?",
+                               (slug, chat_id, topic.message_thread_id))
+            await conn.commit()
+        try:
+            await bot.send_message(chat_id, f"📌 Воркспейс <b>{_esc(name)}</b> (получен) → "
+                                   f"<code>wiki/projects/{_esc(slug)}.md</code>. Пиши сюда по этому проекту.",
+                                   message_thread_id=topic.message_thread_id, parse_mode="HTML")
+        except Exception:  # noqa: BLE001
+            pass
+        return True, f"тема «{name}» создана", topic.message_thread_id
+
     async def _create_workspace(space: PersonalSpace, chat_id: int, name: str) -> tuple[bool, str, int | None]:
         """Создать тему в личке + проект. Возвращает (ok, текст, thread_id)."""
         name = (name or "").strip()[:128]
@@ -585,6 +716,25 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 if not rows:
                     return "Воркспейсов нет."
                 return "\n".join(f"- {r['name']} → wiki/projects/{r['project_slug']}.md" for r in rows)
+            if action == "share_workspace":
+                tid = _thread_id(msg)
+                if tid is None:
+                    return "ERROR: разговор идёт не в теме-воркспейсе"
+                row = await db.get_workspace(msg.chat.id, tid)
+                if not row or not row["project_slug"]:
+                    return "ERROR: эта тема не привязана к проекту (/ws <имя>)"
+                target = str(args.get("target", "")).strip()
+                comment = str(args.get("comment") or "")
+                if settings.get_chat_by_name(target.lstrip("#")):
+                    return await orch.share_workspace_to_chat(space, row["project_slug"], target.lstrip("#"),
+                                                              comment=comment, author=space.display_name)
+                uid = await _resolve_user_target(target)
+                if uid is None:
+                    return (f"ERROR: не понял адресата '{target}'. Нужен слаг чата "
+                            f"({', '.join(c.name for c in settings.get_chats())}), @username человека, "
+                            "который уже писал боту, или его числовой id.")
+                return await _share_workspace_to_user(space, row["project_slug"], uid,
+                                                      author=space.display_name, comment=comment)
             if action == "set_workspace_icon":
                 tid = _thread_id(msg)
                 if tid is None:
@@ -1154,15 +1304,29 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             chats = settings.get_chats()
             chat = None
             as_topic = False
+            user_target: str | None = None
             comment_parts: list[str] = []
             for p in parts:
                 if p.lstrip("#") in {c.name for c in chats} and chat is None:
                     chat = p.lstrip("#")
+                elif (p.startswith("@") or p.isdigit()) and user_target is None and chat is None:
+                    user_target = p
                 elif p.lower() in ("topic", "тема", "--topic"):
                     as_topic = True
                 else:
                     comment_parts.append(p)
             comment = " ".join(comment_parts)
+            if user_target:
+                uid = await _resolve_user_target(user_target)
+                if uid is None:
+                    await msg.reply(f"Не нашёл пользователя {_esc(user_target)}: он должен хотя бы раз написать боту, "
+                                    "либо укажи числовой id.", parse_mode="HTML")
+                    return
+                await msg.chat.do("typing")
+                res = await _share_workspace_to_user(space, ws["project_slug"], uid,
+                                                     author=_display_name(msg), comment=comment)
+                await _reply_html(msg, ("✅ " if res.startswith("OK") else "❌ ") + res)
+                return
             if chat is None and len(chats) == 1:
                 chat = chats[0].name
             if chat is None:
@@ -1237,7 +1401,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             f"Связанных страниц: {pages}.\n"
             "/ws <имя> — переименовать · /show " + _esc(ws['project_slug']) + " — страница проекта\n"
             "/ws share <чат> [topic] [комментарий] — выгрузить весь воркспейс "
-            "(topic = в отдельную тему группы с тем же именем) · /ws icon [эмодзи] — значок.",
+            "(topic = в отдельную тему группы с тем же именем) · /ws share @user — человеку "
+            "(снимок с кнопкой «принять») · /ws icon [эмодзи] — значок.",
             parse_mode="HTML", reply_markup=_share_keyboard(token),
         )
 

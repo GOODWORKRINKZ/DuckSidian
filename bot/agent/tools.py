@@ -600,6 +600,26 @@ PERSONAL_EXTRA_TOOLS += [
     {
         "type": "function",
         "function": {
+            "name": "share_workspace",
+            "description": (
+                "Поделиться ТЕКУЩИМ воркспейсом (проект + связанные страницы + файлы). target — "
+                "слаг группового чата (например 'main') ИЛИ пользователь: '@username' / числовой id. "
+                "В чат — выгрузка в vault группы; человеку — снимок приходит ему в личку с кнопками "
+                "«посмотреть / принять как воркспейс». Только по явной просьбе владельца."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string"},
+                    "comment": {"type": "string", "default": ""},
+                },
+                "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_workspace_icon",
             "description": (
                 "Сменить значок (иконку) ТЕКУЩЕЙ темы-воркспейса. Без emoji — подобрать по смыслу "
@@ -1083,7 +1103,8 @@ class ToolExecutor:
                     return "ERROR: missing 'path'"
                 res = await process_attachment(self.wiki, rel)
                 return res.agent_block()
-            if name in ("create_workspace", "list_workspaces", "rename_workspace", "set_workspace_icon"):
+            if name in ("create_workspace", "list_workspaces", "rename_workspace", "set_workspace_icon",
+                        "share_workspace"):
                 if self._workspace_fn is None:
                     return "ERROR: управление воркспейсами недоступно в этом режиме"
                 return await self._workspace_fn(name, dict(arguments or {}))

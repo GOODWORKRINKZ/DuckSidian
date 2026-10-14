@@ -519,3 +519,18 @@ class DB:
                 params,
             ) as cur:
                 return list(await cur.fetchall())
+
+
+    async def find_user_id_by_username(self, username: str) -> int | None:
+        """user_id по @username среди всех, кто писал боту (в т.ч. в группе)."""
+        u = username.lstrip("@").strip().lower()
+        if not u:
+            return None
+        async with self.conn() as db:
+            async with db.execute(
+                """SELECT user_id FROM messages WHERE lower(username)=? AND user_id IS NOT NULL
+                   ORDER BY ts DESC LIMIT 1""",
+                (u,),
+            ) as cur:
+                row = await cur.fetchone()
+        return int(row["user_id"]) if row else None
