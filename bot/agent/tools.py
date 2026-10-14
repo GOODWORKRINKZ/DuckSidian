@@ -355,15 +355,35 @@ TOOL_SCHEMAS: list[dict] = [
             "name": "fetch_url",
             "description": (
                 "Загрузить содержимое веб-страницы по URL и вернуть очищенный текст. "
-                "Используй для конкретных ссылок из сообщений чата (YouTube, GitHub, "
+                "Используй для конкретных ссылок из сообщений чата (YouTube, GitHub, 1688, "
                 "статьи, документация и т.п.) — чтобы понять о чём ссылка. "
-                "Возвращает заголовок страницы + основной текст (до 3000 символов)."
+                "Возвращает заголовок страницы + основной текст (до 3000 символов). "
+                "YouTube: название, канал и ПОЛНАЯ стенограмма с таймкодами (субтитры или ASR), "
+                "сохранённая в raw/imports/youtube_<id>.md — используй её как источник для "
+                "wiki/sources/<slug>.md. 1688: карточка товара."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "Полный URL включая https://"},
                 },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_image",
+            "description": (
+                "Скачать картинку по URL (например фото товара с 1688/Taobao из fetch_url) в vault "
+                "raw/assets/<date>/web_*.jpg и вернуть rel-путь. Дальше: describe_media(path), "
+                "чтобы посмотреть её, и/или блок IMAGES в finish(), чтобы отправить пользователю. "
+                "Лимит 10 МБ, только image/*."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
                 "required": ["url"],
             },
         },
@@ -850,6 +870,8 @@ class ToolExecutor:
                 )
             if name == "fetch_url":
                 return await self._fetch_url(arguments["url"])
+            if name == "fetch_image":
+                return await self._fetch_image(str(arguments.get("url", "")))
             if name == "fetch_git_log":
                 return await self._fetch_git_log(
                     arguments["repo"],
@@ -1126,31 +1148,47 @@ class ToolExecutor:
                 return m.group(1)
         return None
 
-    @staticmethod
-    async def _fetch_youtube(url: str, video_id: str) -> str:
-        """Получить метаданные + стенограмму YouTube-видео."""
+    async def _fetch_youtube(self, url: str, video_id: str) -> str:
+        """Метаданные + ПОЛНАЯ стенограмма YouTube-видео.
+
+        Субтитры (youtube-transcript-api) с таймкодами; если их нет — скачиваем
+        аудио yt-dlp и распознаём (MiniMax ASR / Whisper) кусками по 8 минут.
+        Полный текст сохраняется в raw/imports/youtube_<id>.md (источник для
+        wiki/sources), агенту возвращается выдержка + путь.
+        """
         import asyncio
 
         yt_url = f"https://www.youtube.com/watch?v={video_id}"
 
+        def _fmt_ts(sec: float) -> str:
+            sec = int(sec)
+            return f"{sec // 3600:d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60:d}:{sec % 60:02d}"
+
         def _get_transcript() -> tuple[str, str]:
-            """Синхронно: стянуть стенограмму через youtube-transcript-api."""
+            """Синхронно: стенограмма с таймкодами (строка на ~45 сек) через youtube-transcript-api."""
             try:
-                from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled  # type: ignore[import]
+                from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound  # type: ignore[import]
                 api = YouTubeTranscriptApi()
-                # Предпочитаем русский, потом английский, потом любой
                 try:
                     transcript = api.fetch(video_id, languages=["ru", "en"])
                 except NoTranscriptFound:
                     transcript_list = api.list(video_id)
                     transcript = next(iter(transcript_list)).fetch()
-                snippets = [s.text for s in transcript]
-                full = " ".join(snippets)
-                # Обрезаем до ~4000 символов
-                if len(full) > 4000:
-                    full = full[:4000] + f"...(обрезано, всего ~{len(full)} символов)"
+                lines: list[str] = []
+                cur_start = None
+                cur: list[str] = []
+                for s in transcript:
+                    st = float(getattr(s, "start", 0.0) or 0.0)
+                    if cur_start is None:
+                        cur_start = st
+                    cur.append(str(getattr(s, "text", "")).replace("\n", " ").strip())
+                    if st - cur_start >= 45:
+                        lines.append(f"[{_fmt_ts(cur_start)}] " + " ".join(x for x in cur if x))
+                        cur, cur_start = [], None
+                if cur:
+                    lines.append(f"[{_fmt_ts(cur_start or 0)}] " + " ".join(x for x in cur if x))
                 lang = getattr(transcript, "language_code", "?")
-                return full, lang
+                return "\n".join(lines), lang
             except Exception as exc:  # noqa: BLE001
                 return "", str(exc)
 
@@ -1166,11 +1204,19 @@ class ToolExecutor:
             except Exception:  # noqa: BLE001
                 return "", ""
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         (title, author), (transcript_text, transcript_err) = await asyncio.gather(
             loop.run_in_executor(None, _get_title),
             loop.run_in_executor(None, _get_transcript),
         )
+        source = "субтитры YouTube"
+        if not transcript_text:
+            # Нет субтитров — пробуем аудио → ASR.
+            asr_text, asr_err = await self._yt_audio_transcript(yt_url)
+            if asr_text:
+                transcript_text, source = asr_text, "распознавание аудио (ASR)"
+            else:
+                transcript_err = f"{transcript_err}; ASR: {asr_err}"
 
         lines = [f"URL: {yt_url}"]
         if title:
@@ -1179,16 +1225,89 @@ class ToolExecutor:
             lines.append(f"Канал: {author}")
 
         if transcript_text:
-            lines.append(f"\nСтенограмма:\n{transcript_text}")
+            # Полный транскрипт — в raw/imports (источник), агенту — выдержка.
+            side = f"raw/imports/youtube_{video_id}.md"
+            try:
+                from datetime import datetime as _dt, timezone as _tz  # noqa: PLC0415
+                body = (
+                    "---\ntype: extracted\nkind: youtube\n"
+                    f"source: {yt_url}\ntitle: \"{(title or video_id).replace(chr(34), chr(39))}\"\n"
+                    f"channel: \"{(author or '').replace(chr(34), chr(39))}\"\n"
+                    f"transcript: {source}\nextracted: {_dt.now(_tz.utc).strftime('%Y-%m-%d %H:%M')}\n---\n\n"
+                    f"# {title or video_id}\n\n{yt_url}\n\n## Стенограмма\n\n{transcript_text}\n"
+                )
+                p = self.wiki.root / side
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(body, encoding="utf-8")
+                lines.append(f"Полная стенограмма ({len(transcript_text)} симв., {source}) сохранена: `{side}` "
+                             f"— читай read_file/grep_file при необходимости; ссылайся на неё как [[{side[:-3]}]].")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("youtube sidecar write failed: %s", exc)
+            excerpt = transcript_text if len(transcript_text) <= 6000 else transcript_text[:6000] + "\n…(обрезано)"
+            lines.append(f"\nСтенограмма ({source}):\n{excerpt}")
         else:
             lines.append(f"\n[Стенограмма недоступна: {transcript_err}]")
 
         result = "\n".join(lines)
-        log.info("youtube %s → title=%r transcript=%d chars", video_id, title, len(transcript_text))
+        log.info("youtube %s → title=%r transcript=%d chars (%s)", video_id, title, len(transcript_text), source)
         return result
 
-    @staticmethod
-    async def _fetch_url(url: str) -> str:
+    async def _yt_audio_transcript(self, yt_url: str) -> tuple[str, str]:
+        """Скачать аудио yt-dlp и распознать кусками по 8 минут (лимит ASR 500 с)."""
+        import asyncio
+        import shutil
+        import tempfile
+        from ..media_parser import transcribe_audio  # noqa: PLC0415
+        if shutil.which("yt-dlp") is None:
+            try:
+                import yt_dlp  # type: ignore[import]  # noqa: F401
+                cmd = ["python", "-m", "yt_dlp"]
+                import sys as _sys
+                cmd[0] = _sys.executable
+            except ImportError:
+                return "", "yt-dlp не установлен"
+        else:
+            cmd = ["yt-dlp"]
+        tmp = Path(tempfile.mkdtemp(prefix="yt_"))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, "-q", "--no-warnings", "--no-playlist", "-x", "--audio-format", "m4a",
+                "--max-filesize", "200m", "-o", str(tmp / "audio.%(ext)s"), yt_url,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=600)
+            audio = next(iter(tmp.glob("audio.*")), None)
+            if proc.returncode != 0 or audio is None:
+                return "", (err or b"").decode(errors="replace")[-300:].strip() or "yt-dlp failed"
+            # Режем на сегменты по 480 с (wav 16k mono) — под лимит ASR 500 с.
+            seg_dir = tmp / "seg"
+            seg_dir.mkdir()
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", str(audio), "-vn", "-ar", "16000", "-ac", "1",
+                "-f", "segment", "-segment_time", "480", str(seg_dir / "part_%03d.wav"),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=300)
+            parts = sorted(seg_dir.glob("part_*.wav"))
+            if proc.returncode != 0 or not parts:
+                return "", "ffmpeg segment failed"
+            if len(parts) > 12:  # ~1.5 часа максимум
+                parts = parts[:12]
+            out: list[str] = []
+            for i, part in enumerate(parts):
+                txt = await transcribe_audio(part)
+                if txt and not txt.startswith("("):
+                    m, s = divmod(i * 480, 60)
+                    out.append(f"[{m}:{s:02d}] {txt.strip()}")
+            return "\n".join(out), "" if out else "пустая транскрипция"
+        except asyncio.TimeoutError:
+            return "", "таймаут скачивания/распознавания"
+        except Exception as exc:  # noqa: BLE001
+            return "", str(exc)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    async def _fetch_url(self, url: str) -> str:
         """Загрузить страницу и вернуть очищенный текст (до 3000 символов)."""
         import re
         import urllib.parse
@@ -1206,19 +1325,16 @@ class ToolExecutor:
         # YouTube: use transcript API
         _yt_id = ToolExecutor._yt_video_id(url)
         if _yt_id:
-            return await ToolExecutor._fetch_youtube(url, _yt_id)
+            return await self._fetch_youtube(url, _yt_id)
 
-        # 1688: blocks scraping with JS challenge; no public API without key.
-        # Return offer URL so agent can still record it as a clickable link.
+        # 1688: десктопная страница — JS-челлендж, но мобильная m.1688.com отдаёт
+        # карточку с JSON (название, цена, MOQ, продавец, характеристики, фото).
         if "1688.com" in parsed.netloc:
-            _offer_match = _re.search(r"/offer/(\d+)", url)
+            _offer_match = _re.search(r"/offer/(\d+)", url) or _re.search(r"offerId=(\d+)", url)
             offer_id = _offer_match.group(1) if _offer_match else ""
-            clean_url = f"https://detail.1688.com/offer/{offer_id}.html" if offer_id else url
-            return (
-                f"URL: {clean_url}\n"
-                f"Заголовок: товар на 1688.com (offer {offer_id})\n\n"
-                f"[1688 блокирует автоматические запросы. Запиши ссылку как есть: {clean_url}]"
-            )
+            if offer_id:
+                return await ToolExecutor._fetch_1688(offer_id)
+            return f"URL: {url}\nЗаголовок: страница 1688.com без offer id\n\n[не карточка товара — не разобрано]"
 
         try:
             headers = {
@@ -1257,6 +1373,137 @@ class ToolExecutor:
         result = f"URL: {url}\nЗаголовок: {title}\n\n{text}"
         log.info("fetch_url %s → %d символов", url, len(result))
         return result
+
+    @staticmethod
+    def _parse_1688_html(html: str, offer_id: str) -> dict:
+        """Вытащить поля карточки из HTML мобильной страницы 1688."""
+        import json as _json
+        import re as _re
+        d: dict = {"offer_id": offer_id}
+        m = _re.search(r"<title>(.*?)</title>", html, _re.S)
+        title = (m.group(1).strip() if m else "")
+        m2 = _re.search(r'"offerTitle":"((?:[^"\\]|\\.)*)"', html)
+        if m2:
+            title = _json.loads('"' + m2.group(1) + '"') or title
+        d["title"] = title
+        m = _re.search(r'"price":"(\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?)"', html)
+        d["price"] = m.group(1) if m else ""
+        m = _re.search(r'"beginAmount":"?(\d+)', html)
+        d["moq"] = m.group(1) if m else ""
+        units = [u for u in _re.findall(r'"unit":"([^"]{1,8})"', html) if u not in ("￥", "¥", "$", "元")]
+        d["unit"] = units[0] if units else ""
+        m = _re.search(r'"saledCount":"([^"]{1,20})"', html)
+        d["sold"] = m.group(1) if m else ""
+        m = _re.search(r'"companyName":"([^"]{1,80})"', html)
+        d["company"] = m.group(1) if m else ""
+        m = _re.search(r'"sellerLoginId":"([^"]{1,60})"', html)
+        d["seller"] = m.group(1) if m else ""
+        props: list[tuple[str, str]] = []
+        i = html.find('"propsList":')
+        if i != -1:
+            try:
+                arr, _ = _json.JSONDecoder().raw_decode(html[i + len('"propsList":'):])
+                for it in arr:
+                    if isinstance(it, dict) and it.get("name"):
+                        props.append((str(it.get("name")), str(it.get("value", ""))))
+            except Exception:  # noqa: BLE001
+                pass
+        d["props"] = props
+        imgs: list[str] = []
+        i = html.find('"offerImgList":')
+        if i != -1:
+            try:
+                arr, _ = _json.JSONDecoder().raw_decode(html[i + len('"offerImgList":'):])
+                imgs = [str(x) for x in arr if isinstance(x, str) and x.startswith("http")]
+            except Exception:  # noqa: BLE001
+                pass
+        d["images"] = imgs
+        return d
+
+    @staticmethod
+    def _format_1688(d: dict) -> str:
+        oid = d.get("offer_id", "")
+        url = f"https://detail.1688.com/offer/{oid}.html"
+        lines = [f"URL: {url}", f"Заголовок: {d.get('title') or '(нет)'} (1688, offer {oid})", ""]
+        if d.get("price"):
+            unit = f" / {d['unit']}" if d.get("unit") else ""
+            lines.append(f"Цена: ¥{d['price']}{unit} (диапазон по объёму/SKU; CNY)")
+        if d.get("moq"):
+            lines.append(f"Мин. заказ: {d['moq']} {d.get('unit') or 'шт'}")
+        if d.get("sold"):
+            lines.append(f"Продано: {d['sold']}")
+        if d.get("company") or d.get("seller"):
+            lines.append(f"Продавец: {d.get('company') or ''} {('(' + d['seller'] + ')') if d.get('seller') else ''}".strip())
+        if d.get("props"):
+            lines.append("")
+            lines.append("Характеристики (кит.):")
+            for name, val in d["props"][:14]:
+                v = val if len(val) <= 160 else val[:160] + "…"
+                lines.append(f"- {name}: {v}")
+        if d.get("images"):
+            lines.append("")
+            lines.append("Фото (скачать: fetch_image(url)):")
+            lines += [f"- {u}" for u in d["images"][:3]]
+        lines.append("")
+        lines.append("[Текст на китайском — переведи ключевое для пользователя сам.]")
+        return "\n".join(lines)
+
+    @staticmethod
+    async def _fetch_1688(offer_id: str) -> str:
+        """Карточка товара 1688 через мобильную страницу m.1688.com."""
+        url = f"https://m.1688.com/offer/{offer_id}.html"
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5",
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers=headers)
+            html = resp.text if resp.status_code == 200 else ""
+        except Exception as exc:  # noqa: BLE001
+            log.warning("fetch 1688 %s failed: %s", offer_id, exc)
+            html = ""
+        clean = f"https://detail.1688.com/offer/{offer_id}.html"
+        if not html or ('"offerTitle"' not in html and "<title>" not in html):
+            return (
+                f"URL: {clean}\nЗаголовок: товар на 1688.com (offer {offer_id})\n\n"
+                f"[1688 не отдал карточку (анти-бот/капча). Запиши ссылку как есть: {clean}. "
+                f"Пользователь может прислать скриншот карточки — я прочитаю его через vision.]"
+            )
+        d = ToolExecutor._parse_1688_html(html, offer_id)
+        if not d.get("title") or "验证" in d.get("title", ""):
+            return f"URL: {clean}\nЗаголовок: товар на 1688.com (offer {offer_id})\n\n[страница-заглушка/капча, карточка недоступна]"
+        log.info("fetch 1688 %s → %s", offer_id, d.get("title", "")[:60])
+        return ToolExecutor._format_1688(d)
+
+    async def _fetch_image(self, url: str) -> str:
+        """Скачать картинку по URL в raw/assets/<date>/web_<hash>.<ext>."""
+        import hashlib
+        import urllib.parse
+        from datetime import datetime as _dt, timezone as _tz
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return "ERROR: нужен http(s) URL"
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; DuckSidian/1.0)", "Referer": f"{parsed.scheme}://{parsed.netloc}/"}
+        try:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                ct = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+                data = resp.content
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR fetch_image: {exc}"
+        if not ct.startswith("image/"):
+            return f"ERROR fetch_image: не картинка (content-type {ct or '?'})"
+        if len(data) > 10 * 1024 * 1024:
+            return "ERROR fetch_image: файл больше 10 МБ"
+        ext = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif"}.get(ct, ".jpg")
+        h = hashlib.sha1(url.encode()).hexdigest()[:10]
+        date_iso = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+        rel = self.wiki.save_asset(data, f"web_{h}{ext}", date_iso).replace("\\", "/")
+        return f"OK: {rel} ({len(data) // 1024} KB, {ct}). Посмотреть: describe_media('{rel}'); отправить — в блоке IMAGES."
 
     @staticmethod
     async def _web_search(query: str, max_results: int = 5) -> str:

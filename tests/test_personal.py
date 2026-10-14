@@ -531,3 +531,23 @@ async def test_executor_grep_dir_and_search_hint(space: PersonalSpace) -> None:
     out = await ex.call("search_wiki", {"query": "винты", "path_prefix": "raw/daily"})
     assert "2025-10-09.md" in out
     assert any(t["function"]["name"] == "grep_dir" for t in personal_tool_schemas())
+
+
+def test_parse_1688_html() -> None:
+    html = ('<html><head><title>304不锈钢DIN7984 矮薄头内六角螺丝</title></head><body><script>'
+            'window.__INIT={"offerId":"675067142927","offerTitle":"304不锈钢DIN7984 矮薄头内六角螺丝 M2-M10",'
+            '"price":"0.02-4.00","beginAmount":"10","unit":"￥","unit":"个","saledCount":"32万+",'
+            '"companyName":"深圳市伟粤紧固件有限公司","sellerLoginId":"深圳伟粤紧固件",'
+            '"propsList":[{"name":"标准编号","value":"DIN7984","show":false},{"name":"品牌","value":"伟粤"}],'
+            '"offerImgList":["https://cbu01.alicdn.com/img/a.jpg","https://cbu01.alicdn.com/img/b.jpg"]}'
+            '</script></body></html>')
+    d = ToolExecutor._parse_1688_html(html, "675067142927")
+    assert d["title"].startswith("304不锈钢DIN7984") and d["price"] == "0.02-4.00"
+    assert d["moq"] == "10" and d["unit"] == "个" and d["sold"] == "32万+"
+    assert d["company"] == "深圳市伟粤紧固件有限公司" and d["seller"] == "深圳伟粤紧固件"
+    assert d["props"] == [("标准编号", "DIN7984"), ("品牌", "伟粤")]
+    assert d["images"] == ["https://cbu01.alicdn.com/img/a.jpg", "https://cbu01.alicdn.com/img/b.jpg"]
+    out = ToolExecutor._format_1688(d)
+    assert "https://detail.1688.com/offer/675067142927.html" in out
+    assert "Цена: ¥0.02-4.00 / 个" in out and "Мин. заказ: 10 个" in out and "- 品牌: 伟粤" in out
+    assert "fetch_image" in out

@@ -78,12 +78,18 @@ def _format_table_text(rows: list[list[str]]) -> str:
                 lines.append(k)
         return "\n".join(lines)
 
-    # N-column card format.
+    # N-column card format: Telegram не умеет таблицы, поэтому каждая строка —
+    # карточка «• <первая колонка>» + атрибуты «Заголовок: значение». Сырую шапку
+    # `a | b | c` не выводим — она выглядит как сломанная таблица.
     header = rows[0]
     data = rows[1:]
+    first_hdr = header[0].strip() if header and header[0] else ""
     parts: list[str] = []
     for row in data:
-        card = [f"• {row[0]}"]
+        title = row[0]
+        if first_hdr and first_hdr not in ("#", "№", "N", "n") and title:
+            title = f"{first_hdr} {title}" if len(first_hdr) <= 12 else title
+        card = [f"• {title}" if title else "•"]
         for i in range(1, col_count):
             cell = row[i]
             if not cell:
@@ -91,8 +97,7 @@ def _format_table_text(rows: list[list[str]]) -> str:
             hdr = header[i] if i < len(header) else ""
             card.append(f"    {hdr}: {cell}" if hdr else f"    {cell}")
         parts.append("\n".join(card))
-    hdr_line = " | ".join(header)
-    return hdr_line + "\n\n" + "\n\n".join(parts)
+    return "\n\n".join(parts)
 
 
 def _wiki_alias(target: str, alias: str | None) -> str:
@@ -311,3 +316,127 @@ def split_tg_chunks(text: str, limit: int = TG_LIMIT) -> list[str]:
     if buf:
         chunks.append("\n".join(buf))
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# Таблицы → картинка. Telegram Bot API не поддерживает табличную разметку,
+# поэтому широкие таблицы (3+ колонки) дополнительно рендерим в PNG (Pillow +
+# шрифт с кириллицей) и шлём фото после текста.
+
+_TABLE_LINE_RE = re.compile(r"^\s*\|.+\|\s*$")
+_MD_INLINE_RE = re.compile(r"(\*\*|__|`|~~)")
+_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+)
+_FONT_BOLD_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+)
+
+
+def extract_tables(md: str, min_cols: int = 3) -> list[list[list[str]]]:
+    """Найти markdown-таблицы (≥ min_cols колонок) → список таблиц (строки ячеек, без разделителя).
+
+    Ячейки очищены от inline-markdown (** ` ~~) и wikilink-скобок.
+    """
+    tables: list[list[list[str]]] = []
+    buf: list[list[str]] = []
+
+    def _flush() -> None:
+        nonlocal buf
+        if buf and max(len(r) for r in buf) >= min_cols and len(buf) >= 2:
+            tables.append(buf)
+        buf = []
+
+    for line in md.splitlines():
+        if _TABLE_LINE_RE.match(line):
+            s = line.strip()
+            if _is_table_sep(s):
+                continue
+            cells = [c.strip() for c in s[1:-1].split("|")]
+            cells = [_MD_INLINE_RE.sub("", c) for c in cells]
+            cells = [re.sub(r"\[\[([^\]|]*\|)?([^\]]*)\]\]", r"\2", c) for c in cells]
+            cells = [re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", c) for c in cells]
+            buf.append(cells)
+        else:
+            _flush()
+    _flush()
+    return tables
+
+
+def _wrap_cell(text: str, width: int) -> list[str]:
+    import textwrap
+    out: list[str] = []
+    for para in (text or "").split("\n"):
+        out.extend(textwrap.wrap(para, width=width, break_long_words=True) or [""])
+    return out or [""]
+
+
+def render_table_png(rows: list[list[str]], *, max_width_px: int = 1600) -> bytes | None:
+    """Отрендерить таблицу в PNG. None — если Pillow/шрифт недоступны."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # type: ignore[import]
+    except ImportError:
+        return None
+    import io
+    import os
+    font_path = next((p for p in _FONT_CANDIDATES if os.path.exists(p)), None)
+    bold_path = next((p for p in _FONT_BOLD_CANDIDATES if os.path.exists(p)), None) or font_path
+    if not font_path:
+        return None
+    size = 22
+    font = ImageFont.truetype(font_path, size)
+    bold = ImageFont.truetype(bold_path, size)
+    pad_x, pad_y = 14, 10
+    col_count = max(len(r) for r in rows)
+    rows = [r + [""] * (col_count - len(r)) for r in rows]
+    # Ширина колонок: по содержимому, с ограничением на символы в строке.
+    max_chars = max(12, min(48, int(180 / col_count)))
+    wrapped = [[_wrap_cell(c, max_chars) for c in r] for r in rows]
+
+    def _tw(s: str, f) -> int:
+        return int(f.getlength(s)) if s else 0
+
+    col_w = [0] * col_count
+    for ri, r in enumerate(wrapped):
+        f = bold if ri == 0 else font
+        for ci, lines in enumerate(r):
+            col_w[ci] = max(col_w[ci], max(_tw(ln, f) for ln in lines) + 2 * pad_x)
+    total_w = sum(col_w) + 2
+    if total_w > max_width_px:
+        scale = max_width_px / total_w
+        col_w = [int(w * scale) for w in col_w]
+        total_w = sum(col_w) + 2
+    line_h = size + 6
+    row_h = [max(len(lines) for lines in r) * line_h + 2 * pad_y for r in wrapped]
+    total_h = sum(row_h) + 2
+    img = Image.new("RGB", (total_w, total_h), "white")
+    draw = ImageDraw.Draw(img)
+    y = 1
+    for ri, r in enumerate(wrapped):
+        f = bold if ri == 0 else font
+        if ri == 0:
+            draw.rectangle([0, y, total_w, y + row_h[ri]], fill=(235, 238, 243))
+        elif ri % 2 == 0:
+            draw.rectangle([0, y, total_w, y + row_h[ri]], fill=(248, 249, 251))
+        x = 1
+        for ci, lines in enumerate(r):
+            ty = y + pad_y
+            for ln in lines:
+                draw.text((x + pad_x, ty), ln, font=f, fill=(20, 20, 20))
+                ty += line_h
+            x += col_w[ci]
+            draw.line([(x, y), (x, y + row_h[ri])], fill=(205, 208, 214), width=1)
+        y += row_h[ri]
+        draw.line([(0, y), (total_w, y)], fill=(205, 208, 214), width=1)
+    draw.rectangle([0, 0, total_w - 1, total_h - 1], outline=(160, 164, 172), width=1)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()

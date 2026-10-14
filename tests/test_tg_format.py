@@ -132,10 +132,29 @@ def test_table_cards():
     md = "| Имя | Роль | Навык |\n|---|---|---|\n| **Вася** | Dev | Python |\n| Петя | PM | Excel |\n"
     out = md_to_tg_html(md)
     assert "<pre>" not in out
-    assert "• <b>Вася</b>" in out
+    assert "• Имя <b>Вася</b>" in out
     assert "Роль: Dev" in out
-    assert "• Петя" in out
+    assert "• Имя Петя" in out
     assert "Навык: Excel" in out
+    assert "Имя | Роль | Навык" not in out  # сырую шапку не выводим
+
+
+def test_table_cards_numbered_header_dropped():
+    md = "| # | Дата | Сумма |\n|---|---|---|\n| 1 | 14.10 | **2285¥** |\n"
+    out = md_to_tg_html(md)
+    assert "• 1\n" in out and "Сумма: <b>2285¥</b>" in out and "# |" not in out
+
+
+def test_extract_tables_and_render_png():
+    from bot.tg_format import extract_tables, render_table_png
+    md = ("текст\n\n| # | Дата | Сумма |\n|---|---|---|\n| 1 | 14.10 | **2285¥** [[БиБа|проект]] |\n"
+          "| 2 | 24.10 | 260¥ |\n\n| a | b |\n|---|---|\n| 1 | 2 |\n")
+    tables = extract_tables(md, min_cols=3)
+    assert len(tables) == 1  # 2-колоночная не считается
+    assert tables[0][0] == ["#", "Дата", "Сумма"] and tables[0][1][2] == "2285¥ проект"
+    png = render_table_png(tables[0])
+    if png is not None:  # Pillow+шрифт есть
+        assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 500
 
 
 def test_unbalanced_asterisk_safe():

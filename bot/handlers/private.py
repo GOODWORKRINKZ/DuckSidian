@@ -60,7 +60,7 @@ from ..personal import (
     slugify,
 )
 from ..telegraph import TelegraphClient, page_title
-from ..tg_format import md_to_tg_html
+from ..tg_format import extract_tables, md_to_tg_html, render_table_png
 from .admin_shared import (
     format_model_list,
     handle_allow_command,
@@ -622,6 +622,28 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
     async def _voice_id(user_id: int) -> str:
         return await db.get_state(f"voice_id_{user_id}", settings.minimax_tts_voice)
 
+    async def _send_table_images(msg: Message, markdown: str) -> None:
+        """Широкие markdown-таблицы (3+ колонок) дополнительно шлём картинкой:
+        в тексте они превращаются в карточки, а PNG даёт привычный табличный вид."""
+        try:
+            tables = extract_tables(markdown, min_cols=3)
+        except Exception:  # noqa: BLE001
+            return
+        for i, rows in enumerate(tables[:3], 1):
+            try:
+                png = await asyncio.get_running_loop().run_in_executor(None, render_table_png, rows)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("table png failed: %s", exc)
+                png = None
+            if not png:
+                return
+            try:
+                from aiogram.types import BufferedInputFile  # noqa: PLC0415
+                cap = f"📊 таблица {i}" if len(tables) > 1 else "📊 таблица"
+                await msg.answer_photo(BufferedInputFile(png, filename=f"table_{i}.png"), caption=cap)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("send table png failed: %s", exc)
+
     async def _send_voice(msg: Message, space: PersonalSpace, text: str, *, summarize: bool = False) -> bool:
         """Озвучить текст и отправить голосовым. summarize=True — сначала сжать в короткий
         устный пересказ сути (полный ответ уже ушёл текстом). True если получилось."""
@@ -710,6 +732,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         sent_ids = await _reply_html(msg, display or "(пусто)")
         if has_images:
             await _attach_media(msg, answer, space.wiki.root)
+        await _send_table_images(msg, display)
         await _save_bot_reply(space, msg, display, sent_ids, ws_name)
         if voice and display:
             await _send_voice(msg, space, display, summarize=True)
