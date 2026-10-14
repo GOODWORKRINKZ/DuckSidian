@@ -8,6 +8,20 @@ from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def parse_id_list(v) -> list[int]:
+    """'1, 2;3' | '[1,2]' | 7 | [..] → [1, 2, 3]."""
+    if v is None:
+        return []
+    if isinstance(v, int):
+        return [v]
+    if isinstance(v, str):
+        v = v.strip().strip("[]")
+        if not v:
+            return []
+        return [int(x.strip().strip('"').strip("'")) for x in v.replace(";", ",").split(",") if x.strip()]
+    return [int(x) for x in v]
+
+
 class ChatConfig(BaseModel):
     """Конфигурация одного отслеживаемого чата."""
 
@@ -101,10 +115,20 @@ class Settings(BaseSettings):
     # Первичный чат (backward compat). Используется, если TELEGRAM_CHATS пуст.
     telegram_chat_id: int
     telegram_topic_id: int | None = None
-    telegram_admins: List[int] = Field(default_factory=list)
+    # Списки id читаем как СТРОКИ: pydantic-settings пытается json.loads() любое
+    # поле типа list и падает на "123,456". Парсим сами (см. свойства ниже).
+    telegram_admins_raw: str = Field(default="", validation_alias="TELEGRAM_ADMINS")
     # Пользователи, которым разрешён личный режим (DM). Админы — всегда.
     # Список можно дополнять в рантайме через /allow (хранится в БД).
-    telegram_private_users: List[int] = Field(default_factory=list)
+    telegram_private_users_raw: str = Field(default="", validation_alias="TELEGRAM_PRIVATE_USERS")
+
+    @property
+    def telegram_admins(self) -> List[int]:
+        return parse_id_list(self.telegram_admins_raw)
+
+    @property
+    def telegram_private_users(self) -> List[int]:
+        return parse_id_list(self.telegram_private_users_raw)
 
     @field_validator("telegram_topic_id", mode="before")
     @classmethod
@@ -179,17 +203,9 @@ class Settings(BaseSettings):
     git_user_name: str = "DuckSidian Bot"
     git_user_email: str = "ducksidian@localhost"
 
-    @field_validator("telegram_admins", "telegram_private_users", mode="before")
-    @classmethod
-    def _parse_id_list(cls, v):
-        if isinstance(v, str):
-            v = v.strip()
-            if not v:
-                return []
-            return [int(x.strip()) for x in v.replace(";", ",").split(",") if x.strip()]
-        if isinstance(v, int):
-            return [v]
-        return v
+    @staticmethod
+    def _parse_id_list(v) -> List[int]:
+        return parse_id_list(v)
 
     # --- LLM helpers ---
 

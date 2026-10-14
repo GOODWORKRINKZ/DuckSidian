@@ -289,10 +289,17 @@ def test_llm_client_switch(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_private_users_parse(monkeypatch: pytest.MonkeyPatch) -> None:
-    from bot.config import Settings
-    assert Settings._parse_id_list("1, 2;3") == [1, 2, 3]
-    assert Settings._parse_id_list("") == []
-    assert Settings._parse_id_list(7) == [7]
+    from bot.config import Settings, parse_id_list
+    assert parse_id_list("1, 2;3") == [1, 2, 3]
+    assert parse_id_list("") == []
+    assert parse_id_list(7) == [7]
+    assert parse_id_list("[1, 2]") == [1, 2]
+    # Через окружение: список через запятую не должен падать на json.loads.
+    monkeypatch.setenv("TELEGRAM_ADMINS", "6124427627,495039871")
+    monkeypatch.setenv("TELEGRAM_PRIVATE_USERS", "5")
+    st = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert st.telegram_admins == [6124427627, 495039871]
+    assert st.telegram_private_users == [5]
 
 
 # ---------------------------------------------------------------- media_ai helpers / workspaces
