@@ -130,6 +130,25 @@ def _menu_kb(admin: bool) -> ReplyKeyboardMarkup:
 
 # user_id → что ждём следующим сообщением ("ws_name")
 _awaiting: dict[int, str] = {}
+
+INBOX_TOPIC_NAME = "📥 Входящие"
+# Имена тем, которые Telegram даёт сам при первом сообщении «из корня» чата.
+_AUTO_TOPIC_NAMES = {
+    "media", "медиа", "voice message", "голосовое сообщение", "photo", "фото", "video", "видео",
+    "document", "файл", "документ", "sticker", "стикер", "gif", "video message", "видеосообщение",
+    "audio", "аудио", "new topic", "новая тема",
+}
+
+
+def _looks_auto_topic(name: str, first_text: str) -> bool:
+    """Тема создана Telegram автоматически (а не пользователем через «Новая тема»)?"""
+    n = (name or "").strip().lower().rstrip("…. ")
+    if not n or n in _AUTO_TOPIC_NAMES:
+        return True
+    t = (first_text or "").strip().lower()
+    if t and (t.startswith(n[:20]) or n.startswith(t[:20])):
+        return True
+    return False
 # user_id → последний показанный список артефактов (для /show 3, /share 2 …)
 _last_listing: dict[int, list[Artifact]] = {}
 # token → (user_id, text_markdown | "@file:<rel>", title|comment)
@@ -337,6 +356,36 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             return None
         return orch.personal_space(uid, _display_name(msg))  # type: ignore[arg-type]
 
+    async def _ensure_inbox_topic(chat_id: int) -> int | None:
+        """Тема «📥 Входящие» для всего, что не по проекту: иначе каждое сообщение из
+        корня чата открывает новую авто-тему. Создаётся один раз на пользователя."""
+        key = f"inbox_topic_{chat_id}"
+        stored = await db.get_state(key, "")
+        if stored:
+            return int(stored) if stored.isdigit() else None
+        try:
+            topic = await bot.create_forum_topic(chat_id=chat_id, name=INBOX_TOPIC_NAME)
+        except Exception as exc:  # noqa: BLE001
+            log.info("inbox topic not created for %s: %s", chat_id, exc)
+            await db.set_state(key, "0")
+            return None
+        tid = topic.message_thread_id
+        await db.set_state(key, str(tid))
+        await db.upsert_workspace(chat_id, tid, INBOX_TOPIC_NAME, None)
+        try:
+            await bot.send_message(
+                chat_id,
+                "📥 Это <b>Входящие</b> — пиши сюда всё, что не относится к конкретному проекту: "
+                "мысли, вопросы, «посмотри/проверь…». Для проекта создай тему (/ws new &lt;имя&gt; "
+                "или попроси меня) — тогда всё в ней ляжет в его страницу.\n"
+                "Сообщения, отправленные из списка тем, Telegram сам оборачивает в новую тему — "
+                "лучше писать внутри Входящих или темы проекта.",
+                message_thread_id=tid, parse_mode="HTML",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("inbox greet failed: %s", exc)
+        return tid
+
     async def _create_workspace(space: PersonalSpace, chat_id: int, name: str) -> tuple[bool, str, int | None]:
         """Создать тему в личке + проект. Возвращает (ok, текст, thread_id)."""
         name = (name or "").strip()[:128]
@@ -419,6 +468,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             return dict(row) if row["project_slug"] else None
         name = (name_hint or await _topic_name(msg, tid)).strip()[:128]
         await db.upsert_workspace(msg.chat.id, tid, name, None)  # известна, не привязана
+        if _looks_auto_topic(name, msg.text or msg.caption or ""):
+            return None  # Telegram сам открыл тему по первому сообщению — просто чат
         try:
             await msg.answer(
                 f"🆕 Новая тема «{_esc(name)}». Сделать её воркспейсом? Тогда всё в ней "
@@ -565,6 +616,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             return
         orch.personal_space(uid, _display_name(msg))  # type: ignore[arg-type]
         await msg.reply(HELP_TEXT, parse_mode="HTML", reply_markup=_menu_kb(is_admin(uid)))
+        await _ensure_inbox_topic(msg.chat.id)
 
     @router.message(Command("menu"))
     async def cmd_menu(msg: Message) -> None:
@@ -1371,13 +1423,14 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             name = (msg.forum_topic_created.name or f"тема {tid}")[:128]
             if await db.get_workspace(msg.chat.id, tid) is None:
                 await db.upsert_workspace(msg.chat.id, tid, name, None)
-                try:
-                    await msg.answer(
-                        f"🆕 Тема «{_esc(name)}». Сделать её воркспейсом (проектом)?",
-                        parse_mode="HTML", reply_markup=_bind_kb(tid, name),
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("bind hint failed: %s", exc)
+                if not _looks_auto_topic(name, "") and name != INBOX_TOPIC_NAME:
+                    try:
+                        await msg.answer(
+                            f"🆕 Тема «{_esc(name)}». Сделать её воркспейсом (проектом)?",
+                            parse_mode="HTML", reply_markup=_bind_kb(tid, name),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("bind hint failed: %s", exc)
             return
         if msg.forum_topic_edited and msg.message_thread_id:
             name = msg.forum_topic_edited.name

@@ -406,3 +406,12 @@ def test_menu_keyboard() -> None:
     kb_admin = _menu_kb(admin=True)
     assert BTN_ADMIN in {b.text for row in kb_admin.keyboard for b in row}
     assert kb.is_persistent and kb.resize_keyboard
+
+
+def test_looks_auto_topic() -> None:
+    from bot.handlers.private import _looks_auto_topic
+    assert _looks_auto_topic("Media", "")
+    assert _looks_auto_topic("Медиа", "")
+    assert _looks_auto_topic("привет, запомни что", "Привет, запомни что драйвер греется")
+    assert not _looks_auto_topic("Роббокс", "сегодня поменял драйвер")
+    assert not _looks_auto_topic("Личное", "")
