@@ -584,6 +584,17 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 if not rows:
                     return "Воркспейсов нет."
                 return "\n".join(f"- {r['name']} → wiki/projects/{r['project_slug']}.md" for r in rows)
+            if action == "set_workspace_icon":
+                tid = _thread_id(msg)
+                if tid is None:
+                    return "ERROR: разговор идёт не в теме — значок менять нечему"
+                row = await db.get_workspace(msg.chat.id, tid)
+                name = (row["name"] if row else None) or await _topic_name(msg, tid)
+                wanted = str(args.get("emoji") or "").strip() or None
+                emoji = await _set_topic_icon(msg.chat.id, tid, name, wanted)
+                if not emoji:
+                    return "ERROR: не удалось поставить значок (Telegram отказал или набор значков недоступен)"
+                return f"OK: значок темы «{name}» → {emoji}"
             if action == "rename_workspace":
                 tid = _thread_id(msg)
                 if tid is None:
@@ -678,12 +689,19 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 log.info("get_forum_topic_icon_stickers failed: %s", exc)
         return _icons
 
-    async def _pick_icon(name: str) -> str | None:
-        """custom_emoji_id значка темы по смыслу имени: правила → LLM → дефолт."""
+    async def _pick_icon(name: str, wanted: str | None = None) -> str | None:
+        """custom_emoji_id значка темы: желаемый эмодзи → правила по имени → LLM → дефолт."""
         icons = await _topic_icons()
         if not icons:
             return None
-        emoji = _icon_by_rules(name)
+        if wanted:
+            w = wanted.strip()
+            for key in (w, w.replace("\ufe0f", ""), w + "\ufe0f"):
+                if key in icons:
+                    return icons[key]
+            # нет такого в наборе — попросим LLM выбрать ближайший
+            name = f"{name} (пользователь хочет значок вроде {w})"
+        emoji = _icon_by_rules(name) if not wanted else None
         if emoji is None:
             try:
                 choices = " ".join(sorted(set(k for k in icons if k)))
@@ -714,14 +732,18 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 log.info("create_forum_topic with icon failed (%s), retry without", exc)
         return await bot.create_forum_topic(chat_id=chat_id, name=name)
 
-    async def _set_topic_icon(chat_id: int, tid: int, name: str) -> None:
-        icon_id = await _pick_icon(name)
+    async def _set_topic_icon(chat_id: int, tid: int, name: str, wanted: str | None = None) -> str | None:
+        """Поставить значок теме. Возвращает эмодзи, который поставили, или None."""
+        icon_id = await _pick_icon(name, wanted)
         if not icon_id:
-            return
+            return None
         try:
             await bot.edit_forum_topic(chat_id=chat_id, message_thread_id=tid, icon_custom_emoji_id=icon_id)
         except Exception as exc:  # noqa: BLE001
-            log.debug("edit_forum_topic icon failed: %s", exc)
+            log.info("edit_forum_topic icon failed: %s", exc)
+            return None
+        icons = await _topic_icons()
+        return next((e for e, i in icons.items() if i == icon_id), None)
 
     async def _bot_username() -> str:
         if not _bot_user.get("name"):
@@ -1156,6 +1178,17 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             )
             await _reply_html(msg, ("✅ " if res.startswith("OK") else "❌ ") + res)
             return
+        if sub == "icon":
+            tid = _thread_id(msg)
+            if tid is None:
+                await msg.reply("Команда /ws icon работает внутри темы.")
+                return
+            row = await db.get_workspace(msg.chat.id, tid)
+            name = (row["name"] if row else None) or await _topic_name(msg, tid)
+            emoji = await _set_topic_icon(msg.chat.id, tid, name, rest.strip() or None)
+            await msg.reply(f"{emoji} Значок темы «{_esc(name)}» обновлён." if emoji else
+                            "❌ Не удалось поставить значок.", parse_mode="HTML")
+            return
         if sub == "list":
             rows = [r for r in await db.list_workspaces(msg.chat.id) if r["project_slug"]]
             if not rows:
@@ -1203,7 +1236,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             f"Связанных страниц: {pages}.\n"
             "/ws <имя> — переименовать · /show " + _esc(ws['project_slug']) + " — страница проекта\n"
             "/ws share <чат> [topic] [комментарий] — выгрузить весь воркспейс "
-            "(topic = в отдельную тему группы с тем же именем).",
+            "(topic = в отдельную тему группы с тем же именем) · /ws icon [эмодзи] — значок.",
             parse_mode="HTML", reply_markup=_share_keyboard(token),
         )
 

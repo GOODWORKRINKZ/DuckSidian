@@ -600,6 +600,21 @@ PERSONAL_EXTRA_TOOLS += [
     {
         "type": "function",
         "function": {
+            "name": "set_workspace_icon",
+            "description": (
+                "Сменить значок (иконку) ТЕКУЩЕЙ темы-воркспейса. Без emoji — подобрать по смыслу "
+                "названия темы автоматически; с emoji — поставить указанный (из набора значков тем "
+                "Telegram; если такого нет, подбирается ближайший). Работает только внутри темы."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"emoji": {"type": "string", "description": "Желаемый эмодзи (опц.)"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "rename_workspace",
             "description": (
                 "Переименовать ТЕКУЩИЙ воркспейс (тему, в которой идёт разговор) и перепривязать "
@@ -1068,7 +1083,7 @@ class ToolExecutor:
                     return "ERROR: missing 'path'"
                 res = await process_attachment(self.wiki, rel)
                 return res.agent_block()
-            if name in ("create_workspace", "list_workspaces", "rename_workspace"):
+            if name in ("create_workspace", "list_workspaces", "rename_workspace", "set_workspace_icon"):
                 if self._workspace_fn is None:
                     return "ERROR: управление воркспейсами недоступно в этом режиме"
                 return await self._workspace_fn(name, dict(arguments or {}))
