@@ -139,8 +139,48 @@ INBOX_TOPIC_NAME = "📥 Входящие"
 _AUTO_TOPIC_NAMES = {
     "media", "медиа", "voice message", "голосовое сообщение", "photo", "фото", "video", "видео",
     "document", "файл", "документ", "sticker", "стикер", "gif", "video message", "видеосообщение",
-    "audio", "аудио", "new topic", "новая тема",
+    "audio", "аудио", "new topic", "новая тема", "new chat", "новый чат", "chat", "чат",
 }
+
+# Подбор значка темы по смыслу: ключевые слова → эмодзи из набора Telegram
+# (getForumTopicIconStickers). Если не подошло — один короткий вызов LLM.
+_ICON_RULES: list[tuple[str, str]] = [
+    (r"входящ|inbox|общ", "💬"),
+    (r"бизнес|кейс|финанс|деньг|бюджет|инвест|продаж|клиент", "💼"),
+    (r"видео|youtube|ютуб|ролик|кино|фильм", "🎬"),
+    (r"иде[яи]|брейншторм|гипотез", "💡"),
+    (r"личн|мысл|дневник|заметк|notes", "📝"),
+    (r"робот|бот|ровер|дрон|ai|ии|нейро|llm", "🤖"),
+    (r"код|софт|программ|dev|разработ|git|ros", "💻"),
+    (r"учеб|курс|обучен|книг|лекци|конспект", "📚"),
+    (r"исслед|поиск|анализ|research|обзор", "🔎"),
+    (r"дом|ремонт|квартир|дача", "🏠"),
+    (r"авто|машин|мото|гараж", "🚗"),
+    (r"путеш|поездк|отпуск|перелёт|командиров", "✈️"),
+    (r"здоров|медиц|врач|лечен", "🩺"),
+    (r"наук|лаб|эксперимент|физик|хими", "🧪"),
+    (r"музык|песн|трек", "🎵"),
+    (r"еда|рецепт|кухн|ресторан", "🍽"),
+    (r"спорт|трениров|бег|зал", "🏆"),
+    (r"покуп|заказ|закуп|1688|карго|постав|склад|логист", "🛒"),
+    (r"команд|люди|hr|найм|сотрудник", "👨‍👩‍👧‍👦"),
+    (r"маркет|реклам|promo|smm|контент", "📣"),
+    (r"дизайн|арт|рисун|график", "🎨"),
+    (r"игр|game", "🎮"),
+    (r"электрон|плат|pcb|схем|датчик|сенсор", "⚡️"),
+    (r"документ|договор|юрид|бухгалт|налог", "📁"),
+    (r"встреч|календар|план|расписан", "📆"),
+    (r"метрик|статист|отчёт|kpi|рост", "📈"),
+]
+_DEFAULT_ICON = "📁"
+
+
+def _icon_by_rules(name: str) -> str | None:
+    low = (name or "").lower()
+    for pat, emoji in _ICON_RULES:
+        if re.search(pat, low):
+            return emoji
+    return None
 
 
 def _looks_auto_topic(name: str, first_text: str) -> bool:
@@ -373,7 +413,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         if stored:
             return int(stored) if stored.isdigit() else None
         try:
-            topic = await bot.create_forum_topic(chat_id=chat_id, name=INBOX_TOPIC_NAME)
+            topic = await _create_topic(chat_id, INBOX_TOPIC_NAME)
         except Exception as exc:  # noqa: BLE001
             log.info("inbox topic not created for %s: %s", chat_id, exc)
             await db.set_state(key, "0")
@@ -514,7 +554,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         if not name:
             return False, "пустое имя", None
         try:
-            topic = await bot.create_forum_topic(chat_id=chat_id, name=name)
+            topic = await _create_topic(chat_id, name)
         except Exception as exc:  # noqa: BLE001
             return False, (
                 f"не удалось создать тему: {exc}. Включи у бота в @BotFather режим тем для "
@@ -615,6 +655,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             await bot.edit_forum_topic(chat_id=chat_id, message_thread_id=tid, name=name)
         except Exception as exc:  # noqa: BLE001
             log.debug("edit_forum_topic failed: %s", exc)
+        await _set_topic_icon(chat_id, tid, name)
         return slug
 
     async def _voice_mode(user_id: int) -> str:
@@ -624,6 +665,63 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         return await db.get_state(f"voice_id_{user_id}", settings.minimax_tts_voice)
 
     _bot_user: dict[str, str] = {}
+    _icons: dict[str, str] = {}  # emoji → custom_emoji_id
+
+    async def _topic_icons() -> dict[str, str]:
+        if not _icons:
+            try:
+                for st in await bot.get_forum_topic_icon_stickers():
+                    if st.emoji and st.custom_emoji_id:
+                        _icons.setdefault(st.emoji, st.custom_emoji_id)
+                        _icons.setdefault(st.emoji.replace("\ufe0f", ""), st.custom_emoji_id)
+            except Exception as exc:  # noqa: BLE001
+                log.info("get_forum_topic_icon_stickers failed: %s", exc)
+        return _icons
+
+    async def _pick_icon(name: str) -> str | None:
+        """custom_emoji_id значка темы по смыслу имени: правила → LLM → дефолт."""
+        icons = await _topic_icons()
+        if not icons:
+            return None
+        emoji = _icon_by_rules(name)
+        if emoji is None:
+            try:
+                choices = " ".join(sorted(set(k for k in icons if k)))
+                resp = await orch.client.chat(
+                    messages=[
+                        {"role": "system", "content": (
+                            "Выбери ОДИН эмодзи из списка, который лучше всего подходит как значок "
+                            "темы/проекта с данным названием. Ответь только самим эмодзи.")},
+                        {"role": "user", "content": f"Название: {name}\nСписок: {choices}"},
+                    ],
+                    tools=None, temperature=0,
+                )
+                cand = (resp["choices"][0]["message"].get("content") or "").strip()
+                cand = re.sub(r"<think>.*?</think>", "", cand, flags=re.S).strip()
+                emoji = next((k for k in sorted(icons, key=len, reverse=True) if k and k in cand), None)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("icon LLM pick failed: %s", exc)
+        emoji = emoji or _DEFAULT_ICON
+        return icons.get(emoji) or icons.get(emoji.replace("\ufe0f", "")) or icons.get(_DEFAULT_ICON)
+
+    async def _create_topic(chat_id: int, name: str):
+        """createForumTopic со значком по смыслу; при отказе — без значка."""
+        icon_id = await _pick_icon(name)
+        if icon_id:
+            try:
+                return await bot.create_forum_topic(chat_id=chat_id, name=name, icon_custom_emoji_id=icon_id)
+            except Exception as exc:  # noqa: BLE001
+                log.info("create_forum_topic with icon failed (%s), retry without", exc)
+        return await bot.create_forum_topic(chat_id=chat_id, name=name)
+
+    async def _set_topic_icon(chat_id: int, tid: int, name: str) -> None:
+        icon_id = await _pick_icon(name)
+        if not icon_id:
+            return
+        try:
+            await bot.edit_forum_topic(chat_id=chat_id, message_thread_id=tid, icon_custom_emoji_id=icon_id)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("edit_forum_topic icon failed: %s", exc)
 
     async def _bot_username() -> str:
         if not _bot_user.get("name"):

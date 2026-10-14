@@ -576,3 +576,13 @@ def test_path_ref_and_wikilink_regex() -> None:
     wl = re.compile(r"!?\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|([^\]]*))?\]\]")
     m = wl.search("[[БиБа|проект]] и ![[raw/assets/a.jpg]]")
     assert m and m.group(1) == "БиБа" and m.group(2) == "проект"
+
+
+def test_icon_by_rules_and_auto_names() -> None:
+    from bot.handlers.private import _icon_by_rules, _looks_auto_topic
+    assert _icon_by_rules("Бизнес-кейсы") == "💼"
+    assert _icon_by_rules("Разборы видео с ютуба") == "🎬"
+    assert _icon_by_rules("Роббокс") == "🤖"
+    assert _icon_by_rules("Закупки 1688") == "🛒"
+    assert _icon_by_rules("Что-то непонятное") is None
+    assert _looks_auto_topic("New Chat", "") and _looks_auto_topic("Новый чат", "")

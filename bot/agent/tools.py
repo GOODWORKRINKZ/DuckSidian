@@ -374,6 +374,27 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "summarize_file",
+            "description": (
+                "Сжать БОЛЬШОЙ файл (транскрипт видео, экспорт чата, длинный документ) в "
+                "структурированный конспект одним вызовом вместо чтения по кускам: тезисы, "
+                "факты/цифры/имена, таймкоды или даты, выводы. focus — на что обратить внимание "
+                "(например «бизнес-кейсы и ошибки», «решения по моторам»). До ~120k символов."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "focus": {"type": "string", "default": ""},
+                    "max_words": {"type": "integer", "default": 600},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "fetch_file",
             "description": (
                 "Скачать ФАЙЛ по прямой ссылке (zip/pdf/docx/xlsx/txt/json/html…) в vault "
@@ -890,6 +911,40 @@ class ToolExecutor:
                 return await self._fetch_url(arguments["url"])
             if name == "fetch_image":
                 return await self._fetch_image(str(arguments.get("url", "")))
+            if name == "summarize_file":
+                if self._ds is None:
+                    return "ERROR: LLM недоступен для summarize_file"
+                path = self.wiki.find_md(str(arguments.get("path", "")))
+                try:
+                    text = self.wiki.read_file(path, max_bytes=600_000)
+                except WikiPathError as exc:
+                    return f"ERROR: {exc}"
+                cap = 120_000
+                note = ""
+                if len(text) > cap:
+                    note = f"\n\n[файл {len(text)} символов — сжаты первые {cap}]"
+                    text = text[:cap]
+                focus = str(arguments.get("focus") or "").strip()
+                max_words = max(150, min(int(arguments.get("max_words") or 600), 1500))
+                sys_prompt = (
+                    "Ты делаешь конспект документа для базы знаний. Верни структурированный markdown: "
+                    "1) о чём документ (2–3 предложения); 2) ключевые тезисы/факты/цифры/имена — "
+                    "буллетами, КАЖДЫЙ с таймкодом [m:ss] или датой/строкой, если они есть в тексте; "
+                    "3) выводы/что полезно. Без воды, по-русски, "
+                    f"до {max_words} слов." + (f" Особое внимание: {focus}." if focus else "")
+                )
+                try:
+                    resp = await self._ds.chat(
+                        messages=[{"role": "system", "content": sys_prompt},
+                                  {"role": "user", "content": f"Файл {path}:\n\n{text}"}],
+                        tools=None, temperature=0.2,
+                    )
+                    out = (resp["choices"][0]["message"].get("content") or "").strip()
+                except Exception as exc:  # noqa: BLE001
+                    return f"ERROR summarize_file: {exc}"
+                import re as _re
+                out = _re.sub(r"<think>.*?</think>", "", out, flags=_re.S).strip()
+                return f"[конспект {path}]\n{out}{note}"
             if name == "fetch_file":
                 from ..intake import download_url_to_vault, process_attachment  # noqa: PLC0415
                 url = str(arguments.get("url", "")).strip()
