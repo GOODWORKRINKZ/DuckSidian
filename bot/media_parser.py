@@ -22,7 +22,17 @@ log = logging.getLogger(__name__)
 
 # ── PDF ──────────────────────────────────────────────────────────────────────
 
-def _extract_pdf(path: Path) -> str:
+DEFAULT_EXTRACT_LIMIT = 8000
+
+
+def _cap(text: str, limit: int | None) -> str:
+    lim = limit or DEFAULT_EXTRACT_LIMIT
+    if len(text) > lim:
+        return text[:lim] + f"\n...(обрезано, всего {len(text)} символов)"
+    return text
+
+
+def _extract_pdf(path: Path, limit: int | None = None) -> str:
     try:
         from pypdf import PdfReader  # type: ignore[import]
     except ImportError:
@@ -36,11 +46,7 @@ def _extract_pdf(path: Path) -> str:
                 pages.append(f"[стр. {i + 1}]\n{text.strip()}")
         if not pages:
             return "(PDF без извлекаемого текста — возможно, сканированный)"
-        total = sum(len(p) for p in pages)
-        result = "\n\n".join(pages)
-        if total > 8000:
-            result = result[:8000] + f"\n...(обрезано, всего ~{total} символов)"
-        return result
+        return _cap("\n\n".join(pages), limit)
     except Exception as exc:  # noqa: BLE001
         log.warning("PDF extract failed: %s", exc)
         return f"(ошибка чтения PDF: {exc})"
@@ -48,18 +54,21 @@ def _extract_pdf(path: Path) -> str:
 
 # ── DOCX ─────────────────────────────────────────────────────────────────────
 
-def _extract_docx(path: Path) -> str:
+def _extract_docx(path: Path, limit: int | None = None) -> str:
     try:
         import docx  # type: ignore[import]
     except ImportError:
         return "(python-docx не установлен — pip install python-docx)"
     try:
         doc = docx.Document(str(path))
-        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-        text = "\n".join(paragraphs)
-        if len(text) > 8000:
-            text = text[:8000] + "\n...(обрезано)"
-        return text or "(документ пуст)"
+        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        for table in getattr(doc, "tables", []):
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells]
+                if any(cells):
+                    parts.append("| " + " | ".join(cells) + " |")
+        text = "\n".join(parts)
+        return _cap(text, limit) or "(документ пуст)"
     except Exception as exc:  # noqa: BLE001
         log.warning("DOCX extract failed: %s", exc)
         return f"(ошибка чтения DOCX: {exc})"
@@ -67,7 +76,33 @@ def _extract_docx(path: Path) -> str:
 
 # ── XLSX ─────────────────────────────────────────────────────────────────────
 
-def _extract_xlsx(path: Path) -> str:
+def _extract_pptx(path: Path, limit: int | None = None) -> str:
+    try:
+        from pptx import Presentation  # type: ignore[import]
+    except ImportError:
+        return "(python-pptx не установлен — pip install python-pptx)"
+    try:
+        prs = Presentation(str(path))
+        parts: list[str] = []
+        for i, slide in enumerate(prs.slides, 1):
+            texts: list[str] = []
+            for shape in slide.shapes:
+                if getattr(shape, "has_text_frame", False) and shape.text_frame.text.strip():
+                    texts.append(shape.text_frame.text.strip())
+                if getattr(shape, "has_table", False):
+                    for row in shape.table.rows:
+                        cells = [c.text.strip() for c in row.cells]
+                        if any(cells):
+                            texts.append("| " + " | ".join(cells) + " |")
+            if texts:
+                parts.append(f"## Слайд {i}\n" + "\n".join(texts))
+        return _cap("\n\n".join(parts), limit) or "(презентация без текста)"
+    except Exception as exc:  # noqa: BLE001
+        log.warning("PPTX extract failed: %s", exc)
+        return f"(ошибка чтения PPTX: {exc})"
+
+
+def _extract_xlsx(path: Path, limit: int | None = None) -> str:
     try:
         import openpyxl  # type: ignore[import]
     except ImportError:
@@ -87,10 +122,7 @@ def _extract_xlsx(path: Path) -> str:
                     if row_count >= 200:
                         lines.append("...(строки обрезаны)")
                         break
-        text = "\n".join(lines)
-        if len(text) > 8000:
-            text = text[:8000] + "\n...(обрезано)"
-        return text or "(таблица пуста)"
+        return _cap("\n".join(lines), limit) or "(таблица пуста)"
     except Exception as exc:  # noqa: BLE001
         log.warning("XLSX extract failed: %s", exc)
         return f"(ошибка чтения XLSX: {exc})"
@@ -98,12 +130,9 @@ def _extract_xlsx(path: Path) -> str:
 
 # ── PLAIN TEXT ────────────────────────────────────────────────────────────────
 
-def _extract_text(path: Path) -> str:
+def _extract_text(path: Path, limit: int | None = None) -> str:
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        if len(text) > 8000:
-            text = text[:8000] + f"\n...(обрезано, всего {len(text)} символов)"
-        return text
+        return _cap(path.read_text(encoding="utf-8", errors="replace"), limit)
     except Exception as exc:  # noqa: BLE001
         return f"(ошибка чтения файла: {exc})"
 
@@ -359,27 +388,29 @@ async def transcribe_video(video_path: Path) -> str:
         return await transcribe_audio(audio_path)
 
 
-async def extract_text_from_file(path: Path) -> str | None:
+async def extract_text_from_file(path: Path, limit: int | None = None) -> str | None:
     """Попытаться извлечь текст из файла по расширению.
 
+    limit — максимум символов (по умолчанию 8000; для sidecar-файлов — больше).
     Возвращает строку с текстом или None если тип не поддерживается.
     """
     ext = path.suffix.lower()
+    loop = asyncio.get_running_loop()
 
     if ext == ".pdf":
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _extract_pdf, path)
+        return await loop.run_in_executor(None, _extract_pdf, path, limit)
 
     if ext in {".docx"}:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _extract_docx, path)
+        return await loop.run_in_executor(None, _extract_docx, path, limit)
+
+    if ext in {".pptx"}:
+        return await loop.run_in_executor(None, _extract_pptx, path, limit)
 
     if ext in {".xlsx", ".xls"}:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _extract_xlsx, path)
+        return await loop.run_in_executor(None, _extract_xlsx, path, limit)
 
     if ext in TEXT_EXTENSIONS:
-        return _extract_text(path)
+        return _extract_text(path, limit)
 
     if ext in AUDIO_EXTENSIONS:
         return await transcribe_audio(path)

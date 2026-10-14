@@ -42,6 +42,7 @@ from aiogram.types import (
 
 from ..config import settings
 from ..db import DB
+from ..intake import IntakeResult, process_attachment
 from ..media_ai import MediaAIError, get_media_ai
 from ..media_parser import (
     AUDIO_EXTENSIONS,
@@ -58,6 +59,7 @@ from ..personal import (
     describe_space,
     slugify,
 )
+from ..telegraph import TelegraphClient, page_title
 from ..tg_format import md_to_tg_html
 from .admin_shared import (
     format_model_list,
@@ -155,6 +157,10 @@ _last_listing: dict[int, list[Artifact]] = {}
 _pending_share: dict[str, tuple[int, str, str]] = {}
 # token → (user_id, rel_path) — подтверждение удаления
 _pending_delete: dict[str, tuple[int, str]] = {}
+# token → (user_id, rel_path) — кнопки «📰 статьёй / 📄 файлом» под /show
+_pending_view: dict[str, tuple[int, str]] = {}
+# user_id → фоновая задача ingest (разбор импортированных дней в wiki)
+_ingest_tasks: dict[int, asyncio.Task] = {}
 _PENDING_MAX = 300
 # Кому уже сказали «нет доступа» (чтобы не спамить на каждое сообщение)
 _denied_notified: set[int] = set()
@@ -387,6 +393,119 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         except Exception as exc:  # noqa: BLE001
             log.debug("inbox greet failed: %s", exc)
         return tid
+
+    async def _offer_archive_ingest(msg: Message, space: PersonalSpace, intake: IntakeResult) -> None:
+        info = intake.archive
+        if info is None:
+            return
+        token = uuid.uuid4().hex[:10]
+        _pending_share[token] = (space.user_id, "@ingest", "")
+        _trim(_pending_share)
+        rows = [[InlineKeyboardButton(text=f"🧠 Разобрать в wiki ({len(info.dates)} дн.)", callback_data=f"ping:{token}")]]
+        if is_admin(space.user_id):
+            for c in settings.get_chats()[:3]:
+                rows.append([InlineKeyboardButton(text=f"📤 Импортировать в чат {c.name}", callback_data=f"pimp:{token}:{c.name}")])
+        _pending_view[token] = (space.user_id, intake.rel)
+        await msg.reply(md_to_tg_html(info.summary_md()) + "\n\nЧто делаем дальше?",
+                        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+    async def _run_ingest_bg(chat_id: int, thread_id: int | None, space: PersonalSpace) -> None:
+        """Фоновый разбор всех необработанных raw/daily/*.md личного vault (INGEST-агент)."""
+        done = 0
+        try:
+            while True:
+                out = await orch.ingest_raw_pending(space.cfg, limit=3)
+                if out.startswith("Все raw/daily") or out.startswith("Нет raw/daily"):
+                    break
+                done += 3
+                if done % 6 == 0:
+                    try:
+                        await bot.send_message(chat_id, f"⏳ Разобрано ~{done} дней, продолжаю… (/stop — остановить)",
+                                               message_thread_id=thread_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if "Ещё" not in out:
+                    break
+            await bot.send_message(chat_id, "✅ Импорт разобран: знания разложены по wiki/. "
+                                   "Спроси меня о чём-нибудь из переписки или смотри /list.",
+                                   message_thread_id=thread_id)
+        except asyncio.CancelledError:
+            await bot.send_message(chat_id, "⏹ Разбор остановлен.", message_thread_id=thread_id)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("bg ingest failed")
+            await bot.send_message(chat_id, f"⚠️ Разбор упал: {type(exc).__name__}: {exc}",
+                                   message_thread_id=thread_id)
+        finally:
+            _ingest_tasks.pop(space.user_id, None)
+
+    @router.callback_query(F.data.startswith("ping:"))
+    async def cb_ingest_imported(cb: CallbackQuery) -> None:
+        token = (cb.data or "").split(":", 1)[1]
+        entry = _pending_view.get(token)
+        if not entry or not cb.from_user or cb.from_user.id != entry[0]:
+            await cb.answer("⌛ устарело")
+            return
+        space = orch.personal_space(entry[0])
+        if space.user_id in _ingest_tasks and not _ingest_tasks[space.user_id].done():
+            await cb.answer("уже идёт разбор — /stop чтобы остановить", show_alert=True)
+            return
+        await cb.answer("запускаю разбор в фоне")
+        tid = cb.message.message_thread_id if cb.message and cb.message.is_topic_message else None
+        _ingest_tasks[space.user_id] = asyncio.create_task(_run_ingest_bg(cb.message.chat.id, tid, space))  # type: ignore[union-attr]
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            pass
+        await cb.message.answer("🧠 Разбираю импорт в wiki в фоне — это небыстро (LLM по каждому дню). "  # type: ignore[union-attr]
+                                "Напишу, когда закончу. /stop — остановить.")
+
+    @router.callback_query(F.data.startswith("pimp:"))
+    async def cb_import_to_chat(cb: CallbackQuery) -> None:
+        parts = (cb.data or "").split(":", 2)
+        if len(parts) != 3:
+            await cb.answer("bad data")
+            return
+        token, chat_name = parts[1], parts[2]
+        entry = _pending_view.get(token)
+        if not entry or not cb.from_user or cb.from_user.id != entry[0] or not is_admin(cb.from_user.id):
+            await cb.answer("⌛ устарело / нет прав")
+            return
+        target = settings.get_chat_by_name(chat_name)
+        if target is None:
+            await cb.answer("чат не найден")
+            return
+        space = orch.personal_space(entry[0])
+        await cb.answer("импортирую…")
+        try:
+            from ..orchestrator import _chat_wiki  # noqa: PLC0415
+            from ..archive_import import import_archive  # noqa: PLC0415
+            import shutil  # noqa: PLC0415
+            twiki = _chat_wiki(target)
+            # копируем архив в vault чата и импортируем туда же
+            src = space.root / entry[1]
+            date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            dst_rel = f"raw/assets/shared/{date}/u{space.user_id}_{src.name}"
+            (twiki.root / dst_rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, twiki.root / dst_rel)
+            info = import_archive(twiki, dst_rel)
+            text = md_to_tg_html(info.summary_md()) + (
+                "\n\nДни попадут в wiki чата при ближайшем авто-ingest (каждые 20 минут) или по /ingestfiles в группе."
+                if info.dates else "")
+        except Exception as exc:  # noqa: BLE001
+            log.exception("import to chat failed")
+            text = f"❌ {_esc(str(exc))}"
+        if cb.message:
+            await cb.message.answer(text, parse_mode="HTML")
+
+    @router.message(Command("stop"))
+    async def cmd_stop(msg: Message) -> None:
+        uid = msg.from_user.id if msg.from_user else 0
+        task = _ingest_tasks.get(uid)
+        if task and not task.done():
+            task.cancel()
+            await msg.reply("⏹ Останавливаю разбор…")
+        else:
+            await msg.reply("Фоновых задач нет.")
 
     async def _create_workspace(space: PersonalSpace, chat_id: int, name: str) -> tuple[bool, str, int | None]:
         """Создать тему в личке + проект. Возвращает (ok, текст, thread_id)."""
@@ -840,7 +959,10 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         ext = abs_path.suffix.lower()
         if ext == ".md":
             text = space.read_artifact(rel)
-            await _reply_html(msg, f"`{rel}`\n\n{text[:12000]}")
+            # Длинные страницы не заваливаем чанками: первые ~3500 символов + кнопки.
+            preview = text if len(text) <= 3500 else text[:3500].rsplit("\n", 1)[0] + "\n\n_… (дальше — кнопками ниже)_"
+            await _reply_html(msg, f"`{rel}`\n\n{preview}")
+            await msg.answer("Как удобнее смотреть?", reply_markup=_view_kb(space.user_id, rel))
         else:
             try:
                 if ext in _IMG_EXTS:
@@ -851,6 +973,60 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                     await msg.answer_document(FSInputFile(abs_path), caption=rel)
             except Exception as exc:  # noqa: BLE001
                 await msg.reply(f"Не удалось отправить файл: {exc}")
+
+    def _view_kb(user_id: int, rel: str) -> InlineKeyboardMarkup:
+        token = uuid.uuid4().hex[:10]
+        _pending_view[token] = (user_id, rel)
+        _trim(_pending_view)
+        row = [InlineKeyboardButton(text="📄 .md файл", callback_data=f"pfile:{token}")]
+        if settings.telegraph_enabled:
+            row.insert(0, InlineKeyboardButton(text="📰 Открыть статьёй", callback_data=f"ptg:{token}"))
+        return InlineKeyboardMarkup(inline_keyboard=[row])
+
+    @router.callback_query(F.data.startswith("pfile:"))
+    async def cb_send_file(cb: CallbackQuery) -> None:
+        token = (cb.data or "").split(":", 1)[1]
+        entry = _pending_view.get(token)
+        if not entry or not cb.from_user or cb.from_user.id != entry[0]:
+            await cb.answer("⌛ устарело")
+            return
+        space = orch.personal_space(entry[0])
+        path = space.root / entry[1]
+        await cb.answer()
+        try:
+            await cb.message.answer_document(FSInputFile(path), caption=entry[1])  # type: ignore[union-attr]
+        except Exception as exc:  # noqa: BLE001
+            if cb.message:
+                await cb.message.answer(f"Не удалось отправить файл: {_esc(str(exc))}", parse_mode="HTML")
+
+    @router.callback_query(F.data.startswith("ptg:"))
+    async def cb_telegraph(cb: CallbackQuery) -> None:
+        token = (cb.data or "").split(":", 1)[1]
+        entry = _pending_view.get(token)
+        if not entry or not cb.from_user or cb.from_user.id != entry[0]:
+            await cb.answer("⌛ устарело")
+            return
+        if not settings.telegraph_enabled:
+            await cb.answer("Telegraph выключен", show_alert=True)
+            return
+        space = orch.personal_space(entry[0])
+        rel = entry[1]
+        await cb.answer("публикую…")
+        try:
+            md = space.read_artifact(rel)
+            url = await TelegraphClient(db, author_name=space.display_name).publish_markdown(
+                md, title=page_title(md, rel.rsplit("/", 1)[-1][:-3]), author=space.display_name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("telegraph publish failed: %s", exc)
+            if cb.message:
+                await cb.message.answer(f"❌ Telegraph: {_esc(str(exc))}", parse_mode="HTML")
+            return
+        if cb.message:
+            await cb.message.answer(
+                f"📰 {url}\n<i>Страница публична по ссылке (без индексации).</i>",
+                parse_mode="HTML", disable_web_page_preview=False,
+            )
 
     @router.message(Command("del", "delete", "rm"))
     async def cmd_del(msg: Message, command: CommandObject) -> None:
@@ -1466,6 +1642,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         media_path: str | None = None
         transcript: str | None = None
         extracted: str | None = None
+        intake_block: str | None = None
         attached: list[str] = []
         ws = await _workspace(msg, space)
         ws_name = ws["name"] if ws else None
@@ -1482,18 +1659,21 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 abs_path = space.root / media_path
                 ext = abs_path.suffix.lower()
                 stop = asyncio.Event()
-                typing = asyncio.create_task(_typing_loop(bot, msg.chat.id, stop, _thread_id(msg)))
+                typing = asyncio.create_task(_typing_loop(bot, msg.chat.id, stop, _thread_id(msg),
+                                                          "upload_document" if media_type == "document" else "typing"))
                 try:
                     if media_type in {"voice", "audio"} or ext in AUDIO_EXTENSIONS:
                         transcript = await extract_text_from_file(abs_path)
                     elif media_type in {"video_note", "video"} or ext in VIDEO_EXTENSIONS:
                         transcript = await transcribe_video(abs_path)
                         attached.append(media_path)
-                    elif media_type == "document":
-                        extracted = await extract_text_from_file(abs_path)
+                    else:
+                        # документы, архивы, фото → единый приём: текст/OCR/описание + sidecar
+                        intake = await process_attachment(space.wiki, media_path, media_type)
                         attached.append(media_path)
-                    else:  # photo / animation / sticker → агент сам посмотрит через describe_media
-                        attached.append(media_path)
+                        intake_block = intake.agent_block()
+                        if intake.archive is not None and intake.archive.dates:
+                            await _offer_archive_ingest(msg, space, intake)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("private: media parse failed %s: %s", media_path, exc)
                 finally:
@@ -1512,6 +1692,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             parts.append(f"🎤 (голосовое, расшифровка): {transcript.strip()}")
         if extracted and not extracted.startswith("("):
             parts.append(f"📄 (содержимое файла {media_path}):\n{extracted.strip()[:6000]}")
+        if intake_block:
+            parts.append(intake_block)
         full_text = "\n\n".join(parts).strip()
         if not full_text and not attached:
             await msg.reply("Пустое сообщение — нечего обрабатывать.")

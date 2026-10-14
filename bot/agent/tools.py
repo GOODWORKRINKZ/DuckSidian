@@ -530,6 +530,23 @@ PERSONAL_EXTRA_TOOLS += [
     },
 ]
 
+PERSONAL_EXTRA_TOOLS.append({
+    "type": "function",
+    "function": {
+        "name": "extract_archive",
+        "description": (
+            "Распаковать zip-архив из vault (raw/assets/...) в raw/imports/<имя>/ и разобрать: "
+            "экспорт чата WhatsApp/Telegram раскладывается по raw/daily/<дата>.md, документы "
+            "внутри — в текст. Возвращает сводку: что внутри, какие файлы/даты появились."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+})
+
 _PERSONAL_EXCLUDE = {"ask_user", "defer_question", "tag_media"}
 
 
@@ -895,6 +912,13 @@ class ToolExecutor:
                     paths.append(rel.replace("\\", "/"))
                 return "OK: сгенерировано " + str(len(paths)) + " файл(ов):\n" + "\n".join(paths) + \
                     "\nДобавь нужные в блок IMAGES: в finish()."
+            if name == "extract_archive":
+                from ..intake import process_attachment  # noqa: PLC0415
+                rel = str(arguments.get("path", "")).strip()
+                if not rel:
+                    return "ERROR: missing 'path'"
+                res = await process_attachment(self.wiki, rel)
+                return res.agent_block()
             if name in ("create_workspace", "list_workspaces", "rename_workspace"):
                 if self._workspace_fn is None:
                     return "ERROR: управление воркспейсами недоступно в этом режиме"

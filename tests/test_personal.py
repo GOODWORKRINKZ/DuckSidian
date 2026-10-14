@@ -415,3 +415,87 @@ def test_looks_auto_topic() -> None:
     assert _looks_auto_topic("привет, запомни что", "Привет, запомни что драйвер греется")
     assert not _looks_auto_topic("Роббокс", "сегодня поменял драйвер")
     assert not _looks_auto_topic("Личное", "")
+
+
+def test_md_to_telegraph_nodes() -> None:
+    from bot.telegraph import md_to_nodes, page_title
+    md = ("---\ntype: note\ntitle: \"Заметка\"\n---\n# Заметка\n\nАбзац с **жирным**, `кодом`, "
+          "[ссылкой](https://ex.com/a) и [[Роббокс|проектом]] ![[raw/assets/2026/x.jpg]].\n\n"
+          "## Раздел\n- пункт 1\n- [ ] задача\n\n> цитата\n\n```\ncode\n```\n---\n1. один\n2. два\n")
+    nodes = md_to_nodes(md)
+    tags = [n["tag"] for n in nodes]
+    assert tags == ["p", "h3", "ul", "blockquote", "pre", "hr", "ol"]
+    p = nodes[0]["children"]
+    assert {"tag": "b", "children": ["жирным"]} in p
+    assert {"tag": "code", "children": ["кодом"]} in p
+    assert any(isinstance(n, dict) and n["tag"] == "a" and n["attrs"]["href"] == "https://ex.com/a" for n in p)
+    assert {"tag": "b", "children": ["проектом"]} in p
+    assert {"tag": "i", "children": ["📎 x.jpg"]} in p
+    assert nodes[2]["children"][1]["children"][0].startswith("☐")
+    assert page_title(md, "fallback") == "Заметка"
+    assert page_title("# Заголовок\nтекст", "f") == "Заголовок"
+    assert page_title("текст", "f") == "f"
+
+
+def test_whatsapp_parse_and_daily(space: PersonalSpace) -> None:
+    from bot.archive_import import looks_like_whatsapp, parse_whatsapp, write_messages_as_daily
+    txt = ("Messages and calls are end-to-end encrypted.\n"
+           "[10/9/25, 10:22:09 AM] You: ага\n"
+           "[10/9/25, 11:29:05 AM] You: вопрос про винты\nM2*12 400шт\n"
+           "[10/10/25, 12:04:00 PM] +7 985 858-61-48: M2*12---0.03юаней\n")
+    assert looks_like_whatsapp(txt)
+    msgs = parse_whatsapp(txt)
+    assert len(msgs) == 3 and msgs[1]["text"] == "вопрос про винты\nM2*12 400шт"
+    assert msgs[2]["full_name"] == "+7 985 858-61-48" and msgs[0]["_dt"].strftime("%Y-%m-%d") == "2025-10-09"
+    days = write_messages_as_daily(space.wiki, msgs, source="test")
+    assert days == ["2025-10-09", "2025-10-10"]
+    d = (space.root / "raw/daily/2025-10-09.md").read_text(encoding="utf-8")
+    assert "^msg-2" in d and "вопрос про винты" in d and "Импорт: test" in d
+    assert write_messages_as_daily(space.wiki, msgs, source="test") == []  # идемпотентно
+
+
+def test_import_archive_zip_whatsapp_and_zipslip(space: PersonalSpace) -> None:
+    import zipfile
+    from bot.archive_import import import_archive, safe_extract
+    assets = space.root / "raw/assets/2026-10-14"
+    assets.mkdir(parents=True)
+    z = assets / "wa.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        zf.writestr("chat.txt", "[10/9/25, 10:22:09 AM] You: ага\n[10/9/25, 10:23:09 AM] Коля: ок\n[10/9/25, 10:24:09 AM] You: да\n")
+        zf.writestr("../evil.txt", "x")
+    info = import_archive(space.wiki, "raw/assets/2026-10-14/wa.zip")
+    assert info.kind == "whatsapp" and info.messages == 3 and info.dates == ["2025-10-09"]
+    assert (space.root / "raw/imports/wa/chat.txt").exists()
+    assert not (space.root / "raw/evil.txt").exists() and not (space.root / "evil.txt").exists()
+    assert "WhatsApp" in info.summary_md()
+    # generic archive
+    z2 = assets / "docs.zip"
+    with zipfile.ZipFile(z2, "w") as zf:
+        zf.writestr("readme.md", "# Readme\nпросто текст")
+        zf.writestr("data.bin", b"\x00\x01")
+    info2 = import_archive(space.wiki, "raw/assets/2026-10-14/docs.zip")
+    assert info2.kind == "generic" and info2.text_files == ["raw/imports/docs/readme.md"]
+
+
+@pytest.mark.asyncio
+async def test_intake_document_and_archive(space: PersonalSpace, monkeypatch: pytest.MonkeyPatch) -> None:
+    import zipfile
+    from bot.intake import process_attachment
+    monkeypatch.setattr(settings, "vision_provider", "off")
+    assets = space.root / "raw/assets/2026-10-14"
+    assets.mkdir(parents=True)
+    (assets / "spec.md").write_text("# Спека\n" + "строка\n" * 50, encoding="utf-8")
+    res = await process_attachment(space.wiki, "raw/assets/2026-10-14/spec.md", "document")
+    assert res.kind == "document" and res.sidecar == "raw/imports/spec.md.md"
+    side = (space.root / res.sidecar).read_text(encoding="utf-8")
+    assert "type: extracted" in side and "source: raw/assets/2026-10-14/spec.md" in side and "строка" in side
+    assert "ДОКУМЕНТ" in res.agent_block() and "raw/imports/spec.md.md" in res.agent_block()
+    z = assets / "a.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        zf.writestr("notes/n.txt", "заметка внутри архива")
+    res2 = await process_attachment(space.wiki, "raw/assets/2026-10-14/a.zip", "document")
+    assert res2.kind == "archive" and res2.archive is not None and res2.archive.kind == "generic"
+    assert "заметка внутри архива" in res2.text and res2.sidecar
+    (assets / "pic.png").write_bytes(b"PNG")
+    res3 = await process_attachment(space.wiki, "raw/assets/2026-10-14/pic.png", "photo")
+    assert res3.kind == "image" and res3.sidecar is None and res3.notes
