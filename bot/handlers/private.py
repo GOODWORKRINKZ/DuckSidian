@@ -207,6 +207,7 @@ _PENDING_MAX = 300
 _denied_notified: set[int] = set()
 # Последовательная обработка сообщений одного пользователя
 _user_locks: dict[int, asyncio.Lock] = {}
+_queue_depth: dict[int, int] = {}
 
 
 def _trim(d: dict) -> None:
@@ -1926,7 +1927,24 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             if await orch.deliver_answer(qid, msg.text):
                 await msg.reply("✅ ответ передан агенту")
                 return
-        async with _lock(space.user_id):
+        lk = _lock(space.user_id)
+        if lk.locked():
+            # Запросы одного пользователя идут строго по очереди (общие файлы, история
+            # диалога). Покажем, что сообщение принято и ждёт.
+            _queue_depth[space.user_id] = _queue_depth.get(space.user_id, 0) + 1
+            await _react(bot, msg, "⏳")
+            if _queue_depth[space.user_id] == 1:
+                try:
+                    await msg.reply("⏳ Принял, отвечу сразу после текущего запроса.")
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                async with lk:
+                    await _process_message(msg, space)
+            finally:
+                _queue_depth[space.user_id] = max(0, _queue_depth.get(space.user_id, 1) - 1)
+            return
+        async with lk:
             await _process_message(msg, space)
 
     async def _process_message(msg: Message, space: PersonalSpace) -> None:
