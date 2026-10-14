@@ -343,6 +343,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
 
     async def _guard(msg: Message) -> PersonalSpace | None:
         uid = msg.from_user.id if msg.from_user else None
+        if msg.from_user and msg.from_user.is_bot:
+            return None
         if not await is_private_allowed(db, uid):
             if uid not in _denied_notified:
                 _denied_notified.add(uid or 0)
@@ -1400,6 +1402,10 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
 
     @router.message()
     async def on_message(msg: Message) -> None:
+        # Служебные сообщения от ботов (в т.ч. «тема создана» от нас самих при
+        # create_forum_topic) — не пользовательский ввод и не запрос доступа.
+        if msg.from_user and msg.from_user.is_bot:
+            return
         space = await _guard(msg)
         if not space:
             return
