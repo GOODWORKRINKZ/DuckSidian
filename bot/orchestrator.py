@@ -366,6 +366,37 @@ class Orchestrator:
             commit_and_push(f"personal {space.user_id}: turn")
         return run.summary or "Не понял, переформулируй."
 
+    async def summarize_for_voice(self, text: str, max_chars: int | None = None) -> str:
+        """Сжать ответ в короткий устный пересказ для TTS: 1–3 фразы, суть, без
+        markdown, ссылок, путей и перечислений. Короткий текст возвращается как есть."""
+        from .media_ai import _md_for_tts  # noqa: PLC0415
+        limit = max_chars or settings.voice_reply_max_chars
+        plain = _md_for_tts(text)
+        if len(plain) <= limit:
+            return plain
+        sys_prompt = (
+            "Ты озвучиваешь ответ ассистента голосом. Перескажи СУТЬ ответа в 1–3 коротких "
+            f"разговорных фразах (до {limit} символов), по-русски, от первого лица, как сказал бы "
+            "человек вслух. Без markdown, без ссылок, без путей к файлам, без списков и цифр "
+            "в скобках. Если в ответе был вопрос пользователю — обязательно задай его. "
+            "Верни только текст для озвучки."
+        )
+        try:
+            resp = await self.client.chat(
+                messages=[{"role": "system", "content": sys_prompt},
+                          {"role": "user", "content": plain[:6000]}],
+                tools=None, temperature=0.3,
+            )
+            out = (resp["choices"][0]["message"].get("content") or "").strip()
+            from .agent.loop import _sanitize_summary  # noqa: PLC0415
+            out = _md_for_tts(_sanitize_summary(out))
+            if out:
+                return out[: limit * 2]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("summarize_for_voice failed: %s", exc)
+        cut = plain[:limit]
+        return cut.rsplit(". ", 1)[0] + "." if ". " in cut else cut
+
     async def share_to_chat(
         self,
         space: PersonalSpace,

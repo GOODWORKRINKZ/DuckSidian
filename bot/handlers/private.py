@@ -503,8 +503,9 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
     async def _voice_id(user_id: int) -> str:
         return await db.get_state(f"voice_id_{user_id}", settings.minimax_tts_voice)
 
-    async def _send_voice(msg: Message, space: PersonalSpace, text: str) -> bool:
-        """Озвучить текст и отправить голосовым. True если получилось."""
+    async def _send_voice(msg: Message, space: PersonalSpace, text: str, *, summarize: bool = False) -> bool:
+        """Озвучить текст и отправить голосовым. summarize=True — сначала сжать в короткий
+        устный пересказ сути (полный ответ уже ушёл текстом). True если получилось."""
         ai = get_media_ai()
         if not ai.tts_enabled:
             return False
@@ -513,8 +514,10 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         stop = asyncio.Event()
         typing = asyncio.create_task(_typing_loop(bot, msg.chat.id, stop, _thread_id(msg), "record_voice"))
         try:
-            path = await ai.tts_to_file(text[:_TTS_REPLY_MAX_CHARS], dst,
-                                        voice_id=await _voice_id(space.user_id))
+            speech = await orch.summarize_for_voice(text) if summarize else text[:_TTS_REPLY_MAX_CHARS]
+            if not speech.strip():
+                return False
+            path = await ai.tts_to_file(speech, dst, voice_id=await _voice_id(space.user_id))
             if path.suffix == ".ogg":
                 await msg.answer_voice(FSInputFile(path))
             else:
@@ -590,7 +593,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             await _attach_media(msg, answer, space.wiki.root)
         await _save_bot_reply(space, msg, display, sent_ids, ws_name)
         if voice and display:
-            await _send_voice(msg, space, display)
+            await _send_voice(msg, space, display, summarize=True)
         # Кнопка «поделиться ответом» — только для содержательных ответов.
         if len(display) >= 200 and settings.get_chats():
             token = uuid.uuid4().hex[:10]

@@ -181,6 +181,8 @@ class Settings(BaseSettings):
     # Голосовые ответы в личке: auto — отвечать голосом, если пользователь прислал голос;
     # on — всегда; off — никогда. Переключается per-user командой /voice.
     personal_voice_reply: str = "auto"
+    # Голосовой ответ — короткий устный пересказ сути (символов), полный текст остаётся сообщением.
+    voice_reply_max_chars: int = 350
 
     # --- Личный режим ---
     personal_agent_max_steps: int = 20
