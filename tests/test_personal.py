@@ -376,3 +376,33 @@ def test_step_line() -> None:
     assert _step_line("search_team_wiki", {"chat": "main", "query": "biba"}) == "🔎 ищу в wiki команды: main: biba"
     assert _step_line("web_search", {"query": "x" * 100}).endswith("x" * 60)
     assert _step_line("unknown_tool", {}) == "⚙️ unknown_tool"
+
+
+@pytest.mark.asyncio
+async def test_executor_workspace_tools(space: PersonalSpace) -> None:
+    calls: list[tuple[str, dict]] = []
+
+    async def ws_fn(action: str, args: dict) -> str:
+        calls.append((action, args))
+        return f"OK: {action}"
+
+    async def ask(_q, _o):
+        return ""
+    ex = ToolExecutor(space.wiki, ask, workspace_fn=ws_fn)
+    assert await ex.call("create_workspace", {"name": "Личное"}) == "OK: create_workspace"
+    assert await ex.call("list_workspaces", {}) == "OK: list_workspaces"
+    assert calls[0] == ("create_workspace", {"name": "Личное"})
+    ex2 = ToolExecutor(space.wiki, ask)
+    assert "ERROR" in await ex2.call("create_workspace", {"name": "x"})
+    names = {t["function"]["name"] for t in personal_tool_schemas()}
+    assert {"create_workspace", "list_workspaces", "rename_workspace", "generate_image"} <= names
+
+
+def test_menu_keyboard() -> None:
+    from bot.handlers.private import BTN_ADMIN, MENU_BUTTONS, _menu_kb
+    kb = _menu_kb(admin=False)
+    texts = {b.text for row in kb.keyboard for b in row}
+    assert BTN_ADMIN not in texts and texts <= MENU_BUTTONS
+    kb_admin = _menu_kb(admin=True)
+    assert BTN_ADMIN in {b.text for row in kb_admin.keyboard for b in row}
+    assert kb.is_persistent and kb.resize_keyboard

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -34,7 +35,9 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 
 from ..config import settings
@@ -57,10 +60,12 @@ from ..personal import (
 )
 from ..tg_format import md_to_tg_html
 from .admin_shared import (
+    format_model_list,
     handle_allow_command,
     handle_deny_command,
     handle_model_command,
     handle_users_command,
+    is_admin,
     is_private_allowed,
 )
 from .commands import _download_ask_media, _extract_image_refs, _react, _reply_html
@@ -105,6 +110,26 @@ HELP_TEXT = (
     "/model — модель LLM <i>(admin)</i> · /allow /deny /users — доступ <i>(admin)</i>\n"
 )
 
+# ---- постоянное меню (reply keyboard)
+BTN_WS, BTN_ART, BTN_PROJ, BTN_SPACE = "📌 Воркспейсы", "📂 Артефакты", "📁 Проекты", "📊 Пространство"
+BTN_VOICE, BTN_HELP, BTN_ADMIN = "🎙 Голос", "❓ Помощь", "🛡 Админ"
+MENU_BUTTONS = {BTN_WS, BTN_ART, BTN_PROJ, BTN_SPACE, BTN_VOICE, BTN_HELP, BTN_ADMIN}
+
+
+def _menu_kb(admin: bool) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text=BTN_WS), KeyboardButton(text=BTN_ART)],
+        [KeyboardButton(text=BTN_PROJ), KeyboardButton(text=BTN_SPACE)],
+        [KeyboardButton(text=BTN_VOICE), KeyboardButton(text=BTN_HELP)],
+    ]
+    if admin:
+        rows.append([KeyboardButton(text=BTN_ADMIN)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True,
+                               input_field_placeholder="Пиши или говори — я запишу / найду")
+
+
+# user_id → что ждём следующим сообщением ("ws_name")
+_awaiting: dict[int, str] = {}
 # user_id → последний показанный список артефактов (для /show 3, /share 2 …)
 _last_listing: dict[int, list[Artifact]] = {}
 # token → (user_id, text_markdown | "@file:<rel>", title|comment)
@@ -261,42 +286,163 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
 
     # ------------------------------------------------------------- helpers
 
+    async def _access_requests() -> list[dict]:
+        try:
+            return json.loads(await db.get_state("access_requests", "[]"))
+        except Exception:  # noqa: BLE001
+            return []
+
+    async def _set_access_requests(items: list[dict]) -> None:
+        await db.set_state("access_requests", json.dumps(items[-50:], ensure_ascii=False))
+
+    async def _register_access_request(msg: Message) -> None:
+        """Запомнить запрос доступа и разослать админам карточку с кнопками ✅/❌."""
+        u = msg.from_user
+        if not u:
+            return
+        items = await _access_requests()
+        if any(int(i.get("id", 0)) == u.id for i in items):
+            return
+        items.append({"id": u.id, "name": u.full_name, "username": u.username or "",
+                      "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")})
+        await _set_access_requests(items)
+        card = (
+            f"🔔 <b>Запрос доступа к личному режиму</b>\n"
+            f"{_esc(u.full_name)}" + (f" (@{_esc(u.username)})" if u.username else "") +
+            f" · id <code>{u.id}</code>\n"
+            f"Сообщение: <i>{_esc((msg.text or msg.caption or '(медиа)')[:200])}</i>"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Разрешить", callback_data=f"pacc:{u.id}:y"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"pacc:{u.id}:n"),
+        ]])
+        for admin_id in settings.telegram_admins:
+            try:
+                await bot.send_message(admin_id, card, parse_mode="HTML", reply_markup=kb)
+            except Exception as exc:  # noqa: BLE001
+                log.info("access request: can't notify admin %s: %s", admin_id, exc)
+
     async def _guard(msg: Message) -> PersonalSpace | None:
         uid = msg.from_user.id if msg.from_user else None
         if not await is_private_allowed(db, uid):
             if uid not in _denied_notified:
                 _denied_notified.add(uid or 0)
                 await msg.reply(
-                    "⛔ Личный режим не включён для тебя.\n"
-                    f"Твой id: <code>{uid}</code> — попроси админа выполнить "
-                    f"<code>/allow {uid}</code>.",
+                    "⛔ Личный режим пока не включён для тебя.\n"
+                    f"Твой id: <code>{uid}</code>. Я отправил запрос админу — как только он "
+                    "подтвердит, я напишу.",
                     parse_mode="HTML",
                 )
+                await _register_access_request(msg)
             return None
         return orch.personal_space(uid, _display_name(msg))  # type: ignore[arg-type]
 
+    async def _create_workspace(space: PersonalSpace, chat_id: int, name: str) -> tuple[bool, str, int | None]:
+        """Создать тему в личке + проект. Возвращает (ok, текст, thread_id)."""
+        name = (name or "").strip()[:128]
+        if not name:
+            return False, "пустое имя", None
+        try:
+            topic = await bot.create_forum_topic(chat_id=chat_id, name=name)
+        except Exception as exc:  # noqa: BLE001
+            return False, (
+                f"не удалось создать тему: {exc}. Включи у бота в @BotFather режим тем для "
+                "личных чатов (Bot Settings → Threaded mode / Topics)."
+            ), None
+        slug = space.ensure_project(name)
+        await db.upsert_workspace(chat_id, topic.message_thread_id, name, slug)
+        try:
+            await bot.send_message(
+                chat_id,
+                f"📌 Воркспейс <b>{_esc(name)}</b> → <code>wiki/projects/{_esc(slug)}.md</code>.\n"
+                "Пиши сюда всё по этому проекту — я буду вести его страницу.",
+                message_thread_id=topic.message_thread_id, parse_mode="HTML",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("ws greet failed: %s", exc)
+        return True, f"тема «{name}» создана, проект wiki/projects/{slug}.md", topic.message_thread_id
+
+    def _workspace_tool_fn(msg: Message, space: PersonalSpace):
+        """Коллбек для агентских инструментов create_workspace / list_workspaces / rename_workspace."""
+        async def fn(action: str, args: dict) -> str:
+            if action == "create_workspace":
+                ok, text, _tid = await _create_workspace(space, msg.chat.id, str(args.get("name", "")))
+                return ("OK: " if ok else "ERROR: ") + text
+            if action == "list_workspaces":
+                rows = await db.list_workspaces(msg.chat.id)
+                if not rows:
+                    return "Воркспейсов нет."
+                return "\n".join(f"- {r['name']} → wiki/projects/{r['project_slug']}.md" for r in rows)
+            if action == "rename_workspace":
+                tid = _thread_id(msg)
+                if tid is None:
+                    return "ERROR: разговор идёт не в теме — переименовывать нечего"
+                new_name = str(args.get("name", "")).strip()[:128]
+                if not new_name:
+                    return "ERROR: пустое имя"
+                slug = await _bind_workspace(space, msg.chat.id, tid, new_name)
+                return f"OK: воркспейс → «{new_name}» (wiki/projects/{slug}.md)"
+            return f"ERROR: unknown action {action}"
+        return fn
+
+    def _bind_kb(tid: int, name: str) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"📌 Да, воркспейс «{name[:24]}»", callback_data=f"pwsbind:{tid}")],
+            [InlineKeyboardButton(text="✏️ Другое имя", callback_data=f"pwsname:{tid}"),
+             InlineKeyboardButton(text="💬 Нет, просто чат", callback_data=f"pwsno:{tid}")],
+        ])
+
+    async def _topic_name(msg: Message, tid: int) -> str:
+        r = msg.reply_to_message
+        if r is not None and r.forum_topic_created and r.forum_topic_created.name:
+            return r.forum_topic_created.name
+        row = await db.get_workspace(msg.chat.id, tid)
+        if row is not None and row["name"]:
+            return row["name"]
+        return f"тема {tid}"
+
     async def _workspace(msg: Message, space: PersonalSpace,
                          name_hint: str | None = None) -> dict[str, Any] | None:
-        """Воркспейс для сообщения в теме (создаёт запись и страницу проекта при первом касании)."""
+        """Воркспейс для сообщения в теме.
+
+        Тема становится воркспейсом ТОЛЬКО явно: кнопкой «📌 Сделать воркспейсом»,
+        через /ws new, /ws <имя> или инструмент агента. Telegram сам создаёт темы при
+        первом сообщении и называет их по содержимому («Медиа», первые слова текста) —
+        такие темы остаются обычным чатом, пока пользователь не решит иначе.
+        Для незнакомой темы один раз показываем подсказку с кнопками.
+        """
         tid = _thread_id(msg)
         if tid is None:
             return None
         row = await db.get_workspace(msg.chat.id, tid)
-        if row is not None and row["project_slug"]:
-            return dict(row)
-        name = name_hint
-        if not name:
-            r = msg.reply_to_message
-            if r is not None and r.forum_topic_created:
-                name = r.forum_topic_created.name
-        if not name and row is not None:
-            name = row["name"]
-        if not name:
-            name = f"topic-{tid}"
+        if row is not None:
+            return dict(row) if row["project_slug"] else None
+        name = (name_hint or await _topic_name(msg, tid)).strip()[:128]
+        await db.upsert_workspace(msg.chat.id, tid, name, None)  # известна, не привязана
+        try:
+            await msg.answer(
+                f"🆕 Новая тема «{_esc(name)}». Сделать её воркспейсом? Тогда всё в ней "
+                "будет относиться к проекту с таким именем.",
+                parse_mode="HTML", reply_markup=_bind_kb(tid, name),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("bind hint failed: %s", exc)
+        return None
+
+    async def _bind_workspace(space: PersonalSpace, chat_id: int, tid: int, name: str) -> str:
+        """Привязать тему к проекту (создать страницу при необходимости). Возвращает slug."""
+        name = (name or "").strip()[:128] or f"topic-{tid}"
         slug = space.ensure_project(name)
-        await db.upsert_workspace(msg.chat.id, tid, name, slug)
-        row = await db.get_workspace(msg.chat.id, tid)
-        return dict(row) if row else None
+        await db.upsert_workspace(chat_id, tid, name, slug)
+        async with db.conn() as conn:
+            await conn.execute("UPDATE workspaces SET project_slug=? WHERE chat_id=? AND topic_id=?",
+                               (slug, chat_id, tid))
+            await conn.commit()
+        try:
+            await bot.edit_forum_topic(chat_id=chat_id, message_thread_id=tid, name=name)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("edit_forum_topic failed: %s", exc)
+        return slug
 
     async def _voice_mode(user_id: int) -> str:
         return (await db.get_state(f"voice_mode_{user_id}", settings.personal_voice_reply or "auto")).lower()
@@ -418,7 +564,14 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             )
             return
         orch.personal_space(uid, _display_name(msg))  # type: ignore[arg-type]
-        await msg.reply(HELP_TEXT, parse_mode="HTML")
+        await msg.reply(HELP_TEXT, parse_mode="HTML", reply_markup=_menu_kb(is_admin(uid)))
+
+    @router.message(Command("menu"))
+    async def cmd_menu(msg: Message) -> None:
+        space = await _guard(msg)
+        if not space:
+            return
+        await msg.reply("Меню внизу 👇", reply_markup=_menu_kb(is_admin(space.user_id)))
 
     @router.message(Command("model"))
     async def cmd_model(msg: Message, command: CommandObject) -> None:
@@ -517,7 +670,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 return
             ws = await _workspace(msg, space)
             if not ws:
-                await msg.reply("Не удалось определить воркспейс.")
+                await msg.reply("Эта тема не привязана к проекту — сначала /ws <имя>.")
                 return
             parts = rest.split()
             chats = settings.get_chats()
@@ -549,9 +702,9 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             await _reply_html(msg, ("✅ " if res.startswith("OK") else "❌ ") + res)
             return
         if sub == "list":
-            rows = await db.list_workspaces(msg.chat.id)
+            rows = [r for r in await db.list_workspaces(msg.chat.id) if r["project_slug"]]
             if not rows:
-                await msg.reply("Воркспейсов пока нет. Создай тему в этом чате или /ws new <имя>.")
+                await msg.reply("Воркспейсов пока нет. /ws new <имя> или кнопка «📌 Воркспейсы».")
                 return
             lines = ["<b>Воркспейсы:</b>"]
             for r in rows:
@@ -563,28 +716,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             if not name:
                 await msg.reply("Использование: /ws new <имя воркспейса>")
                 return
-            try:
-                topic = await bot.create_forum_topic(chat_id=msg.chat.id, name=name[:128])
-            except Exception as exc:  # noqa: BLE001
-                await msg.reply(
-                    "❌ Не удалось создать тему: " + _esc(str(exc)) +
-                    "\nВключи у бота в @BotFather режим тем для личных чатов "
-                    "(Bot Settings → Threaded mode / Topics).",
-                    parse_mode="HTML",
-                )
-                return
-            slug = space.ensure_project(name)
-            await db.upsert_workspace(msg.chat.id, topic.message_thread_id, name, slug)
-            try:
-                await bot.send_message(
-                    msg.chat.id,
-                    f"📌 Воркспейс <b>{_esc(name)}</b> → <code>wiki/projects/{_esc(slug)}.md</code>.\n"
-                    "Пиши сюда всё по этому проекту — я буду вести его страницу.",
-                    message_thread_id=topic.message_thread_id, parse_mode="HTML",
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warning("ws new: greet failed: %s", exc)
-            await msg.reply(f"✅ Создал тему и проект <b>{_esc(name)}</b>.", parse_mode="HTML")
+            ok, text, _tid = await _create_workspace(space, msg.chat.id, name)
+            await msg.reply(("✅ " if ok else "❌ ") + _esc(text), parse_mode="HTML")
             return
         tid = _thread_id(msg)
         if tid is None:
@@ -594,23 +727,17 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             )
             return
         if args:  # /ws <новое имя> — переименовать/привязать
-            slug = space.ensure_project(args)
-            await db.upsert_workspace(msg.chat.id, tid, args, slug)
-            # у существующей записи slug не меняется (COALESCE) — явно перепривязываем
-            async with db.conn() as conn:
-                await conn.execute("UPDATE workspaces SET project_slug=? WHERE chat_id=? AND topic_id=?",
-                                   (slug, msg.chat.id, tid))
-                await conn.commit()
-            try:
-                await bot.edit_forum_topic(chat_id=msg.chat.id, message_thread_id=tid, name=args[:128])
-            except Exception:  # noqa: BLE001
-                pass
+            slug = await _bind_workspace(space, msg.chat.id, tid, args)
             await msg.reply(f"📌 Воркспейс → <b>{_esc(args)}</b> (<code>wiki/projects/{_esc(slug)}.md</code>)",
                             parse_mode="HTML")
             return
         ws = await _workspace(msg, space)
         if not ws:
-            await msg.reply("Не удалось определить воркспейс.")
+            name = await _topic_name(msg, tid)
+            await msg.reply(
+                f"Эта тема («{_esc(name)}») пока просто чат, не воркспейс.",
+                parse_mode="HTML", reply_markup=_bind_kb(tid, name),
+            )
             return
         token = uuid.uuid4().hex[:10]
         _pending_share[token] = (space.user_id, f"@ws:{ws['project_slug']}:0", "")
@@ -999,6 +1126,224 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         except Exception:  # noqa: BLE001
             pass
 
+    # ------------------------------------------------------------- menu buttons
+
+    def _voice_kb() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔊 on", callback_data="pvm:on"),
+            InlineKeyboardButton(text="🎤 auto", callback_data="pvm:auto"),
+            InlineKeyboardButton(text="🔇 off", callback_data="pvm:off"),
+        ]])
+
+    async def _show_workspaces(msg: Message) -> None:
+        rows = [r for r in await db.list_workspaces(msg.chat.id) if r["project_slug"]]
+        lines = ["<b>Воркспейсы</b> — темы в этом чате, привязанные к проектам."]
+        if rows:
+            for r in rows:
+                lines.append(f"• 📌 <b>{_esc(r['name'])}</b> → <code>wiki/projects/{_esc(r['project_slug'] or '?')}.md</code>")
+        else:
+            lines.append("Пока нет. Создай тему в чате или нажми кнопку ниже.")
+        lines.append("\nВ теме: /ws — статус, /ws share &lt;чат&gt; — выгрузить в группу.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="➕ Создать воркспейс", callback_data="pwsnew"),
+        ]])
+        await msg.reply("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+
+    async def _show_admin_panel(msg: Message) -> None:
+        if not is_admin(msg.from_user.id if msg.from_user else None):
+            await msg.reply("⛔ только для админов")
+            return
+        reqs = await _access_requests()
+        dyn = await db.get_private_users()
+        lines = ["<b>🛡 Админ-панель</b>", "",
+                 f"🧠 Модель: <b>{_esc(orch.model_info())}</b>", "",
+                 "<b>Доступ к личному режиму:</b>"]
+        for uid in settings.telegram_admins:
+            lines.append(f"• <code>{uid}</code> — admin (.env)")
+        for uid in settings.telegram_private_users:
+            if uid not in settings.telegram_admins:
+                lines.append(f"• <code>{uid}</code> — .env")
+        for uid in dyn:
+            lines.append(f"• <code>{uid}</code> — через /allow")
+        kb_rows: list[list[InlineKeyboardButton]] = []
+        if reqs:
+            lines += ["", f"<b>Ожидают подтверждения ({len(reqs)}):</b>"]
+            for r in reqs[-8:]:
+                who = _esc(r.get("name") or "") + (f" (@{_esc(r['username'])})" if r.get("username") else "")
+                lines.append(f"• {who} · <code>{r['id']}</code> · {r.get('ts', '')}")
+                kb_rows.append([
+                    InlineKeyboardButton(text=f"✅ {str(r.get('name') or r['id'])[:20]}", callback_data=f"pacc:{r['id']}:y"),
+                    InlineKeyboardButton(text="❌", callback_data=f"pacc:{r['id']}:n"),
+                ])
+        else:
+            lines += ["", "Запросов на доступ нет. Новый пользователь напишет боту — тебе придёт карточка с кнопками."]
+        for uid in dyn[:6]:
+            kb_rows.append([InlineKeyboardButton(text=f"🚫 отозвать {uid}", callback_data=f"pdeny:{uid}")])
+        prov_row = [
+            InlineKeyboardButton(text=f"🧠 {p['key']}", callback_data=f"pmodel:{p['key']}")
+            for p in orch.client.available_providers() if p["has_key"] and p["key"] != "ollama"
+        ][:4]
+        if prov_row:
+            kb_rows.append(prov_row)
+        lines += ["", "Команды: /allow &lt;id&gt; · /deny &lt;id&gt; · /users · /model &lt;provider&gt; [model]"]
+        await msg.reply("\n".join(lines)[:4000], parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None)
+
+    @router.message(F.text.in_(MENU_BUTTONS))
+    async def on_menu_button(msg: Message) -> None:
+        space = await _guard(msg)
+        if not space:
+            return
+        t = (msg.text or "").strip()
+        if t == BTN_WS:
+            await _show_workspaces(msg)
+        elif t == BTN_ART:
+            arts = space.list_artifacts(limit=40)
+            _last_listing[space.user_id] = arts
+            await _reply_html(msg, f"**Артефакты** ({len(arts)}):\n\n" + artifact_markdown_table(arts)
+                              + "\n\n_/show N · /share N [чат] · /del N · /list notes|ideas|research|files_")
+        elif t == BTN_PROJ:
+            await cmd_projects(msg)
+        elif t == BTN_SPACE:
+            await cmd_space(msg)
+        elif t == BTN_VOICE:
+            await msg.reply(
+                f"🗣 Голосовые ответы: <b>{await _voice_mode(space.user_id)}</b>, голос "
+                f"<code>{_esc(await _voice_id(space.user_id))}</code>\n"
+                "auto — голосом на голосовые. /voices — выбрать голос, /say — озвучить текст.",
+                parse_mode="HTML", reply_markup=_voice_kb(),
+            )
+        elif t == BTN_HELP:
+            await msg.reply(HELP_TEXT, parse_mode="HTML", reply_markup=_menu_kb(is_admin(space.user_id)))
+        elif t == BTN_ADMIN:
+            await _show_admin_panel(msg)
+
+    @router.callback_query(F.data == "pwsnew")
+    async def cb_ws_new(cb: CallbackQuery) -> None:
+        if not cb.from_user:
+            return
+        _awaiting[cb.from_user.id] = "ws_name"
+        await cb.answer()
+        if cb.message:
+            await cb.message.answer("Как назвать воркспейс? Напиши имя одним сообщением (или /cancel).")
+
+    @router.message(Command("cancel"))
+    async def cmd_cancel(msg: Message) -> None:
+        if msg.from_user and _awaiting.pop(msg.from_user.id, None):
+            await msg.reply("Ок, отменил.")
+        else:
+            await msg.reply("Нечего отменять.")
+
+    @router.callback_query(F.data.startswith("pwsbind:"))
+    async def cb_ws_bind(cb: CallbackQuery) -> None:
+        if not cb.from_user or not cb.message:
+            return
+        tid = int((cb.data or "").split(":", 1)[1])
+        space = orch.personal_space(cb.from_user.id)
+        row = await db.get_workspace(cb.message.chat.id, tid)
+        name = (row["name"] if row else None) or f"тема {tid}"
+        slug = await _bind_workspace(space, cb.message.chat.id, tid, name)
+        await cb.answer("готово")
+        try:
+            await cb.message.edit_text(
+                f"📌 Воркспейс <b>{_esc(name)}</b> → <code>wiki/projects/{_esc(slug)}.md</code>.\n"
+                "Пиши сюда всё по этому проекту — я буду вести его страницу. "
+                "/ws share &lt;чат&gt; — выгрузить команде.",
+                parse_mode="HTML",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    @router.callback_query(F.data.startswith("pwsname:"))
+    async def cb_ws_name(cb: CallbackQuery) -> None:
+        if not cb.from_user or not cb.message:
+            return
+        tid = int((cb.data or "").split(":", 1)[1])
+        _awaiting[cb.from_user.id] = f"ws_bind:{tid}"
+        await cb.answer()
+        await cb.message.answer("Как назвать воркспейс? Напиши имя одним сообщением (или /cancel).")
+
+    @router.callback_query(F.data.startswith("pwsno:"))
+    async def cb_ws_no(cb: CallbackQuery) -> None:
+        await cb.answer("ок, просто чат")
+        if cb.message:
+            try:
+                await cb.message.edit_text("💬 Ок, это просто чат. Передумаешь — /ws <имя> в этой теме.")
+            except Exception:  # noqa: BLE001
+                pass
+
+    @router.callback_query(F.data.startswith("pvm:"))
+    async def cb_voice_mode(cb: CallbackQuery) -> None:
+        if not cb.from_user:
+            return
+        mode = (cb.data or "").split(":", 1)[1]
+        if mode not in ("on", "off", "auto"):
+            await cb.answer("bad")
+            return
+        await db.set_state(f"voice_mode_{cb.from_user.id}", mode)
+        await cb.answer(f"голос: {mode}")
+        try:
+            await cb.message.edit_text(f"🗣 Голосовые ответы: <b>{mode}</b>", parse_mode="HTML",  # type: ignore[union-attr]
+                                       reply_markup=_voice_kb())
+        except Exception:  # noqa: BLE001
+            pass
+
+    @router.callback_query(F.data.startswith("pacc:"))
+    async def cb_access(cb: CallbackQuery) -> None:
+        if not cb.from_user or not is_admin(cb.from_user.id):
+            await cb.answer("только для админов", show_alert=True)
+            return
+        parts = (cb.data or "").split(":")
+        if len(parts) != 3 or not parts[1].lstrip("-").isdigit():
+            await cb.answer("bad data")
+            return
+        uid, yes = int(parts[1]), parts[2] == "y"
+        items = [i for i in await _access_requests() if int(i.get("id", 0)) != uid]
+        await _set_access_requests(items)
+        if yes:
+            await db.add_private_user(uid)
+            _denied_notified.discard(uid)
+            try:
+                await bot.send_message(uid, "✅ Доступ к личному режиму открыт. Напиши /start.",
+                                       reply_markup=_menu_kb(False))
+            except Exception as exc:  # noqa: BLE001
+                log.info("notify user %s failed: %s", uid, exc)
+            text = f"✅ <code>{uid}</code> — доступ открыт"
+        else:
+            text = f"❌ <code>{uid}</code> — отклонено"
+        await cb.answer("ok")
+        try:
+            await cb.message.edit_text(text, parse_mode="HTML")  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            pass
+
+    @router.callback_query(F.data.startswith("pdeny:"))
+    async def cb_deny(cb: CallbackQuery) -> None:
+        if not cb.from_user or not is_admin(cb.from_user.id):
+            await cb.answer("только для админов", show_alert=True)
+            return
+        uid = int((cb.data or "").split(":", 1)[1])
+        await db.remove_private_user(uid)
+        await cb.answer(f"отозван {uid}")
+        if cb.message:
+            await cb.message.answer(f"🚫 <code>{uid}</code> — доступ отозван", parse_mode="HTML")
+
+    @router.callback_query(F.data.startswith("pmodel:"))
+    async def cb_model(cb: CallbackQuery) -> None:
+        if not cb.from_user or not is_admin(cb.from_user.id):
+            await cb.answer("только для админов", show_alert=True)
+            return
+        provider = (cb.data or "").split(":", 1)[1]
+        try:
+            desc = await orch.set_model(provider)
+        except Exception as exc:  # noqa: BLE001
+            await cb.answer(str(exc)[:180], show_alert=True)
+            return
+        await cb.answer("ok")
+        if cb.message:
+            await cb.message.answer(f"✅ Модель: <b>{_esc(desc)}</b>\n\n" + format_model_list(orch),
+                                    parse_mode="HTML")
+
     # ------------------------------------------------------------- catch-all
 
     @router.message()
@@ -1006,19 +1351,33 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         space = await _guard(msg)
         if not space:
             return
+        # Ожидали имя воркспейса после кнопки «➕ Создать».
+        pending = _awaiting.get(space.user_id)
+        if pending and msg.text and not msg.text.startswith("/"):
+            _awaiting.pop(space.user_id, None)
+            if pending == "ws_name":
+                ok, text, _tid = await _create_workspace(space, msg.chat.id, msg.text)
+                await msg.reply(("✅ " if ok else "❌ ") + _esc(text), parse_mode="HTML")
+                return
+            if pending.startswith("ws_bind:"):
+                tid = int(pending.split(":", 1)[1])
+                slug = await _bind_workspace(space, msg.chat.id, tid, msg.text)
+                await msg.reply(f"📌 Тема → воркспейс <b>{_esc(msg.text.strip()[:128])}</b> "
+                                f"(<code>wiki/projects/{_esc(slug)}.md</code>)", parse_mode="HTML")
+                return
         # Сервисные сообщения тем: создание / переименование → воркспейс.
         if msg.forum_topic_created and msg.message_thread_id:
-            name = msg.forum_topic_created.name
-            slug = space.ensure_project(name)
-            await db.upsert_workspace(msg.chat.id, msg.message_thread_id, name, slug)
-            try:
-                await msg.answer(
-                    f"📌 Воркспейс <b>{_esc(name)}</b> → <code>wiki/projects/{_esc(slug)}.md</code>.\n"
-                    "Пиши сюда всё по этому проекту — я буду вести его страницу.",
-                    parse_mode="HTML",
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warning("ws greet failed: %s", exc)
+            tid = msg.message_thread_id
+            name = (msg.forum_topic_created.name or f"тема {tid}")[:128]
+            if await db.get_workspace(msg.chat.id, tid) is None:
+                await db.upsert_workspace(msg.chat.id, tid, name, None)
+                try:
+                    await msg.answer(
+                        f"🆕 Тема «{_esc(name)}». Сделать её воркспейсом (проектом)?",
+                        parse_mode="HTML", reply_markup=_bind_kb(tid, name),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("bind hint failed: %s", exc)
             return
         if msg.forum_topic_edited and msg.message_thread_id:
             name = msg.forum_topic_edited.name
@@ -1134,6 +1493,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 space, agent_text or "(без текста — см. вложение)",
                 message_id=msg.message_id, attached_media=attached, history=history,
                 workspace=ws, progress=_draft_progress(msg),
+                workspace_fn=_workspace_tool_fn(msg, space),
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("personal_turn failed")

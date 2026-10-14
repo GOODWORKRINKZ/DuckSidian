@@ -186,12 +186,13 @@ class Orchestrator:
     def _make_executor(self, wiki: Wiki, chat_cfg: ChatConfig | None = None,
                        file_cache: dict[str, str] | None = None,
                        team_wikis: dict[str, Wiki] | None = None,
-                       share_fn: Any = None) -> ToolExecutor:
+                       share_fn: Any = None, workspace_fn: Any = None) -> ToolExecutor:
         async def ask_user_cb(question: str, options: list[str] | None) -> str:
             return await self._ask_user(question, options, chat_cfg)
         return ToolExecutor(wiki, ask_user_cb, deepseek_client=self.client,
                             file_cache=file_cache, db=self.db,
-                            team_wikis=team_wikis, share_fn=share_fn)
+                            team_wikis=team_wikis, share_fn=share_fn,
+                            workspace_fn=workspace_fn)
 
     # --- LLM model switching ---
 
@@ -294,6 +295,7 @@ class Orchestrator:
         history: list[dict[str, str]] | None = None,
         workspace: dict[str, Any] | None = None,
         progress: Any = None,
+        workspace_fn: Any = None,
     ) -> str:
         """Один ход диалога в личном режиме: агент классифицирует сообщение
         (запись / поиск / управление артефактами / разговор) и действует.
@@ -307,6 +309,7 @@ class Orchestrator:
 
         executor = self._make_executor(
             space.wiki, space.cfg, team_wikis=self._team_wikis(), share_fn=share_fn,
+            workspace_fn=workspace_fn,
         )
 
         def _read_or(rel: str, cap: int) -> str:

@@ -487,6 +487,49 @@ PERSONAL_EXTRA_TOOLS.append({
     },
 })
 
+PERSONAL_EXTRA_TOOLS += [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_workspace",
+            "description": (
+                "Создать воркспейс = новую тему (вкладку) в личном чате с ботом + страницу проекта "
+                "wiki/projects/<Имя>.md. Используй, когда пользователь просит «создай вкладку/тему/"
+                "воркспейс <имя>» или «заведи проект <имя> отдельной вкладкой». "
+                "Возвращает OK с именем темы или ERROR (например, если темы в личке выключены)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string", "description": "Имя воркспейса (до 128 символов)"}},
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_workspaces",
+            "description": "Список воркспейсов (тем) пользователя с привязанными проектами.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rename_workspace",
+            "description": (
+                "Переименовать ТЕКУЩИЙ воркспейс (тему, в которой идёт разговор) и перепривязать "
+                "его к проекту wiki/projects/<Новое имя>.md. Работает только внутри темы."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    },
+]
+
 _PERSONAL_EXCLUDE = {"ask_user", "defer_question", "tag_media"}
 
 
@@ -498,6 +541,7 @@ def personal_tool_schemas() -> list[dict]:
 
 AskUserFn = Callable[[str, list[str] | None], Awaitable[str]]
 ShareFn = Callable[[str, str, str], Awaitable[str]]
+WorkspaceFn = Callable[[str, dict], Awaitable[str]]
 
 
 class ToolExecutor:
@@ -507,7 +551,8 @@ class ToolExecutor:
     def __init__(self, wiki: Wiki, ask_user: AskUserFn, deepseek_client: Any = None,
                  file_cache: dict[str, str] | None = None, db: Any = None,
                  team_wikis: dict[str, Wiki] | None = None,
-                 share_fn: ShareFn | None = None):
+                 share_fn: ShareFn | None = None,
+                 workspace_fn: WorkspaceFn | None = None):
         self.wiki = wiki
         self.ask_user = ask_user
         self._ds = deepseek_client
@@ -515,6 +560,7 @@ class ToolExecutor:
         # Личный режим: read-only доступ к wiki групповых чатов + коллбек шаринга.
         self._team_wikis: dict[str, Wiki] = team_wikis or {}
         self._share_fn = share_fn
+        self._workspace_fn = workspace_fn
         self._media_index = MediaIndex(wiki.root)
         # Кэш содержимого файлов в рамках run_agent (или прокинутый снаружи —
         # тогда живёт между несколькими run_agent одного дня). Ключ — rel path.
@@ -849,6 +895,10 @@ class ToolExecutor:
                     paths.append(rel.replace("\\", "/"))
                 return "OK: сгенерировано " + str(len(paths)) + " файл(ов):\n" + "\n".join(paths) + \
                     "\nДобавь нужные в блок IMAGES: в finish()."
+            if name in ("create_workspace", "list_workspaces", "rename_workspace"):
+                if self._workspace_fn is None:
+                    return "ERROR: управление воркспейсами недоступно в этом режиме"
+                return await self._workspace_fn(name, dict(arguments or {}))
             if name == "share_to_chat":
                 if self._share_fn is None:
                     return "ERROR: шаринг недоступен в этом режиме"
