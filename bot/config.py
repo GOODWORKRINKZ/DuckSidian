@@ -205,6 +205,11 @@ class Settings(BaseSettings):
     # Сколько последних сообщений диалога подмешивать агенту как контекст.
     personal_history_size: int = 12
 
+    # --- Baidu: официальный API поиска Qianfan (ai_search/web_search) ---
+    # Ключ из https://console.bce.baidu.com/ai-search/qianfan/ais/console/apiKey (bce-v3/...).
+    # Пусто — baidu_search парсит www.baidu.com (часто капча → фолбэк DuckDuckGo).
+    baidu_api_key: str = ""
+
     # --- 1688-cli (github.com/superjack2050/1688-cli) — поиск на 1688, только чтение ---
     # Команда запуска CLI ("1688" или "npx 1688-cli"); пусто — инструмент search_1688 выключен.
     # Вход в аккаунт покупателя — один раз вручную на сервере: `1688 login` (QR).

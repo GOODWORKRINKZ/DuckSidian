@@ -380,8 +380,10 @@ TOOL_SCHEMAS: list[dict] = [
                 "Поиск в Baidu (百度) — для запросов НА КИТАЙСКОМ: китайские товары и производители "
                 "(1688/Taobao/JD), компании, роботы, платы, статьи на 微信/知乎/bilibili/CSDN. "
                 "Формулируй query по-китайски (иероглифами), Baidu по-русски/по-английски ищет плохо. "
-                "Возвращает список {title, href, body, source} (до max_results). "
-                "Если Baidu показал капчу — результаты придут из DuckDuckGo (регион Китай), "
+                "Возвращает список {title, href, body, source, date} (до max_results). "
+                "query — до ~36 иероглифов (длиннее обрежется). sites — искать только на этих "
+                "сайтах (например ['zhihu.com','csdn.net']), recency — свежесть (week/month/semiyear/year). "
+                "Если Baidu недоступен — результаты придут из DuckDuckGo (регион Китай), "
                 "об этом будет пометка в первой строке."
             ),
             "parameters": {
@@ -393,6 +395,9 @@ TOOL_SCHEMAS: list[dict] = [
                         "description": "Максимум результатов (1–10). По умолчанию 5.",
                         "default": 5,
                     },
+                    "sites": {"type": "array", "items": {"type": "string"},
+                              "description": "Только эти сайты (опц.)"},
+                    "recency": {"type": "string", "enum": ["week", "month", "semiyear", "year"]},
                 },
                 "required": ["query"],
             },
@@ -1135,6 +1140,8 @@ class ToolExecutor:
                 return await self._baidu_search(
                     arguments["query"],
                     min(int(arguments.get("max_results", 5)), 10),
+                    sites=arguments.get("sites") or None,
+                    recency=arguments.get("recency") or None,
                 )
             if name == "fetch_url":
                 return await self._fetch_url(arguments["url"])
@@ -1883,9 +1890,73 @@ class ToolExecutor:
                 break
         return out
 
-    async def _baidu_search(self, query: str, max_results: int = 5) -> str:
-        """Поиск в Baidu через primp (имитация браузера). При капче — DuckDuckGo с регионом cn-zh."""
+    BAIDU_API_URL = "https://qianfan.baidubce.com/v2/ai_search/web_search"
+    _BAIDU_RECENCY = {"week", "month", "semiyear", "year"}
+
+    @staticmethod
+    def _baidu_query(query: str, limit: int = 72) -> str:
+        """API режет запрос до 72 «единиц», иероглиф = 2. Обрезаем сами — предсказуемо."""
+        out, width = [], 0
+        for ch in " ".join(query.split()):
+            w = 2 if ord(ch) > 0x2E7F else 1
+            if width + w > limit:
+                break
+            out.append(ch)
+            width += w
+        return "".join(out)
+
+    async def _baidu_api(self, query: str, max_results: int, sites: list[str] | None,
+                         recency: str | None, api_key: str) -> list[dict]:
+        """Официальный поиск Baidu (Qianfan ai_search/web_search). Ошибка → исключение."""
+        body: dict[str, Any] = {
+            "messages": [{"role": "user", "content": self._baidu_query(query)}],
+            "search_source": "baidu_search_v2",
+            "resource_type_filter": [{"type": "web", "top_k": max(1, min(max_results, 10))}],
+        }
+        clean_sites = [str(s).strip() for s in (sites or []) if str(s).strip()][:20]
+        if clean_sites:
+            body["search_filter"] = {"match": {"site": clean_sites}}
+        if recency in self._BAIDU_RECENCY:
+            body["search_recency_filter"] = recency
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(self.BAIDU_API_URL, json=body, headers={
+                "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        if resp.status_code != 200 or data.get("code"):
+            raise RuntimeError(f"HTTP {resp.status_code} {data.get('code', '')} {data.get('message', '')}".strip())
+        out = []
+        for r in data.get("references") or []:
+            out.append({
+                "title": r.get("title", ""), "href": r.get("url", ""),
+                "body": (r.get("snippet") or r.get("content") or "")[:500],
+                "source": r.get("website") or r.get("web_anchor", ""), "date": r.get("date", ""),
+            })
+        return out[:max_results]
+
+    async def _baidu_search(self, query: str, max_results: int = 5, *,
+                            sites: list[str] | None = None, recency: str | None = None) -> str:
+        """Поиск в Baidu: официальный API Qianfan, если задан BAIDU_API_KEY; иначе (или при его
+        ошибке) — парсинг www.baidu.com через primp. При капче — DuckDuckGo с регионом cn-zh."""
         import asyncio
+
+        from ..config import settings  # noqa: PLC0415
+        api_err = ""
+        if settings.baidu_api_key.strip():
+            try:
+                results = await self._baidu_api(query, max_results, sites, recency,
+                                                settings.baidu_api_key.strip())
+                log.info("baidu_search(api) %r → %d результатов", query[:60], len(results))
+                if results:
+                    return json.dumps(results, ensure_ascii=False, indent=2)
+                return f"[] — Baidu (официальный API) ничего не нашёл по «{self._baidu_query(query)}»."
+            except Exception as exc:  # noqa: BLE001
+                api_err = str(exc)[:200]
+                log.warning("baidu_search api failed (%s), falling back to scraping", api_err)
+        if sites:
+            query = f"{query} " + " ".join(f"site:{s}" for s in sites[:3])
 
         def _sync() -> tuple[list[dict], str]:
             import primp  # type: ignore[import]  # ставится вместе с ddgs
@@ -1916,7 +1987,8 @@ class ToolExecutor:
             results, err = [], str(exc)
         if results:
             log.info("baidu_search %r → %d результатов", query[:60], len(results))
-            return json.dumps(results, ensure_ascii=False, indent=2)
+            note = f"[API Baidu недоступен ({api_err}), результаты парсинга baidu.com]\n" if api_err else ""
+            return note + json.dumps(results, ensure_ascii=False, indent=2)
         log.warning("baidu_search failed (%s), falling back to DuckDuckGo cn-zh", err)
 
         def _ddg() -> list[dict]:

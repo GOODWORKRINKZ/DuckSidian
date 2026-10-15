@@ -136,3 +136,87 @@ def test_schema_and_prompts_mention_baidu() -> None:
     assert "baidu_search" not in tools.PERSONAL_WRITE_TOOLS      # поиск — не запись
     assert "baidu_search" in prompts.PERSONAL_SYSTEM
     assert "иероглиф" in prompts.PERSONAL_SYSTEM.lower()
+
+
+# --- официальный API Qianfan (BAIDU_API_KEY) -------------------------------
+
+def _mock_httpx(monkeypatch, handler):
+    import httpx
+    real = httpx.AsyncClient
+
+    def factory(*a, **kw):
+        kw["transport"] = httpx.MockTransport(handler)
+        return real(*a, **kw)
+    monkeypatch.setattr(tools.httpx, "AsyncClient", factory)
+
+
+def test_baidu_query_truncates_to_72_units() -> None:
+    assert ToolExecutor._baidu_query("电" * 40) == "电" * 36
+    assert ToolExecutor._baidu_query("  MY1016Z   24V  ") == "MY1016Z 24V"
+    assert ToolExecutor._baidu_query("a" * 100) == "a" * 72
+
+
+@pytest.mark.asyncio
+async def test_baidu_api_request_and_parse(monkeypatch) -> None:
+    from bot.config import settings
+    monkeypatch.setattr(settings, "baidu_api_key", "bce-v3/test")
+    seen = {}
+
+    def handler(req):
+        import httpx
+        seen["auth"] = req.headers["authorization"]
+        seen["url"] = str(req.url)
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={"request_id": "r", "references": [
+            {"id": 1, "title": "MY1016Z 电机", "url": "https://zhihu.com/q/1", "snippet": "24V 350W",
+             "website": "知乎", "date": "2026-10-01", "type": "web"}]})
+    _mock_httpx(monkeypatch, handler)
+    ex = ToolExecutor.__new__(ToolExecutor)
+    out = await ex._baidu_search("直流电机", 3, sites=["zhihu.com"], recency="month")
+    assert seen["auth"] == "Bearer bce-v3/test"
+    assert seen["url"] == "https://qianfan.baidubce.com/v2/ai_search/web_search"
+    assert seen["body"] == {
+        "messages": [{"role": "user", "content": "直流电机"}], "search_source": "baidu_search_v2",
+        "resource_type_filter": [{"type": "web", "top_k": 3}],
+        "search_filter": {"match": {"site": ["zhihu.com"]}}, "search_recency_filter": "month"}
+    assert json.loads(out) == [{"title": "MY1016Z 电机", "href": "https://zhihu.com/q/1",
+                                "body": "24V 350W", "source": "知乎", "date": "2026-10-01"}]
+
+
+@pytest.mark.asyncio
+async def test_baidu_api_error_falls_back_to_scraping(monkeypatch) -> None:
+    from bot.config import settings
+    monkeypatch.setattr(settings, "baidu_api_key", "bad")
+
+    def handler(req):
+        import httpx
+        return httpx.Response(401, json={"requestId": "r", "code": "216003", "message": "auth"})
+    _mock_httpx(monkeypatch, handler)
+
+    class _Resp:
+        text = SAMPLE
+        url = "https://www.baidu.com/s?wd=x"
+
+    class _Client:
+        def __init__(self, **kw):
+            pass
+
+        def get(self, *a, **kw):
+            return _Resp()
+
+    import sys
+    import types
+    fake_primp = types.ModuleType("primp")
+    fake_primp.Client = _Client
+    ex = ToolExecutor.__new__(ToolExecutor)
+    with patch.dict(sys.modules, {"primp": fake_primp}):
+        out = await ex._baidu_search("大陆智源", 5)
+    first, rest = out.split("\n", 1)
+    assert "API Baidu недоступен" in first and "216003" in first
+    assert json.loads(rest)[0]["href"] == "https://www.dalurobot.com/andi.html"
+
+
+def test_baidu_schema_has_filters() -> None:
+    schema = next(t for t in TOOL_SCHEMAS if t["function"]["name"] == "baidu_search")
+    props = schema["function"]["parameters"]["properties"]
+    assert "sites" in props and props["recency"]["enum"] == ["week", "month", "semiyear", "year"]
