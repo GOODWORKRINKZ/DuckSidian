@@ -12,11 +12,14 @@ from bot.handlers.shared_live import (
     LiveNotice,
     RunningRequest,
     clear_running,
+    is_busy,
+    lock_for,
     mark_running,
     member_targets,
     queue_wait_text,
     request_snippet,
     running_request,
+    serialized_turn,
     typing_many,
 )
 
@@ -159,3 +162,56 @@ def test_running_registry_per_lock_key() -> None:
     assert running_request(key) is nxt
     clear_running(key, nxt)
     assert running_request(key) is None
+
+
+@pytest.mark.asyncio
+async def test_serialized_turn_queues_second_and_names_first() -> None:
+    key = "shared/тест-serialized"
+    clear_running(key)
+    log: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    seen: list[RunningRequest | None] = []
+
+    async def body_a() -> str:
+        log.append("a:start")
+        first_started.set()
+        await release_first.wait()
+        log.append("a:end")
+        return "a"
+
+    async def body_b() -> str:
+        log.append("b:start")
+        return "b"
+
+    async def on_queued(rr) -> None:
+        seen.append(rr)
+        log.append("b:queued")
+
+    ta = asyncio.create_task(serialized_turn(key, author="Иван", author_id=111, text="хлеб", body=body_a))
+    await first_started.wait()
+    assert is_busy(key) and running_request(key).author == "Иван"
+    # «Долгая расшифровка» второго участника идёт параллельно, пока Иван держит ключ.
+    log.append("b:stt")
+    tb = asyncio.create_task(serialized_turn(key, author="Таня", author_id=222, text="молоко",
+                                             body=body_b, on_queued=on_queued))
+    await asyncio.sleep(0.02)
+    assert log == ["a:start", "b:stt", "b:queued"]            # b ждёт, не стартовал
+    assert seen and seen[0].author == "Иван" and seen[0].snippet == "хлеб"
+    release_first.set()
+    assert await asyncio.wait_for(asyncio.gather(ta, tb), 1) == ["a", "b"]
+    assert log == ["a:start", "b:stt", "b:queued", "a:end", "b:start"]
+    assert not is_busy(key) and running_request(key) is None
+
+
+@pytest.mark.asyncio
+async def test_serialized_turn_clears_marker_on_error() -> None:
+    key = "shared/тест-ошибка"
+
+    async def boom() -> None:
+        raise RuntimeError("agent down")
+
+    with pytest.raises(RuntimeError):
+        await serialized_turn(key, author="Иван", author_id=111, text="x", body=boom)
+    assert running_request(key) is None and not is_busy(key)
+    assert lock_for(key) is lock_for(key)

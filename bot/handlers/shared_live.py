@@ -14,13 +14,14 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html import escape as _esc
-from typing import Any
+from typing import Any, Awaitable, Callable, TypeVar
 
 from ..personal import shared_slug_of
 
 log = logging.getLogger(__name__)
 
 TYPING_PERIOD = 4.5     # Telegram показывает chat action ~5 с
+T = TypeVar("T")
 
 
 async def member_targets(db: Any, project_slug: str, exclude_chat_id: int | None = None
@@ -166,3 +167,36 @@ def queue_wait_text(rr: RunningRequest | None, user_id: int | None) -> str:
     if rr.author_id is not None and rr.author_id == user_id:
         return f"⏳ Сейчас выполняется твой предыдущий запрос {what}, этот следующий в очереди."
     return f"⏳ Сейчас выполняется запрос {rr.author} {what}, твой следующий в очереди."
+
+
+_locks: dict[Any, asyncio.Lock] = {}
+
+
+def lock_for(key: Any) -> asyncio.Lock:
+    """Блокировка на ключ: project_slug совместного воркспейса или user_id личного режима."""
+    lk = _locks.get(key)
+    if lk is None:
+        lk = _locks[key] = asyncio.Lock()
+    return lk
+
+
+def is_busy(key: Any) -> bool:
+    lk = _locks.get(key)
+    return bool(lk and lk.locked())
+
+
+async def serialized_turn(key: Any, *, author: str, author_id: int | None, text: str | None,
+                          body: Callable[[], Awaitable[T]],
+                          on_queued: Callable[[RunningRequest | None], Awaitable[None]] | None = None) -> T:
+    """Выполнить body под блокировкой key — только вызов агента и запись ответа; всё
+    долгое (скачивание и расшифровка медиа) делается до вызова и партнёра не держит.
+    Если ключ занят, сначала on_queued(кто сейчас выполняется), затем ждём очереди."""
+    lk = lock_for(key)
+    if lk.locked() and on_queued is not None:
+        await on_queued(running_request(key))
+    async with lk:
+        rr = mark_running(key, author, author_id, text)
+        try:
+            return await body()
+        finally:
+            clear_running(key, rr)
