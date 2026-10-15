@@ -43,7 +43,7 @@ def format_model_list(orch: Orchestrator) -> str:
     lines += [
         "",
         "Переключить: <code>/model &lt;provider&gt; [model]</code>",
-        "Пример: <code>/model qwen qwen-max</code>, <code>/model minimax</code>, "
+        "Пример: <code>/model qwen qwen3.8-max</code>, <code>/model minimax</code>, "
         "<code>/model deepseek deepseek-v4-flash</code>",
         "🟢 — ключ задан в .env, ⚪️ — ключа нет.",
     ]

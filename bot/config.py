@@ -71,10 +71,13 @@ LLM_PROVIDERS: dict[str, LLMProvider] = {
     ),
     "qwen": LLMProvider(
         key="qwen", title="Qwen (Alibaba DashScope)",
-        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        base_url="https://token-plan.maas.qwencloudapi.com/compatible-mode/v1",
         api_key_env="DASHSCOPE_API_KEY",
-        default_model="qwen-plus",
-        models=["qwen-plus", "qwen-max", "qwen-turbo", "qwen3-coder-plus", "qwen-flash"],
+        default_model="qwen3.7-plus",
+        # Модели token-plan ключа (текст/рассуждение); сторонние — тоже через этот эндпоинт.
+        models=["qwen3.7-plus", "qwen3.8-max", "qwen3.7-max", "qwen3.8-flash",
+                "qwen3.6-flash", "deepseek-v4.1-flash", "deepseek-v4-pro",
+                "deepseek-v4-flash-0731", "glm-5.3", "glm-5.2", "auto"],
         price_in=0.40, price_out=1.20, price_cached=0.10,
     ),
     "openai": LLMProvider(
@@ -154,6 +157,8 @@ class Settings(BaseSettings):
     deepseek_api_key: str = ""
     minimax_api_key: str = ""
     dashscope_api_key: str = ""
+    # Эндпоинт Qwen (OpenAI-compatible); QWEN_BASE_URL в .env перекрывает.
+    qwen_base_url: str = "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1"
     openai_api_key: str = ""
     openrouter_api_key: str = ""
     ollama_api_key: str = "ollama"
@@ -240,6 +245,8 @@ class Settings(BaseSettings):
         provider = LLM_PROVIDERS[pkey]
         api_key = self.provider_api_key(provider)
         base_url = provider.base_url
+        if pkey == "qwen" and self.qwen_base_url:
+            base_url = self.qwen_base_url
         mdl = model or provider.default_model
         if pkey == self.llm_provider:
             # Переопределения из .env применяются только к активному провайдеру.
