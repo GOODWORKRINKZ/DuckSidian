@@ -999,13 +999,13 @@ class ToolExecutor:
                     text = self.wiki.read_file(path, max_bytes=600_000)
                 except WikiPathError as exc:
                     return f"ERROR: {exc}"
-                cap = 120_000
+                cap = 400_000
                 note = ""
                 if len(text) > cap:
                     note = f"\n\n[файл {len(text)} символов — сжаты первые {cap}]"
                     text = text[:cap]
                 focus = str(arguments.get("focus") or "").strip()
-                max_words = max(150, min(int(arguments.get("max_words") or 600), 1500))
+                max_words = max(150, min(int(arguments.get("max_words") or 600), 3000))
                 sys_prompt = (
                     "Ты делаешь конспект документа для базы знаний. Верни структурированный markdown: "
                     "1) о чём документ (2–3 предложения); 2) ключевые тезисы/факты/цифры/имена — "

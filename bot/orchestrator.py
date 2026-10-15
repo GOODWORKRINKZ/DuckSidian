@@ -192,9 +192,9 @@ class Orchestrator:
         fut: asyncio.Future[str] = loop.create_future()
         self._waiters[qid] = fut
         try:
-            return await asyncio.wait_for(fut, timeout=60 * 30)
+            return await asyncio.wait_for(fut, timeout=60 * 60)
         except asyncio.TimeoutError:
-            return "(timeout: команда не ответила за 30 минут, делай по умолчанию)"
+            return "(timeout: команда не ответила за 60 минут, делай по умолчанию)"
         finally:
             self._waiters.pop(qid, None)
 
@@ -675,7 +675,7 @@ class Orchestrator:
                 executor=executor,
                 system_prompt=INGEST_SYSTEM,
                 user_prompt=user_prompt,
-                max_steps=30,
+                max_steps=50,
             )
             self._record_run(f"ingest/{date_iso}", run)
             status = "ok" if run.finished else "partial"
@@ -723,7 +723,7 @@ class Orchestrator:
             executor=executor,
             system_prompt=INGEST_SYSTEM,
             user_prompt=user_prompt,
-            max_steps=30,
+            max_steps=50,
         )
         self._record_run(f"ingest-adhoc/{cfg.name}", run)
         await self.db.finish_batch(
@@ -1047,7 +1047,7 @@ class Orchestrator:
             executor=executor,
             system_prompt=QUERY_SYSTEM,
             user_prompt=user_prompt,
-            max_steps=30,
+            max_steps=50,
         )
         self._record_run("query", run)
         return run.summary or "Не нашёл ответа."
@@ -1156,7 +1156,7 @@ class Orchestrator:
                 executor=executor,
                 system_prompt=ENTITY_MERGE_SYSTEM,
                 user_prompt=user_prompt,
-                max_steps=30,
+                max_steps=50,
             )
             self._record_run(f"merge-entity/{alias}→{canonical}", run)
             status = "ok" if run.finished else "partial"

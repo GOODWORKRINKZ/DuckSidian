@@ -72,7 +72,7 @@ class MediaAI:
         self.base_url = (settings.minimax_base_url or "https://api.minimax.io").rstrip("/")
         if self.base_url.endswith("/v1"):
             self.base_url = self.base_url[:-3]
-        tmo = httpx.Timeout(connect=15.0, read=180.0, write=60.0, pool=10.0)
+        tmo = httpx.Timeout(connect=15.0, read=600.0, write=120.0, pool=10.0)
         self._client = httpx.AsyncClient(timeout=tmo)
 
     # ---- доступность ----

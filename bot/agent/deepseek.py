@@ -68,7 +68,7 @@ class LLMClient:
         # connect — быстрый (ловим DNS/network), read — долгий
         # (модели иногда думают >2 минут на tool-calling).
         if timeout is None:
-            tmo = httpx.Timeout(connect=15.0, read=900.0, write=30.0, pool=10.0)
+            tmo = httpx.Timeout(connect=15.0, read=1200.0, write=60.0, pool=10.0)
         else:
             tmo = httpx.Timeout(timeout)
         # Форсируем IPv4: на некоторых машинах дефолтный сокет висит ConnectTimeout

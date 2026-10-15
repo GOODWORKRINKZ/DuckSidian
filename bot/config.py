@@ -201,7 +201,7 @@ class Settings(BaseSettings):
     telegraph_enabled: bool = True
 
     # --- Личный режим ---
-    personal_agent_max_steps: int = 20
+    personal_agent_max_steps: int = 40
     # Сколько последних сообщений диалога подмешивать агенту как контекст.
     personal_history_size: int = 12
 
