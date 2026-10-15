@@ -80,7 +80,15 @@ from .admin_shared import (
 )
 from .commands import REACT_ERROR, REACT_QUEUED, _download_ask_media, _extract_image_refs, _react, _reply_html
 from .listener import _download_media, handle_answer_callback, question_id_from_reply
-from .shared_live import LiveNotice, member_targets, typing_many
+from .shared_live import (
+    LiveNotice,
+    clear_running,
+    mark_running,
+    member_targets,
+    queue_wait_text,
+    running_request,
+    typing_many,
+)
 
 log = logging.getLogger(__name__)
 
@@ -295,6 +303,16 @@ def history_messages(rows: list[Any], *, bot_id: int, skip: tuple[int, int] | No
             text = f"[{author}]: {text}"
         out.append({"role": "user", "content": text[:2000]})
     return out[-limit:] if limit > 0 else []
+
+
+def _media_label(msg: Message) -> str:
+    """Чем является сообщение без текста (для очереди: «выполняется запрос … (голосовое)»)."""
+    for attr, label in (("voice", "голосовое"), ("video_note", "видео-кружок"), ("audio", "аудио"),
+                        ("photo", "фото"), ("video", "видео"), ("document", "файл"),
+                        ("animation", "гифка"), ("sticker", "стикер")):
+        if getattr(msg, attr, None):
+            return label
+    return ""
 
 
 def _thread_id(msg: Message) -> int | None:
@@ -2389,23 +2407,31 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         lock_key: Any = ws_pre["project_slug"] if (ws_pre and shared_slug_of(ws_pre["project_slug"])) else space.user_id
         lk = _lock(lock_key)
         if lk.locked():
-            # Запросы одного пользователя идут строго по очереди (общие файлы, история
-            # диалога). Покажем, что сообщение принято и ждёт.
+            # Запросы одного пользователя (и одного совместного воркспейса) идут строго по
+            # очереди (общие файлы, история диалога). Покажем, что сообщение принято и ждёт,
+            # и чей запрос сейчас выполняется.
             _queue_depth[space.user_id] = _queue_depth.get(space.user_id, 0) + 1
             await _react(bot, msg, REACT_QUEUED)
             if _queue_depth[space.user_id] == 1:
                 try:
-                    await msg.reply("⏳ Принял, отвечу сразу после текущего запроса.")
+                    await msg.reply(queue_wait_text(running_request(lock_key), space.user_id))
                 except Exception:  # noqa: BLE001
                     pass
             try:
-                async with lk:
-                    await _process_message(msg, space)
+                await _run_locked(lk, lock_key, msg, space)
             finally:
                 _queue_depth[space.user_id] = max(0, _queue_depth.get(space.user_id, 1) - 1)
             return
+        await _run_locked(lk, lock_key, msg, space)
+
+    async def _run_locked(lk: asyncio.Lock, lock_key: Any, msg: Message, space: PersonalSpace) -> None:
         async with lk:
-            await _process_message(msg, space)
+            rr = mark_running(lock_key, _display_name(msg), msg.from_user.id if msg.from_user else None,
+                              msg.text or msg.caption or _media_label(msg))
+            try:
+                await _process_message(msg, space)
+            finally:
+                clear_running(lock_key, rr)
 
     async def _process_message(msg: Message, space: PersonalSpace) -> None:
         ts = msg.date or datetime.now(timezone.utc)

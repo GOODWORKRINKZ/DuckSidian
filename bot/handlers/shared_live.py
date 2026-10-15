@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from html import escape as _esc
 from typing import Any
 
@@ -120,3 +122,47 @@ class LiveNotice:
 
     async def fail(self, reason: str) -> None:
         await self._update(self.fail_text(reason))
+
+
+@dataclass
+class RunningRequest:
+    """Чей запрос сейчас держит блокировку (ключ — project_slug shared-воркспейса или user_id)."""
+    author: str
+    author_id: int | None
+    text: str
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @property
+    def snippet(self) -> str:
+        return request_snippet(self.text)
+
+    def elapsed(self, now: datetime | None = None) -> float:
+        return ((now or datetime.now(timezone.utc)) - self.started_at).total_seconds()
+
+
+_running: dict[Any, RunningRequest] = {}
+
+
+def mark_running(key: Any, author: str, author_id: int | None, text: str | None) -> RunningRequest:
+    rr = _running[key] = RunningRequest(author, author_id, (text or "").strip())
+    return rr
+
+
+def clear_running(key: Any, rr: RunningRequest | None = None) -> None:
+    """Снять отметку; если передан rr — только если это всё ещё он (а не следующий запрос)."""
+    if rr is None or _running.get(key) is rr:
+        _running.pop(key, None)
+
+
+def running_request(key: Any) -> RunningRequest | None:
+    return _running.get(key)
+
+
+def queue_wait_text(rr: RunningRequest | None, user_id: int | None) -> str:
+    """Текст «принял, жди»: называет, чей запрос выполняется и о чём он."""
+    if rr is None:
+        return "⏳ Принял, отвечу сразу после текущего запроса."
+    what = f"(«{rr.snippet}»)" if rr.snippet else "(вложение)"
+    if rr.author_id is not None and rr.author_id == user_id:
+        return f"⏳ Сейчас выполняется твой предыдущий запрос {what}, этот следующий в очереди."
+    return f"⏳ Сейчас выполняется запрос {rr.author} {what}, твой следующий в очереди."

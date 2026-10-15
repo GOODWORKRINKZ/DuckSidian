@@ -8,7 +8,17 @@ from types import SimpleNamespace
 import pytest
 
 from bot.db import DB
-from bot.handlers.shared_live import LiveNotice, member_targets, request_snippet, typing_many
+from bot.handlers.shared_live import (
+    LiveNotice,
+    RunningRequest,
+    clear_running,
+    mark_running,
+    member_targets,
+    queue_wait_text,
+    request_snippet,
+    running_request,
+    typing_many,
+)
 
 SLUG = "семейные-траты"
 PS = "shared/" + SLUG
@@ -124,3 +134,28 @@ async def test_live_notice_fail_and_no_targets() -> None:
     await empty.start()
     await empty.finish("ok")
     assert len(bot.sent) == 1                                   # личный режим — тишина
+
+
+def test_queue_wait_text_names_running_author() -> None:
+    assert queue_wait_text(None, 222) == "⏳ Принял, отвечу сразу после текущего запроса."
+    rr = RunningRequest("Иван", 111, "сколько потратили на еду за неделю, разбей по дням и магазинам, " * 3)
+    t = queue_wait_text(rr, 222)
+    assert t.startswith("⏳ Сейчас выполняется запрос Иван («сколько потратили")
+    assert t.endswith("…»), твой следующий в очереди.")
+    assert len(rr.snippet) == 81                                 # 80 символов + «…»
+    own = queue_wait_text(RunningRequest("Иван", 111, "итого?"), 111)
+    assert own == "⏳ Сейчас выполняется твой предыдущий запрос («итого?»), этот следующий в очереди."
+    assert "(вложение)" in queue_wait_text(RunningRequest("Иван", 111, ""), 222)
+
+
+def test_running_registry_per_lock_key() -> None:
+    key = "shared/тест-очереди"
+    clear_running(key)
+    assert running_request(key) is None
+    rr = mark_running(key, "Иван", 111, "хлеб")
+    assert running_request(key) is rr and rr.elapsed() < 5
+    nxt = mark_running(key, "Таня", 222, "молоко")        # следующий запрос перехватил ключ
+    clear_running(key, rr)                                 # старый finally не снимает чужую отметку
+    assert running_request(key) is nxt
+    clear_running(key, nxt)
+    assert running_request(key) is None
