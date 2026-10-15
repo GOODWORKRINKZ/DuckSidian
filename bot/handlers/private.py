@@ -80,7 +80,7 @@ from .admin_shared import (
 )
 from .commands import REACT_ERROR, REACT_QUEUED, _download_ask_media, _extract_image_refs, _react, _reply_html
 from .listener import _download_media, handle_answer_callback, question_id_from_reply
-from .shared_live import member_targets, typing_many
+from .shared_live import LiveNotice, member_targets, typing_many
 
 log = logging.getLogger(__name__)
 
@@ -1027,27 +1027,6 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         except Exception:  # noqa: BLE001
             pass
         return True
-
-    async def _notify_members(ws: dict[str, Any] | None, exclude_chat_id: int, author: str, text: str) -> None:
-        """В совместном воркспейсе — коротко сообщить остальным участникам, что добавил коллега."""
-        if not ws or not shared_slug_of(ws.get("project_slug")):
-            return
-        try:
-            rows = await db.find_workspaces_by_slug(ws["project_slug"])
-            members = set(await db.shared_members(shared_slug_of(ws["project_slug"]) or ""))
-        except Exception:  # noqa: BLE001
-            return
-        rows = [r for r in rows if int(r["chat_id"]) in members]
-        snippet = text.strip().replace("\n", " ")
-        snippet = snippet[:300] + ("…" if len(snippet) > 300 else "")
-        for r in rows:
-            if int(r["chat_id"]) == exclude_chat_id:
-                continue
-            try:
-                await bot.send_message(int(r["chat_id"]), f"👥 <b>{_esc(author)}</b> в «{_esc(ws['name'])}»:\n<i>{_esc(snippet)}</i>",
-                                       message_thread_id=int(r["topic_id"]), parse_mode="HTML")
-            except Exception as exc:  # noqa: BLE001
-                log.debug("notify member failed: %s", exc)
 
     async def _bind_workspace(space: PersonalSpace, chat_id: int, tid: int, name: str) -> str:
         """Привязать тему к проекту (создать страницу при необходимости). Возвращает slug."""
@@ -2576,6 +2555,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         # В совместном воркспейсе партнёры тоже видят «печатает…» в своих темах.
         targets = await member_targets(db, SHARED_PREFIX + ws["project_slug"], msg.chat.id)             if (space.is_shared and ws) else []
         typing_others = asyncio.create_task(typing_many(bot, targets, stop))
+        notice = LiveNotice(bot, targets, author=who, ws_name=ws_name or "", request=text or transcript)
+        await notice.start()
         try:
             answer = await orch.personal_turn(
                 space, agent_text or "(без текста — см. вложение)",
@@ -2589,6 +2570,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             log.exception("personal_turn failed")
             await _react(bot, msg, REACT_ERROR)
             await msg.reply(f"⚠️ Ошибка агента: {type(exc).__name__}. Попробуй ещё раз.")
+            await notice.fail(type(exc).__name__)
             return
         finally:
             stop.set()
@@ -2598,8 +2580,6 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         voice = mode == "on" or (mode == "auto" and spoke)
         title_hint = (text or transcript or "Ответ").splitlines()[0]
         await _send_agent_answer(msg, space, answer, title_hint=title_hint, ws_name=ws_name, voice=voice)
-        if space.is_shared:
-            await _notify_members(ws | {"project_slug": SHARED_PREFIX + ws["project_slug"]}, msg.chat.id,
-                                  _display_name(msg), (text or transcript or "") + "\n→ " + _strip_images_block(answer)[0])
+        await notice.finish(_strip_images_block(answer)[0])
 
     return router
