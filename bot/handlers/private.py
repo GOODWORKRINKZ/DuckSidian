@@ -253,6 +253,27 @@ def _display_name(msg: Message) -> str:
     return u.full_name or (f"@{u.username}" if u.username else str(u.id))
 
 
+def history_messages(rows: list[Any], *, bot_id: int, skip: tuple[int, int] | None = None,
+                     limit: int, label_authors: bool = False) -> list[dict[str, str]]:
+    """Строки messages из БД → user/assistant реплики для агента. label_authors — для
+    совместного воркспейса: реплики людей с префиксом «[Имя]: …»."""
+    out: list[dict[str, str]] = []
+    for r in rows:
+        if skip is not None and (r["chat_id"], r["message_id"]) == skip:
+            continue
+        text = (r["text"] or "").strip()
+        if not text:
+            continue
+        if r["user_id"] == bot_id:
+            out.append({"role": "assistant", "content": text[:2000]})
+            continue
+        if label_authors:
+            author = r["full_name"] or (f"@{r['username']}" if r["username"] else str(r["user_id"]))
+            text = f"[{author}]: {text}"
+        out.append({"role": "user", "content": text[:2000]})
+    return out[-limit:] if limit > 0 else []
+
+
 def _thread_id(msg: Message) -> int | None:
     return msg.message_thread_id if (msg.is_topic_message and msg.message_thread_id) else None
 
@@ -1264,7 +1285,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         except Exception as exc:  # noqa: BLE001
             log.warning("private: save bot reply failed: %s", exc)
         who = "🤖 DuckSidian" + (f" · 📌 {ws_name}" if ws_name else "")
-        space.append_inbox(who=who, text=text, ts=now, message_id=mid)
+        space.append_inbox(who=who, text=text, ts=now, message_id=mid, chat_id=msg.chat.id)
 
     def _draft_progress(msg: Message):
         """Стриминг прогресса агента черновиком (Bot API sendMessageDraft, только личка)."""
@@ -1286,20 +1307,17 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 log.debug("send_message_draft unavailable: %s", exc)
         return progress
 
-    async def _history(msg: Message) -> list[dict[str, str]]:
-        rows = await db.fetch_last_messages_in_topic(
-            msg.chat.id, _thread_id(msg), settings.personal_history_size + 1,
-        )
-        out: list[dict[str, str]] = []
-        for r in rows:
-            if r["message_id"] == msg.message_id:
-                continue
-            text = (r["text"] or "").strip()
-            if not text:
-                continue
-            role = "assistant" if r["user_id"] == bot.id else "user"
-            out.append({"role": role, "content": text[:2000]})
-        return out[-settings.personal_history_size:]
+    async def _history(msg: Message, shared_project_slug: str | None = None) -> list[dict[str, str]]:
+        """Последние реплики диалога. В совместном воркспейсе (project_slug вида
+        shared/<slug>) — по всем участникам (все их темы этого воркспейса), а реплики
+        людей помечены автором «[Имя]: …», чтобы агент не путал, кто что сказал."""
+        n = settings.personal_history_size
+        if shared_project_slug:
+            rows = await db.fetch_last_messages_in_workspace(shared_project_slug, n + 1)
+        else:
+            rows = await db.fetch_last_messages_in_topic(msg.chat.id, _thread_id(msg), n + 1)
+        return history_messages(rows, bot_id=bot.id, skip=(msg.chat.id, msg.message_id),
+                                limit=n, label_authors=bool(shared_project_slug))
 
     async def _send_agent_answer(msg: Message, space: PersonalSpace, answer: str, *,
                                  title_hint: str, ws_name: str | None = None,
@@ -1733,13 +1751,14 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         title = text.splitlines()[0][:60]
         rel = f"wiki/notes/{date}-{slugify(title)}-{now.strftime('%H%M%S')}.md"
         inbox_rel = space.append_inbox(who=_display_name(msg) + (f" · 📌 {ws['name']}" if ws else ""),
-                                       text=f"/note {text}", ts=now, message_id=msg.message_id)
+                                       text=f"/note {text}", ts=now, message_id=msg.message_id,
+                                       chat_id=msg.chat.id)
         project_line = f"project: \"[[{_ws_slug(ws)}]]\"\n" if ws else ""
         body = (
             "---\ntype: note\n"
             f"title: \"{title.replace(chr(34), chr(39))}\"\n"
             f"created: {date}\nupdated: {date}\ntags: [quick]\n{project_line}---\n\n"
-            f"# {title}\n\n{text}\n\n_Источник: [[{inbox_rel[:-3]}#msg-{msg.message_id}]]_\n"
+            f"# {title}\n\n{text}\n\n_Источник: [[{inbox_rel[:-3]}#{space.msg_anchor(msg.message_id, msg.chat.id)}]]_\n"
         )
         space.wiki.write_file(rel, body)
         try:
@@ -2433,7 +2452,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         except Exception as exc:  # noqa: BLE001
             log.warning("private: save_message failed: %s", exc)
         space.append_inbox(who=who + (f" · 📌 {ws_name}" if ws_name else ""), text=full_text, ts=ts,
-                           message_id=msg.message_id, media_type=media_type, media_path=media_path)
+                           message_id=msg.message_id, media_type=media_type, media_path=media_path,
+                           chat_id=msg.chat.id)
 
         if transcript:
             await msg.reply(f"🎤 <i>{_esc(transcript.strip()[:3000])}</i>", parse_mode="HTML")
@@ -2447,7 +2467,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             if prev:
                 agent_text = f"[Мой предыдущий ответ]:\n{prev[:1500]}\n\n[Реплика пользователя]:\n{full_text}"
 
-        history = await _history(msg)
+        history = await _history(msg, SHARED_PREFIX + ws["project_slug"] if space.is_shared and ws else None)
         if not has_media:
             await _react(bot, msg, "👀")
         stop = asyncio.Event()
@@ -2458,6 +2478,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 message_id=msg.message_id, attached_media=attached, history=history,
                 workspace=ws, progress=_draft_progress(msg),
                 workspace_fn=_workspace_tool_fn(msg, pspace, space),
+                author_name=who, author_id=msg.from_user.id if msg.from_user else None,
+                chat_id=msg.chat.id,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("personal_turn failed")

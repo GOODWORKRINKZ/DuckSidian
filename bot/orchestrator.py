@@ -311,9 +311,14 @@ class Orchestrator:
         workspace: dict[str, Any] | None = None,
         progress: Any = None,
         workspace_fn: Any = None,
+        author_name: str | None = None,
+        author_id: int | None = None,
+        chat_id: int | None = None,
     ) -> str:
         """Один ход диалога в личном режиме: агент классифицирует сообщение
         (запись / поиск / управление артефактами / разговор) и действует.
+        author_* — кто написал реплику (в общем vault у space user_id=0);
+        chat_id — личка-источник (для якоря raw/inbox в общем vault).
         Возвращает текст ответа пользователю (markdown, возможно с блоком IMAGES:)."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         chats = settings.get_chats()
@@ -352,12 +357,27 @@ class Orchestrator:
                 + (f" → проект wiki/projects/{slug}.md" if slug else "")
                 + ". Всё ниже относится к нему, если не сказано иное.\n"
             )
+        author_name = author_name or space.display_name
+        author_id = author_id if author_id is not None else space.user_id
+        if space.is_shared:
+            who_block = (
+                f"Сегодня: {today}. Совместный воркспейс shared/{space.shared_slug} — общий vault "
+                "нескольких участников.\n"
+                f"Автор этой реплики: {author_name} (user_id={author_id}). Реплики других "
+                "участников в истории диалога помечены «[Имя]: …» — не приписывай их автору "
+                "этой реплики.\n"
+                f"ПРАВИЛО АВТОРСТВА: каждую запись в wiki/projects (и в заметках) помечай автором — "
+                f"в конце строки «— {author_name}» (для чужих реплик из истории — их имя).\n"
+            )
+        else:
+            who_block = f"Сегодня: {today}. Владелец: {author_name} (user_id={author_id}).\n"
+        anchor = space.msg_anchor(message_id, chat_id if chat_id is not None else author_id)
         user_prompt = (
-            f"Сегодня: {today}. Владелец: {space.display_name} (user_id={space.user_id}).\n"
+            f"{who_block}"
             f"Групповые чаты для search_team_wiki/share_to_chat: {chats_desc}.\n"
             f"Бюджет шагов: {settings.personal_agent_max_steps}.\n"
             f"{ws_block}"
-            f"Источник этой реплики: [[raw/inbox/{today}#msg-{message_id}]].\n\n"
+            f"Источник этой реплики: [[raw/inbox/{today}#{anchor}]].\n\n"
             f"--- КОНТЕКСТ VAULT (не читай эти файлы через read_file) ---\n{head_ctx}\n"
             f"--- КОНЕЦ КОНТЕКСТА ---\n\n"
             f"СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n{text.strip()}{media_block}"
@@ -385,7 +405,7 @@ class Orchestrator:
             log.warning(
                 "personal: answer claimed a write without write tools — user=%s (id=%s) "
                 "space=%s recovered=%s tools=%s head=%r",
-                space.display_name, space.user_id, space.cfg.name, not run.unconfirmed_write,
+                author_name, author_id, space.cfg.name, not run.unconfirmed_write,
                 run.tools_called, answer[:200],
             )
         if run.unconfirmed_write:

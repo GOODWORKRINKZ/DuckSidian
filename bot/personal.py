@@ -178,8 +178,10 @@ class PersonalSpace:
         message_id: int | None = None,
         media_type: str | None = None,
         media_path: str | None = None,
+        chat_id: int | None = None,
     ) -> str:
-        """Дописать реплику в raw/inbox/<date>.md. Возвращает rel путь файла."""
+        """Дописать реплику в raw/inbox/<date>.md. Возвращает rel путь файла.
+        chat_id — личка, откуда реплика (в общем vault якорь включает его, см. msg_anchor)."""
         ts = ts or datetime.now(timezone.utc)
         date_iso = ts.strftime("%Y-%m-%d")
         rel = f"raw/inbox/{date_iso}.md"
@@ -200,11 +202,18 @@ class PersonalSpace:
         if not (text or "").strip() and not media_path:
             lines.append("> *(пусто)*")
         if message_id is not None:
-            lines.append(f"^msg-{message_id}")
+            lines.append(f"^{self.msg_anchor(message_id, chat_id)}")
         lines.append("")
         with p.open("a", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         return rel
+
+    def msg_anchor(self, message_id: int | None, chat_id: int | None = None) -> str:
+        """Якорь реплики в raw/inbox: `msg-<id>`. В общем vault реплики приходят из
+        разных личек, где message_id пересекаются, — там `msg-<chat_id>-<id>`."""
+        if self.is_shared and chat_id is not None:
+            return f"msg-{chat_id}-{message_id}"
+        return f"msg-{message_id}"
 
     def log(self, line: str) -> None:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")

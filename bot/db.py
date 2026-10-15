@@ -521,6 +521,23 @@ class DB:
                 return list(await cur.fetchall())
 
 
+    async def fetch_last_messages_in_workspace(
+        self, project_slug: str, n: int
+    ) -> list[aiosqlite.Row]:
+        """Последние n сообщений во всех темах (у всех участников), привязанных к
+        project_slug — история совместного воркспейса shared/<slug>."""
+        async with self.conn() as db:
+            async with db.execute(
+                """SELECT * FROM (
+                       SELECT m.* FROM messages m
+                       JOIN workspaces w ON w.chat_id = m.chat_id AND w.topic_id = m.topic_id
+                       WHERE w.project_slug = ?
+                       ORDER BY m.ts DESC LIMIT ?
+                   ) ORDER BY ts ASC""",
+                (project_slug, n),
+            ) as cur:
+                return list(await cur.fetchall())
+
     async def find_user_id_by_username(self, username: str) -> int | None:
         """user_id по @username среди всех, кто писал боту (в т.ч. в группе)."""
         u = username.lstrip("@").strip().lower()
