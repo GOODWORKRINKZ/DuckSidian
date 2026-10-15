@@ -626,12 +626,20 @@ def test_shared_space_and_convert(vault: Path) -> None:
     (owner.root / "raw/assets/2026-01-01").mkdir(parents=True)
     (owner.root / "raw/assets/2026-01-01/a.png").write_bytes(b"PNG")
     owner.wiki.write_file("wiki/sources/v.md", "---\ntype: source\nproject: \"[[Бизнес-кейсы]]\"\n---\n# v\n![[raw/assets/2026-01-01/a.png]]\n")
+    # путь к скану просто текстом/в `коде` (так пишет агент) + sidecar с распознанным текстом
+    (owner.root / "raw/assets/2026-01-01/scan.jpg").write_bytes(b"JPG")
+    (owner.root / "raw/imports").mkdir(parents=True, exist_ok=True)
+    (owner.root / "raw/imports/scan.jpg.md").write_text("ocr", encoding="utf-8")
+    owner.wiki.write_file("wiki/notes/doc.md", "---\ntype: note\nproject: \"[[Бизнес-кейсы]]\"\n---\n"
+                          "# doc\nфото: `raw/assets/2026-01-01/scan.jpg`.\n")
     shared = convert_workspace_to_shared(owner, slug)
+    assert (shared.root / "raw/assets/2026-01-01/scan.jpg").read_bytes() == b"JPG"
+    assert (shared.root / "raw/imports/scan.jpg.md").exists()
     assert shared.is_shared and shared.cfg.name == "shared/Бизнес-кейсы"
     assert shared.root == vault / "shared" / "Бизнес-кейсы"
     assert (shared.root / "wiki/projects/Бизнес-кейсы.md").exists() and not (owner.root / "wiki/projects/Бизнес-кейсы.md").exists()
     assert (shared.root / "wiki/sources/v.md").exists() and (shared.root / "raw/assets/2026-01-01/a.png").exists()
-    assert len(collect_workspace_pages(shared, slug)) == 2
+    assert len(collect_workspace_pages(shared, slug)) == 3
     assert "shared/Бизнес-кейсы" in (owner.root / "index.md").read_text(encoding="utf-8")
     assert shared_slug_of("shared/x") == "x" and shared_slug_of("x") is None
     # второй участник открывает тот же общий vault

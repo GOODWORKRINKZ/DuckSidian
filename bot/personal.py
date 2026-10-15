@@ -667,6 +667,19 @@ def discard_staged_workspace(dst: PersonalSpace, token: str) -> None:
 
 # ----- совместный воркспейс: общий vault для нескольких участников -----
 
+# Агент пишет пути к вложениям не только ссылкой [[raw/assets/…]], но и текстом/в `коде`.
+_ASSET_MENTION_RE = re.compile(r"raw/assets/[^\s`'\"()\[\]|#<>]+")
+
+
+def _asset_mentions(text: str) -> list[str]:
+    out: list[str] = []
+    for m in [*_ASSET_LINK_RE.finditer(text), *_ASSET_MENTION_RE.finditer(text)]:
+        rel = (m.group(1) if m.re is _ASSET_LINK_RE else m.group(0)).rstrip(".,;:!?")
+        if ".." not in Path(rel).parts and rel not in out:
+            out.append(rel)
+    return out
+
+
 def convert_workspace_to_shared(owner: PersonalSpace, slug: str) -> PersonalSpace:
     """Перенести проект (страница + связанные страницы + их вложения) из личного vault
     владельца в общий vault/shared/<slug>/. Пути внутри сохраняются (ссылки не ломаются).
@@ -683,13 +696,14 @@ def convert_workspace_to_shared(owner: PersonalSpace, slug: str) -> PersonalSpac
             text = src_p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for m in _ASSET_LINK_RE.finditer(text):
-            a_rel = m.group(1)
-            a_src = owner.root / a_rel
-            a_dst = shared.root / a_rel
-            if a_src.is_file() and not a_dst.exists():
-                a_dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(a_src), str(a_dst))
+        for a_rel in _asset_mentions(text):
+            # вместе с файлом — его sidecar с текстом/описанием (raw/imports/<имя>.md)
+            for f_rel in (a_rel, f"raw/imports/{Path(a_rel).name}.md"):
+                a_src = owner.root / f_rel
+                a_dst = shared.root / f_rel
+                if a_src.is_file() and not a_dst.exists():
+                    a_dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(a_src), str(a_dst))
         dst_p.parent.mkdir(parents=True, exist_ok=True)
         if dst_p.exists():
             dst_p = shared.root / _unique_rel(shared.root, rel, f"от-{project_slug(owner.display_name)[:20]}")
