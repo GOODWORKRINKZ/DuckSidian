@@ -39,16 +39,50 @@ log = logging.getLogger(__name__)
 router = Router(name="commands")
 
 
+# Telegram принимает в ReactionTypeEmoji только фиксированный набор эмодзи
+# (Bot API, ReactionTypeEmoji.emoji); всё остальное (⏳, ❌, ✅…) → REACTION_INVALID.
+TG_REACTIONS = frozenset({
+    "❤", "👍", "👎", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢", "🎉", "🤩",
+    "🤮", "💩", "🙏", "👌", "🕊", "🤡", "🥱", "🥴", "😍", "🐳", "❤\u200d🔥", "🌚", "🌭",
+    "💯", "🤣", "⚡", "🍌", "🏆", "💔", "🤨", "😐", "🍓", "🍾", "💋", "🖕", "😈", "😴",
+    "😭", "🤓", "👻", "👨\u200d💻", "👀", "🎃", "🙈", "😇", "😨", "🤝", "✍", "🤗", "🫡",
+    "🎅", "🎄", "☃", "💅", "🤪", "🗿", "🆒", "💘", "🙉", "🦄", "😘", "💊", "🙊", "😎",
+    "👾", "🤷\u200d♂", "🤷", "🤷\u200d♀", "😡",
+})
+REACT_SEEN = "👀"     # принял, работаю
+REACT_QUEUED = "✍"    # ждёт в очереди за предыдущим запросом
+REACT_ERROR = "😢"    # ошибка
+_REACT_FALLBACK = {"⏳": REACT_QUEUED, "❌": REACT_ERROR}
+# (chat_id, emoji), на которые Telegram уже ответил REACTION_INVALID (в группах набор
+# реакций может быть урезан) — больше не пробуем.
+_bad_reactions: set[tuple[int, str]] = set()
+
+
+def _reaction_emoji(emoji: str) -> str | None:
+    """Эмодзи из разрешённого Telegram-набора (⏳/❌ → замена) или None."""
+    e = emoji.replace("\ufe0f", "")
+    e = _REACT_FALLBACK.get(e, e)
+    return e if e in TG_REACTIONS else None
+
+
 async def _react(bot: Bot, msg: Message, emoji: str) -> None:
-    """Поставить реакцию на сообщение; молча игнорировать ошибки."""
+    """Поставить реакцию на сообщение; ошибки не мешают обработке."""
+    e = _reaction_emoji(emoji)
+    if e is None or (msg.chat.id, e) in _bad_reactions:
+        log.debug("_react %r skipped: not an allowed Telegram reaction here", emoji)
+        return
     try:
         await bot.set_message_reaction(
             chat_id=msg.chat.id,
             message_id=msg.message_id,
-            reaction=[ReactionTypeEmoji(emoji=emoji)],
+            reaction=[ReactionTypeEmoji(emoji=e)],
         )
     except Exception as exc:  # noqa: BLE001
-        log.warning("_react %s failed: %s: %s", emoji, type(exc).__name__, exc)
+        if "REACTION_INVALID" in str(exc):
+            _bad_reactions.add((msg.chat.id, e))
+            log.debug("_react %s: REACTION_INVALID in chat %s, disabled", e, msg.chat.id)
+            return
+        log.warning("_react %s failed: %s: %s", e, type(exc).__name__, exc)
 
 
 # Кэш ответов /ask, ожидающих кнопки "Сохранить".
@@ -492,7 +526,7 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
                     log.warning("ask: send save-button failed: %s", exc)
         except Exception as exc:  # noqa: BLE001
             log.error("query failed: %s", exc)
-            await _react(bot, msg, "❌")
+            await _react(bot, msg, REACT_ERROR)
             await msg.reply("⚠️ Ошибка при обращении к DeepSeek, попробуй ещё раз.")
 
     @router.message(
@@ -594,7 +628,7 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
                     log.warning("followup: send save-button failed: %s", exc)
         except Exception as exc:  # noqa: BLE001
             log.error("followup failed: %s", exc)
-            await _react(bot, msg, "❌")
+            await _react(bot, msg, REACT_ERROR)
             await msg.reply("⚠️ Ошибка при обращении к DeepSeek, попробуй ещё раз.")
 
     @router.message(Command("search"))

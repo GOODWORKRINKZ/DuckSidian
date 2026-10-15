@@ -78,7 +78,7 @@ from .admin_shared import (
     is_admin,
     is_private_allowed,
 )
-from .commands import _download_ask_media, _extract_image_refs, _react, _reply_html
+from .commands import REACT_ERROR, REACT_QUEUED, _download_ask_media, _extract_image_refs, _react, _reply_html
 from .listener import _download_media, handle_answer_callback, question_id_from_reply
 
 log = logging.getLogger(__name__)
@@ -1802,7 +1802,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             answer = await orch.query(q, chat_cfg=space.cfg)
         except Exception as exc:  # noqa: BLE001
             log.error("private /ask failed: %s", exc)
-            await _react(bot, msg, "❌")
+            await _react(bot, msg, REACT_ERROR)
             await msg.reply("⚠️ Ошибка LLM, попробуй ещё раз.")
             return
         finally:
@@ -2312,7 +2312,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             # Запросы одного пользователя идут строго по очереди (общие файлы, история
             # диалога). Покажем, что сообщение принято и ждёт.
             _queue_depth[space.user_id] = _queue_depth.get(space.user_id, 0) + 1
-            await _react(bot, msg, "⏳")
+            await _react(bot, msg, REACT_QUEUED)
             if _queue_depth[space.user_id] == 1:
                 try:
                     await msg.reply("⏳ Принял, отвечу сразу после текущего запроса.")
@@ -2363,7 +2363,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                         size = int(obj.file_size)
                         break
                 big = size > 20 * 1024 * 1024
-                await _react(bot, msg, "❌")
+                await _react(bot, msg, REACT_ERROR)
                 await msg.reply(
                     "⚠️ Не смог скачать вложение" + (f" ({size // 1024 // 1024} МБ)" if size else "") + ".\n"
                     + ("Telegram не отдаёт ботам файлы больше <b>20 МБ</b>. Варианты:\n"
@@ -2483,7 +2483,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("personal_turn failed")
-            await _react(bot, msg, "❌")
+            await _react(bot, msg, REACT_ERROR)
             await msg.reply(f"⚠️ Ошибка агента: {type(exc).__name__}. Попробуй ещё раз.")
             return
         finally:
