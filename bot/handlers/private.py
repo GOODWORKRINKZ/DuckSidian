@@ -1474,11 +1474,25 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         async def _heartbeat(self) -> None:
             while self.ok:
                 await asyncio.sleep(self.HEARTBEAT)
-                await self._push()
+                if not self.paused:
+                    await self._push()
+
+        # Пока бот стримит черновик, Telegram крутит спиннер вместо кнопки «Отправить» —
+        # на время вопроса пользователю черновик не обновляем, он гаснет и ввод свободен.
+        ASK_TOOLS = frozenset({"ask_choice", "ask_user"})
+        paused = False
 
         async def __call__(self, name: str, args: dict) -> None:
             if self._hb is None:
                 self._hb = asyncio.create_task(self._heartbeat())
+            if name in self.ASK_TOOLS:
+                self.steps.append(_step_line(name, args))
+                self.paused = True
+                return
+            if self.paused:
+                # Новый черновик, а не воскрешение старого над сообщением с вопросом.
+                self.paused = False
+                self.draft_id = random.randint(1, 2**31 - 1)
             if name == "__thinking__":
                 self.meta.update({k: args[k] for k in
                                   ("step", "max_steps", "ctx_chars", "tokens", "tokens_cached") if k in args})
