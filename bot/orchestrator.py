@@ -165,6 +165,9 @@ class Orchestrator:
         # Открытый вопрос ask_choice в личке: (chat_id, thread_id) → qid. Пока он есть,
         # обычное текстовое сообщение в этой теме — ответ на вопрос, а не новый запрос.
         self._private_pending: dict[tuple[int, int | None], int] = {}
+        # Темы, где идущий ход уже задавал вопросы (интерактивный диалог): там реплики во время
+        # хода идут в него, а не в очередь. Чистит обработчик в конце хода.
+        self._asked_in: set[tuple[int, int | None]] = set()
         # Личные пространства (DM): user_id → PersonalSpace
         self._spaces: dict[int, PersonalSpace] = {}
         # Накапливаем статистику токенов с момента старта бота
@@ -259,6 +262,7 @@ class Orchestrator:
         self._waiters[qid] = fut
         key = (chat_id, thread_id)
         self._private_pending[key] = qid
+        self._asked_in.add(key)
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
@@ -271,6 +275,12 @@ class Orchestrator:
 
     def pending_private_question(self, chat_id: int, thread_id: int | None) -> int | None:
         return self._private_pending.get((chat_id, thread_id))
+
+    def turn_is_interactive(self, chat_id: int, thread_id: int | None) -> bool:
+        return (chat_id, thread_id) in self._asked_in
+
+    def end_interactive(self, chat_id: int, thread_id: int | None) -> None:
+        self._asked_in.discard((chat_id, thread_id))
 
     async def deliver_answer(self, qid: int, answer: str) -> bool:
         await self.db.answer_question(qid, answer)
@@ -398,6 +408,7 @@ class Orchestrator:
         author_id: int | None = None,
         chat_id: int | None = None,
         thread_id: int | None = None,
+        interject: Any = None,
     ) -> str:
         """Один ход диалога в личном режиме: агент классифицирует сообщение
         (запись / поиск / управление артефактами / разговор) и действует.
@@ -496,6 +507,7 @@ class Orchestrator:
                 "обычным текстом: что успел сделать/найти и что осталось."
             ),
             on_step=progress,
+            interject=interject,
             write_tools=PERSONAL_WRITE_TOOLS,
             media_tools=MEDIA_TOOLS,
         )

@@ -202,6 +202,7 @@ async def run_agent(
     history: list[dict[str, Any]] | None = None,
     force_finish_hint: str | None = None,
     on_step: Any = None,
+    interject: Any = None,
     tool_result_cap: int = 6_000,
     ctx_char_budget: int = 400_000,
     compress_ctx_threshold: int = 80_000,
@@ -300,6 +301,18 @@ async def run_agent(
                     "что у тебя уже есть. Лучше неполный отчёт, чем пустой."
                 ),
             })
+        # Реплики пользователя, пришедшие во время хода (диалог с ask_choice) — в контекст.
+        if interject is not None:
+            try:
+                extra = interject() or []
+            except Exception as exc:  # noqa: BLE001
+                log.debug("interject failed: %s", exc)
+                extra = []
+            for text in extra:
+                log.info("agent step %d: user interjection %r", step, str(text)[:120])
+                messages.append({"role": "user", "content": (
+                    "[Пользователь написал, пока ты работал — учти это прямо сейчас, "
+                    f"а не как новую задачу]: {text}")})
         await _emit(on_step, "__thinking__", {
             "step": step + 1, "max_steps": max_steps, "ctx_chars": ctx_chars,
             "ctx_msgs": len(messages),

@@ -300,3 +300,39 @@ def test_busy_count_counts_running_queued_and_ingest(monkeypatch) -> None:
     monkeypatch.setattr(private, "_queue_depth", {1: 2})
     monkeypatch.setattr(private, "_ingest_tasks", {1: _T(False)})
     assert private.busy_count() == 4
+
+
+def test_free_text_option_detection() -> None:
+    from bot.handlers.listener import is_free_text_option as f
+    for yes in ("Другое — напишу", "Опишу словами сам", "Свой вариант", "другое", "✍️ напишу сам", "Other"):
+        assert f(yes), yes
+    for no in ("Другой поставщик — Yongkang", "Да, рама общая", "Не начинали вообще — ни названия, ни решения",
+               "Пока не сверяли, надо посмотреть CAD BiBa3"):
+        assert not f(no), no
+
+
+@pytest.mark.asyncio
+async def test_interjection_reaches_running_agent(tmp_path: Path) -> None:
+    inbox = ["не понял сути вопроса"]
+    seen: list = []
+
+    class _C:
+        def __init__(self):
+            self.n = 0
+
+        async def chat(self, messages, tools=None, **_kw):
+            seen.append([m.get("content", "") for m in messages])
+            self.n += 1
+            if self.n == 1:
+                return _call("list_dir", {"path": "wiki"}, "c1")
+            return _call("finish", {"summary": "ок"}, "c2")
+
+    def take():
+        out = list(inbox)
+        inbox.clear()
+        return out
+    run = await run_agent(client=_C(), executor=_exec(tmp_path), system_prompt="s", user_prompt="u",
+                          interject=take)
+    assert run.summary == "ок"
+    assert any("не понял сути вопроса" in c for c in seen[0])      # до первого шага
+    assert sum("не понял сути вопроса" in c for c in seen[1]) == 1   # не дублируется

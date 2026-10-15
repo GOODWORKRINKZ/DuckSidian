@@ -237,6 +237,12 @@ class RunningTurn:
         self.task, self.chat_id, self.thread_id = task, chat_id, thread_id
         self.allowed = {u for u in allowed if u is not None}
         self.stopped = False
+        # Реплики пользователя во время интерактивного хода — забирает агент перед шагом.
+        self.inbox: list[str] = []
+
+    def take_inbox(self) -> list[str]:
+        out, self.inbox = self.inbox, []
+        return out
 
 
 _running_turns: dict[str, RunningTurn] = {}
@@ -261,6 +267,13 @@ def request_stop(token: str, user_id: int | None) -> str:
     rt.stopped = True
     rt.task.cancel()
     return "ok"
+
+
+def running_turn_in(chat_id: int, thread_id: int | None) -> RunningTurn | None:
+    for rt in _running_turns.values():
+        if rt.chat_id == chat_id and rt.thread_id == thread_id and not rt.task.done():
+            return rt
+    return None
 
 
 def stop_turns_in(chat_id: int, thread_id: int | None, user_id: int | None) -> int:
@@ -2601,6 +2614,14 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             if await orch.deliver_answer(pq, msg.text):
                 await _react(bot, msg, "👌")
                 return
+        # Идёт интерактивный ход (агент уже задавал вопросы), а вопрос сейчас не открыт —
+        # реплика (уточнение, «не понял вопроса») уходит в этот ход, а не в очередь.
+        if msg.text and not msg.text.startswith("/") and orch.turn_is_interactive(msg.chat.id, _thread_id(msg)):
+            rt = running_turn_in(msg.chat.id, _thread_id(msg))
+            if rt is not None and (msg.from_user.id if msg.from_user else None) in rt.allowed:
+                rt.inbox.append(msg.text)
+                await _react(bot, msg, "👌")
+                return
         ws_pre = await db.get_workspace(msg.chat.id, _thread_id(msg)) if _thread_id(msg) else None
         if ws_pre is not None and ws_pre["project_slug"] and await _foreign_shared(msg, dict(ws_pre), space):
             return
@@ -2787,6 +2808,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                                 request=text or transcript or _media_label(msg))
             await notice.start()
             progress = _draft_progress(msg)
+            rt_holder: dict[str, RunningTurn] = {}
             agent_task = asyncio.create_task(orch.personal_turn(
                 space, agent_text or "(без текста — см. вложение)",
                 message_id=msg.message_id, attached_media=attached, history=history,
@@ -2794,9 +2816,11 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 workspace_fn=_workspace_tool_fn(msg, pspace, space),
                 author_name=who, author_id=author_id, chat_id=msg.chat.id,
                 thread_id=_thread_id(msg),
+                interject=lambda: rt_holder["rt"].take_inbox() if "rt" in rt_holder else [],
             ))
             token = uuid.uuid4().hex[:12]
             rt = RunningTurn(agent_task, msg.chat.id, _thread_id(msg), {author_id, space.user_id})
+            rt_holder["rt"] = rt
             _running_turns[token] = rt
             stop_btn: dict[str, Any] = {}
 
@@ -2827,6 +2851,15 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 return
             finally:
                 _running_turns.pop(token, None)
+                orch.end_interactive(msg.chat.id, _thread_id(msg))
+                left = rt.take_inbox()
+                if left:
+                    try:
+                        await msg.reply("Это пришло, когда я уже заканчивал, и не попало в ответ: «"
+                                        + "», «".join(t[:200] for t in left)
+                                        + "». Повтори, если ещё актуально.")
+                    except Exception:  # noqa: BLE001
+                        pass
                 stop_btn_task.cancel()
                 if stop_btn.get("msg") is not None:
                     try:

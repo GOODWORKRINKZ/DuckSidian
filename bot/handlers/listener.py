@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,6 +107,18 @@ async def _download_media(
         return media_type, None
 
 
+# Вариант-приглашение написать самому («Другое — напишу», «Свой вариант», «Опишу словами»):
+# нажатие не отвечает за пользователя, а просит текст — вопрос остаётся открытым.
+FREE_TEXT_OPTION_RE = re.compile(
+    r"(напиш|опиш|словами|сво[йёе]\w*\s+(вариант|ответ)|^\s*(другое|иное|other|custom)\b)",
+    re.IGNORECASE)
+
+
+def is_free_text_option(option: str) -> bool:
+    opt = (option or "").strip()
+    return len(opt) <= 40 and bool(FREE_TEXT_OPTION_RE.search(opt))
+
+
 async def handle_answer_callback(cb: CallbackQuery, db: DB, orch: Orchestrator) -> None:
     """Кнопка-ответ на вопрос агента (`ans:<qid>:<idx>`). Общая для групп и DM."""
     try:
@@ -125,6 +138,18 @@ async def handle_answer_callback(cb: CallbackQuery, db: DB, orch: Orchestrator) 
         await cb.answer("bad option")
         return
     chosen = options[idx]
+    if is_free_text_option(chosen):
+        await cb.answer("Напиши ответ сообщением — передам агенту")
+        if cb.message:
+            try:
+                from html import escape as _esc
+                await cb.message.edit_text(
+                    _esc(cb.message.text or "") + "\n\n✍️ <b>Жду твой ответ текстом</b> (просто напиши сообщение).",
+                    parse_mode="HTML",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return
     delivered = await orch.deliver_answer(qid, chosen)
     await cb.answer("принято" if delivered else "уже отвечено")
     if cb.message:
