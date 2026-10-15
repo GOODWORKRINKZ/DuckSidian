@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -156,7 +156,8 @@ class Settings(BaseSettings):
     # Ключи вендоров (все опциональны — нужен хотя бы один для активного провайдера).
     deepseek_api_key: str = ""
     minimax_api_key: str = ""
-    dashscope_api_key: str = ""
+    dashscope_api_key: str = Field(
+        default="", validation_alias=AliasChoices("DASHSCOPE_API_KEY", "QWEN_API_KEY"))
     # Эндпоинт Qwen (OpenAI-compatible); QWEN_BASE_URL в .env перекрывает.
     qwen_base_url: str = "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1"
     openai_api_key: str = ""
