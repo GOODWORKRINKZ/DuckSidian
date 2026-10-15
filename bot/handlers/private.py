@@ -227,6 +227,42 @@ _denied_notified: set[int] = set()
 _queue_depth: dict[Any, int] = {}
 
 
+class RunningTurn:
+    """Идущий ход агента, который можно остановить кнопкой «⏹» или /stop."""
+
+    def __init__(self, task: asyncio.Task, chat_id: int, thread_id: int | None,
+                 allowed: set[int]) -> None:
+        self.task, self.chat_id, self.thread_id = task, chat_id, thread_id
+        self.allowed = {u for u in allowed if u is not None}
+        self.stopped = False
+
+
+_running_turns: dict[str, RunningTurn] = {}
+# Через сколько секунд хода показать кнопку остановки (короткие ходы — без лишнего сообщения).
+STOP_BUTTON_DELAY = 15.0
+
+
+def request_stop(token: str, user_id: int | None) -> str:
+    """'ok' — ход отменяется; 'forbidden' — чужой ход; 'gone' — уже закончился."""
+    rt = _running_turns.get(token)
+    if rt is None or rt.task.done():
+        return "gone"
+    if user_id not in rt.allowed:
+        return "forbidden"
+    rt.stopped = True
+    rt.task.cancel()
+    return "ok"
+
+
+def stop_turns_in(chat_id: int, thread_id: int | None, user_id: int | None) -> int:
+    """/stop: остановить ходы этого пользователя в этой теме. Возвращает сколько."""
+    n = 0
+    for token, rt in list(_running_turns.items()):
+        if rt.chat_id == chat_id and rt.thread_id == thread_id and request_stop(token, user_id) == "ok":
+            n += 1
+    return n
+
+
 def _space_for(space: PersonalSpace, ws: dict[str, Any] | None) -> PersonalSpace:
     """Пространство, в котором работаем: общий vault для shared-воркспейса, иначе личный."""
     sslug = shared_slug_of(ws.get("project_slug") if ws else None)
@@ -2132,6 +2168,18 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
     async def cb_answer(cb: CallbackQuery) -> None:
         await handle_answer_callback(cb, db, orch)
 
+    @router.callback_query(F.data.startswith("stopturn:"))
+    async def cb_stop_turn(cb: CallbackQuery) -> None:
+        token = (cb.data or "").split(":", 1)[1]
+        res = request_stop(token, cb.from_user.id if cb.from_user else None)
+        await cb.answer({"ok": "Останавливаю…", "forbidden": "Это не твой запрос",
+                         "gone": "Уже закончилось"}[res])
+        if res != "forbidden" and cb.message:
+            try:
+                await cb.message.edit_text("⏹ Останавливаю…" if res == "ok" else "✅ Уже готово")
+            except Exception:  # noqa: BLE001
+                pass
+
     @router.callback_query(F.data.startswith("pshr:"))
     async def cb_share(cb: CallbackQuery) -> None:
         parts = (cb.data or "").split(":", 2)
@@ -2305,6 +2353,13 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         await cb.answer()
         if cb.message:
             await cb.message.answer("Как назвать воркспейс? Напиши имя одним сообщением (или /cancel).")
+
+    @router.message(Command("stop"))
+    async def cmd_stop(msg: Message) -> None:
+        if not await _guard(msg):
+            return
+        n = stop_turns_in(msg.chat.id, _thread_id(msg), msg.from_user.id if msg.from_user else None)
+        await msg.reply("⏹ Останавливаю текущий запрос…" if n else "Сейчас ничего не выполняется.")
 
     @router.message(Command("skills"))
     async def cmd_skills(msg: Message) -> None:
@@ -2684,15 +2739,38 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                                 request=text or transcript or _media_label(msg))
             await notice.start()
             progress = _draft_progress(msg)
+            agent_task = asyncio.create_task(orch.personal_turn(
+                space, agent_text or "(без текста — см. вложение)",
+                message_id=msg.message_id, attached_media=attached, history=history,
+                workspace=ws, progress=progress,
+                workspace_fn=_workspace_tool_fn(msg, pspace, space),
+                author_name=who, author_id=author_id, chat_id=msg.chat.id,
+                thread_id=_thread_id(msg),
+            ))
+            token = uuid.uuid4().hex[:12]
+            rt = RunningTurn(agent_task, msg.chat.id, _thread_id(msg), {author_id, space.user_id})
+            _running_turns[token] = rt
+            stop_btn: dict[str, Any] = {}
+
+            async def _show_stop_button() -> None:
+                await asyncio.sleep(STOP_BUTTON_DELAY)
+                kb = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="⏹ Остановить", callback_data=f"stopturn:{token}")]])
+                try:
+                    stop_btn["msg"] = await msg.reply("⏳ Работаю над запросом…", reply_markup=kb)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("stop button failed: %s", exc)
+
+            stop_btn_task = asyncio.create_task(_show_stop_button())
             try:
-                answer = await orch.personal_turn(
-                    space, agent_text or "(без текста — см. вложение)",
-                    message_id=msg.message_id, attached_media=attached, history=history,
-                    workspace=ws, progress=progress,
-                    workspace_fn=_workspace_tool_fn(msg, pspace, space),
-                    author_name=who, author_id=author_id, chat_id=msg.chat.id,
-                    thread_id=_thread_id(msg),
-                )
+                answer = await agent_task
+            except asyncio.CancelledError:
+                if not rt.stopped:
+                    raise
+                log.info("personal_turn stopped by user (chat=%s)", msg.chat.id)
+                await msg.reply("⏹ Остановил. Что агент успел записать до остановки — осталось в vault.")
+                await notice.fail("остановлено")
+                return
             except Exception as exc:  # noqa: BLE001
                 log.exception("personal_turn failed")
                 await _react(bot, msg, REACT_ERROR)
@@ -2700,6 +2778,13 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 await notice.fail(type(exc).__name__)
                 return
             finally:
+                _running_turns.pop(token, None)
+                stop_btn_task.cancel()
+                if stop_btn.get("msg") is not None:
+                    try:
+                        await stop_btn["msg"].delete()
+                    except Exception:  # noqa: BLE001
+                        pass
                 progress.close()
                 stop.set()
                 typing.cancel()

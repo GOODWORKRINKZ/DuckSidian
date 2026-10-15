@@ -151,3 +151,15 @@ async def test_tool_gated_by_config(fake_cli, tmp_path: Path, monkeypatch: pytes
     monkeypatch.setattr(settings, "one688_cli", fake_cli[0])
     assert "search_1688" in {t["function"]["name"] for t in personal_tool_schemas()}
     assert (await ex.call("search_1688", {"mode": "search", "query": "a"})).startswith("[1688: 2 шт.")
+
+
+@pytest.mark.asyncio
+async def test_run_cancel_kills_cli(fake_cli, tmp_path: Path) -> None:
+    import asyncio
+    cli, _ = fake_cli
+    task = asyncio.create_task(one688.run(cli, {"mode": "search", "query": "SLOW"}, tmp_path, timeout=30))
+    await asyncio.sleep(1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not one688._lock.locked()

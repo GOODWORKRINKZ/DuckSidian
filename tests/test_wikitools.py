@@ -255,3 +255,32 @@ def test_render_progress() -> None:
     assert first == "⏳ 1:23 · шаг 3/40 · контекст 48k симв · токены 120k (кэш 90k)"
     assert rest[0] == "🧠 думаю… 33с" and rest[1] == "💭 проверю статус"
     assert rest[-1] == "✍️ пишу: wiki/b.md"
+
+
+# --- остановка хода -------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_request_stop_cancels_only_for_allowed_user() -> None:
+    import asyncio
+
+    from bot.handlers.private import RunningTurn, _running_turns, request_stop, stop_turns_in
+    started = asyncio.Event()
+
+    async def long_turn() -> str:
+        started.set()
+        await asyncio.sleep(30)
+        return "done"
+    task = asyncio.create_task(long_turn())
+    await started.wait()
+    _running_turns["t1"] = RunningTurn(task, chat_id=10, thread_id=5, allowed={42, None})
+    try:
+        assert request_stop("t1", 7) == "forbidden" and not task.cancelled()
+        assert stop_turns_in(10, 6, 42) == 0          # другая тема
+        assert stop_turns_in(10, 5, 42) == 1
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert _running_turns["t1"].stopped
+        assert request_stop("t1", 42) == "gone"
+        assert request_stop("nope", 42) == "gone"
+    finally:
+        _running_turns.pop("t1", None)

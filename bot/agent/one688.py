@@ -285,6 +285,10 @@ async def run(cli: str, a: dict[str, Any], vault_root: Path, *, timeout: float =
             proc.kill()
             await proc.wait()
             return f"ERROR: 1688 не ответил за {int(timeout)} с — попробуй позже или уже запрос."
+        except asyncio.CancelledError:
+            # Ход остановлен пользователем — не оставляем браузер CLI висеть.
+            proc.kill()
+            raise
     if proc.returncode in _EXIT_HINTS:
         return _EXIT_HINTS[proc.returncode]
     text = out.decode("utf-8", "replace").strip()
