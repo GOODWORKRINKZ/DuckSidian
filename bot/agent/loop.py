@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,6 +22,35 @@ class AgentRun:
     tokens_prompt: int = 0
     tokens_completion: int = 0
     tokens_cached: int = 0
+    tools_called: list[str] = field(default_factory=list)
+    # Ответ утверждал запись, а write-инструменты не вызывались: nudged — агенту
+    # один раз досылали подсказку; unconfirmed_write — так и не записал.
+    write_nudged: bool = False
+    unconfirmed_write: bool = False
+
+
+# «Записал / добавила / сохранили / готово / обновлено» — но не «не записал».
+_WRITE_CLAIM_RE = re.compile(
+    r"(?<![Нн]е )(?<!\w)(?:"
+    r"(?:за|до)писал[аио]?|добавил[аи]?|сохранил[аи]?|обновил[аи]?|создал[аи]?"
+    r"|дополнил[аи]?|внёс|внес(?:ла|ли)?|занёс|занес(?:ла|ли)?"
+    r"|(?:за|до)писано|добавлено|сохранено|обновлено|создано|дополнено|внесено"
+    r"|готово"
+    r")(?!\w)",
+    re.IGNORECASE,
+)
+
+WRITE_NUDGE = (
+    "⚠️ Ты ответил, что записал/добавил/сохранил, но за этот ход НЕ вызвал ни одного "
+    "инструмента записи (edit_file / write_file / append_file …) — в vault ничего не "
+    "изменилось. Либо вызови нужные инструменты сейчас и потом finish(), либо честно "
+    "ответь пользователю, что ничего не записал (без слов «записал/добавил/готово»)."
+)
+
+
+def claims_write(text: str) -> bool:
+    """Текст ответа утверждает, что что-то записано/сохранено."""
+    return bool(text) and bool(_WRITE_CLAIM_RE.search(text))
 
 
 def _ctx_chars(messages: list[dict[str, Any]]) -> int:
@@ -106,8 +136,22 @@ async def run_agent(
     tool_result_cap: int = 6_000,
     ctx_char_budget: int = 400_000,
     compress_ctx_threshold: int = 80_000,
+    write_tools: frozenset[str] | set[str] | None = None,
 ) -> AgentRun:
-    """Один прогон агента до вызова finish() или исчерпания шагов."""
+    """Один прогон агента до вызова finish() или исчерпания шагов.
+
+    write_tools: если задан и финальный ответ утверждает запись («записал»,
+    «готово»…), а ни один из этих инструментов не вызывался, — один раз
+    возвращаем агента в цикл с WRITE_NUDGE; если и потом записи нет —
+    run.unconfirmed_write=True (решение, что показать пользователю, — у вызывающего).
+    """
+
+    def _fake_write(text: str) -> bool:
+        return (
+            write_tools is not None
+            and not any(t in write_tools for t in run.tools_called)
+            and claims_write(text)
+        )
 
     tool_schemas = tools if tools is not None else TOOL_SCHEMAS
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
@@ -199,6 +243,12 @@ async def run_agent(
         if not tool_calls:
             # Модель решила ответить без tool-call → считаем что закончила.
             run.summary = _strip_think(raw_content)
+            if not run.write_nudged and _fake_write(run.summary):
+                run.write_nudged = True
+                log.warning("agent step %d: claims a write without write tools, nudging. head=%r",
+                            step, run.summary[:160])
+                messages.append({"role": "user", "content": WRITE_NUDGE})
+                continue
             run.finished = True
             break
 
@@ -229,6 +279,7 @@ async def run_agent(
                 )
                 continue
 
+            run.tools_called.append(name)
             log.info("agent step %d: tool=%s args=%s", step, name, str(args)[:200])
             if on_step is not None:
                 try:
@@ -251,6 +302,13 @@ async def run_agent(
             )
 
         if finish_called:
+            if not run.write_nudged and _fake_write(run.summary):
+                run.write_nudged = True
+                run.finished = False
+                log.warning("agent step %d: finish() claims a write without write tools, nudging. head=%r",
+                            step, run.summary[:160])
+                messages.append({"role": "user", "content": WRITE_NUDGE})
+                continue
             break
 
     if not run.finished:
@@ -286,6 +344,7 @@ async def run_agent(
             log.error("forced summary call failed: %s", exc)
             run.summary = run.summary or "(agent stopped without finish())"
     run.summary = _sanitize_summary(run.summary)
+    run.unconfirmed_write = _fake_write(run.summary)
     log.info(
         "agent done: steps=%d tokens_prompt=%d tokens_completion=%d "
         "tokens_total=%d tokens_cached=%d",

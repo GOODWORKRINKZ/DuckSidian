@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,7 +37,7 @@ from .agent.prompts import (
     SUMMARY_SYSTEM,
     TRIZ_SYSTEM,
 )
-from .agent.tools import ToolExecutor, personal_tool_schemas
+from .agent.tools import PERSONAL_WRITE_TOOLS, ToolExecutor, personal_tool_schemas
 from .config import ChatConfig, settings
 from .db import DB
 from .git_sync import commit_and_push
@@ -46,6 +47,18 @@ from .topic_manager import ensure_bot_topic
 from .wiki import Wiki, WikiPathError
 
 log = logging.getLogger(__name__)
+
+UNCONFIRMED_WRITE_NOTE = "⚠️ в vault ничего не записано"
+_IMAGES_MARKER_RE = re.compile(r"(?im)^\s*IMAGES\s*:\s*$")
+
+
+def mark_unconfirmed_write(answer: str) -> str:
+    """Пометить ответ, утверждающий запись, которой не было. Пометка — до блока
+    IMAGES: (его хвост бот отрезает от текста перед отправкой)."""
+    m = _IMAGES_MARKER_RE.search(answer)
+    if not m:
+        return f"{answer.rstrip()}\n\n{UNCONFIRMED_WRITE_NOTE}"
+    return f"{answer[:m.start()].rstrip()}\n\n{UNCONFIRMED_WRITE_NOTE}\n\n{answer[m.start():].lstrip()}"
 tokens_log = logging.getLogger("bot.tokens")
 
 
@@ -362,11 +375,22 @@ class Orchestrator:
                 "обычным текстом: что успел сделать/найти и что осталось."
             ),
             on_step=progress,
+            write_tools=PERSONAL_WRITE_TOOLS,
         )
         self._record_run(f"personal/{space.user_id}", run)
         if settings.git_autocommit:
             commit_and_push(f"personal {space.user_id}: turn")
-        return run.summary or "Не понял, переформулируй."
+        answer = run.summary or "Не понял, переформулируй."
+        if run.write_nudged or run.unconfirmed_write:
+            log.warning(
+                "personal: answer claimed a write without write tools — user=%s (id=%s) "
+                "space=%s recovered=%s tools=%s head=%r",
+                space.display_name, space.user_id, space.cfg.name, not run.unconfirmed_write,
+                run.tools_called, answer[:200],
+            )
+        if run.unconfirmed_write:
+            answer = mark_unconfirmed_write(answer)
+        return answer
 
     async def summarize_for_voice(self, text: str, max_chars: int | None = None) -> str:
         """Сжать ответ в короткий устный пересказ для TTS: 1–3 фразы, суть, без

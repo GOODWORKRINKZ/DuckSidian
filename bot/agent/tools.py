@@ -673,6 +673,15 @@ PERSONAL_EXTRA_TOOLS.append({
 
 _PERSONAL_EXCLUDE = {"ask_user", "defer_question", "tag_media"}
 
+# Инструменты, которые реально что-то меняют в vault (или в темах/чатах). Если агент
+# ответил «записал/добавил/готово», а ни один из них не вызывался — запись выдумана.
+PERSONAL_WRITE_TOOLS = frozenset({
+    "write_file", "append_file", "edit_file", "move_file", "delete_file",
+    "fetch_file", "fetch_image", "extract_archive", "generate_image",
+    "share_to_chat", "create_workspace", "share_workspace",
+    "set_workspace_icon", "rename_workspace",
+})
+
 
 def personal_tool_schemas() -> list[dict]:
     """Набор инструментов для личного режима."""
