@@ -2,20 +2,24 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from bot.config import settings
 from bot.db import DB
 from bot.handlers.shared_live import (
     LiveNotice,
+    _fmt_ago,
     RunningRequest,
     clear_running,
     is_busy,
     lock_for,
     mark_running,
     member_targets,
+    members_report,
     queue_wait_text,
     request_snippet,
     running_request,
@@ -215,3 +219,47 @@ async def test_serialized_turn_clears_marker_on_error() -> None:
         await serialized_turn(key, author="Иван", author_id=111, text="x", body=boom)
     assert running_request(key) is None and not is_busy(key)
     assert lock_for(key) is lock_for(key)
+
+
+@pytest.mark.asyncio
+async def test_last_activity_in_workspace(tmp_path: Path) -> None:
+    db = await _db(tmp_path)
+    t0 = datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc)
+    rows = [(111, 1, 7, 111, "хлеб"), (222, 1, 9, 222, "молоко"), (111, 2, 8, 111, "не сюда"),
+            (222, 2, 9, 999, "бот"), (111, 3, 7, 111, "итого?")]
+    for i, (chat, mid, topic, uid, text) in enumerate(rows):
+        await db.save_message(chat_id=chat, message_id=mid, topic_id=topic, user_id=uid, username=None,
+                              full_name="x", text=text, reply_to_message_id=None, ts=t0 + timedelta(minutes=i))
+    seen = await db.last_activity_in_workspace(PS)
+    assert set(seen) == {111, 222, 999}
+    assert datetime.fromisoformat(seen[111]) == t0 + timedelta(minutes=4)   # последнее в теме 7, не из темы 8
+    assert datetime.fromisoformat(seen[222]) == t0 + timedelta(minutes=1)
+    assert await db.last_activity_in_workspace("нет-такого") == {}
+
+
+def test_members_report_shows_last_seen_and_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "tz", "Europe/Moscow")
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    members = [(111, "Иван (@ivan, 111)", True), (222, "Таня (222)", False), (333, "333", False)]
+    seen = {111: (now - timedelta(seconds=30)).isoformat(),
+            222: (now - timedelta(hours=1, days=1)).isoformat()}
+    rr = RunningRequest("Иван", 111, "хлеб <b>", started_at=now - timedelta(seconds=12))
+    text = members_report("Семейные траты", members, seen, rr, now)
+    assert text.splitlines()[0] == "<b>Участники «Семейные траты»:</b>"
+    assert "• Иван (@ivan, 111) 👑 владелец — писал только что" in text
+    assert "• Таня (222) — писал вчера 14:00" in text          # 11:00 UTC вчера = 14:00 МСК
+    assert "• 333 — ещё не писал здесь" in text
+    assert "⏳ Сейчас выполняется запрос <b>Иван</b> («хлеб &lt;b&gt;»), 12 с." in text
+    assert text.rstrip().endswith("/ws kick <user_id|@username>")
+    idle = members_report("ws", members, {}, None, now)
+    assert "💤 Сейчас никто ничего не выполняет." in idle
+
+
+def test_fmt_ago_buckets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "tz", "UTC")
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    assert _fmt_ago((now - timedelta(minutes=5)).isoformat(), now) == "5 мин назад"
+    assert _fmt_ago((now - timedelta(hours=3)).isoformat(), now) == "3 ч назад"
+    assert _fmt_ago("2026-10-12T09:15:00+00:00", now) == "12.10 09:15"
+    assert _fmt_ago("2026-10-15T08:00:00", now) == "4 ч назад"      # naive = UTC
+    assert _fmt_ago("мусор", now) == "мусор"

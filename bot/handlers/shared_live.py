@@ -15,7 +15,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html import escape as _esc
 from typing import Any, Awaitable, Callable, TypeVar
+from zoneinfo import ZoneInfo
 
+from ..config import settings
 from ..personal import shared_slug_of
 
 log = logging.getLogger(__name__)
@@ -200,3 +202,47 @@ async def serialized_turn(key: Any, *, author: str, author_id: int | None, text:
             return await body()
         finally:
             clear_running(key, rr)
+
+
+def _fmt_ago(ts_iso: str, now: datetime) -> str:
+    """«только что» / «5 мин назад» / «3 ч назад» / «вчера 18:40» / «12.10 09:15» (по settings.tz)."""
+    try:
+        ts = datetime.fromisoformat(ts_iso)
+    except ValueError:
+        return ts_iso
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    sec = (now - ts).total_seconds()
+    if sec < 60:
+        return "только что"
+    if sec < 3600:
+        return f"{int(sec // 60)} мин назад"
+    try:
+        tz = ZoneInfo(settings.tz)
+    except Exception:  # noqa: BLE001
+        tz = timezone.utc
+    local, today = ts.astimezone(tz), now.astimezone(tz)
+    if local.date() == today.date():
+        return f"{int(sec // 3600)} ч назад"
+    if (today.date() - local.date()).days == 1:
+        return f"вчера {local:%H:%M}"
+    return f"{local:%d.%m %H:%M}"
+
+
+def members_report(ws_name: str, members: list[tuple[int, str, bool]], last_seen: dict[int, str],
+                   rr: RunningRequest | None, now: datetime | None = None) -> str:
+    """Текст /ws members: участники (👑 владелец), когда каждый писал в воркспейс последний
+    раз и чей запрос выполняется прямо сейчас."""
+    now = now or datetime.now(timezone.utc)
+    lines = [f"<b>Участники «{_esc(ws_name)}»:</b>"]
+    for uid, label, is_owner in members:
+        crown = " 👑 владелец" if is_owner else ""
+        seen = f" — писал {_fmt_ago(last_seen[uid], now)}" if uid in last_seen else " — ещё не писал здесь"
+        lines.append(f"• {_esc(label)}{crown}{_esc(seen)}")
+    if rr is not None:
+        what = f"«{_esc(rr.snippet)}»" if rr.snippet else "вложение"
+        lines.append(f"\n⏳ Сейчас выполняется запрос <b>{_esc(rr.author)}</b> ({what}), {int(rr.elapsed(now))} с.")
+    else:
+        lines.append("\n💤 Сейчас никто ничего не выполняет.")
+    lines.append("\nУбрать участника (только владелец): /ws kick <user_id|@username>")
+    return "\n".join(lines)

@@ -83,7 +83,9 @@ from .listener import _download_media, handle_answer_callback, question_id_from_
 from .shared_live import (
     LiveNotice,
     member_targets,
+    members_report,
     queue_wait_text,
+    running_request,
     serialized_turn,
     typing_many,
 )
@@ -1621,12 +1623,11 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 return
             v = await db.get_shared_vault(sslug)
             if sub == "members":
-                lines = [f"<b>Участники «{_esc(ws['name'])}»:</b>"]
-                for uid_ in await db.shared_members(sslug):
-                    crown = " 👑 владелец" if v and int(v["owner_user_id"]) == uid_ else ""
-                    lines.append(f"• {_esc(await db.user_label(uid_))}{crown}")
-                lines.append("\nУбрать участника (только владелец): /ws kick <user_id|@username>")
-                await msg.reply("\n".join(lines), parse_mode="HTML")
+                members = [(uid_, await db.user_label(uid_), bool(v and int(v["owner_user_id"]) == uid_))
+                           for uid_ in await db.shared_members(sslug)]
+                last_seen = await db.last_activity_in_workspace(ws["project_slug"])
+                await msg.reply(members_report(ws["name"], members, last_seen, running_request(ws["project_slug"])),
+                                parse_mode="HTML")
                 return
             if await shared_role(db, sslug, space.user_id) != "owner":
                 await msg.reply("Убирать участников может только владелец воркспейса.")
