@@ -352,6 +352,32 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "baidu_search",
+            "description": (
+                "Поиск в Baidu (百度) — для запросов НА КИТАЙСКОМ: китайские товары и производители "
+                "(1688/Taobao/JD), компании, роботы, платы, статьи на 微信/知乎/bilibili/CSDN. "
+                "Формулируй query по-китайски (иероглифами), Baidu по-русски/по-английски ищет плохо. "
+                "Возвращает список {title, href, body, source} (до max_results). "
+                "Если Baidu показал капчу — результаты придут из DuckDuckGo (регион Китай), "
+                "об этом будет пометка в первой строке."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Запрос на китайском, например «大陆智源 ANDI 机器人»"},
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Максимум результатов (1–10). По умолчанию 5.",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "fetch_url",
             "description": (
                 "Загрузить содержимое веб-страницы по URL и вернуть очищенный текст. "
@@ -953,6 +979,11 @@ class ToolExecutor:
                 return ans or "(no answer / timeout)"
             if name == "web_search":
                 return await self._web_search(
+                    arguments["query"],
+                    min(int(arguments.get("max_results", 5)), 10),
+                )
+            if name == "baidu_search":
+                return await self._baidu_search(
                     arguments["query"],
                     min(int(arguments.get("max_results", 5)), 10),
                 )
@@ -1660,6 +1691,99 @@ class ToolExecutor:
         except Exception as exc:  # noqa: BLE001
             log.warning("web_search failed: %s", exc)
             return f"ERROR web_search: {exc}"
+
+    # Имитации браузера для Baidu: без них www.baidu.com/s отдаёт капчу (wappass).
+    BAIDU_IMPERSONATE = ("chrome_124", "chrome_120", "edge_122", "safari_17.5")
+
+    @staticmethod
+    def _baidu_blocked(html: str, final_url: str = "") -> bool:
+        """Baidu вместо выдачи показал капчу / страницу проверки."""
+        return (not html) or ("wappass.baidu.com" in (final_url or "")) or ("百度安全验证" in html) \
+            or ("c-container" not in html)
+
+    @staticmethod
+    def _parse_baidu_html(html: str, max_results: int = 5) -> list[dict]:
+        """Разобрать выдачу www.baidu.com/s: заголовок, настоящий URL (атрибут mu, а не
+        редирект baidu.com/link), сниппет, источник. Агрегатные блоки Baidu (картинки,
+        видео, «百度百科»-карточки без mu) пропускаем."""
+        from bs4 import BeautifulSoup  # type: ignore[import]
+        soup = BeautifulSoup(html, "html.parser")
+        out: list[dict] = []
+        seen: set[str] = set()
+        for d in soup.select("div.c-container"):
+            h3 = d.find("h3")
+            if h3 is None:
+                continue
+            title = h3.get_text(" ", strip=True)
+            a = h3.find("a")
+            href = (d.get("mu") or (a.get("href") if a else "") or "").strip()
+            if not href or "baidu.com/link?" in href or href in seen:
+                continue
+            if any(x in href for x in ("image.baidu.com", "v.baidu.com", "map.baidu.com")):
+                continue
+            seen.add(href)
+            src_el = d.select_one(".c-showurl, [class*=source_], [class*=siteLink], .c-color-gray")
+            source = src_el.get_text(" ", strip=True) if src_el else ""
+            text = d.get_text(" ", strip=True)
+            if text.startswith(title):
+                text = text[len(title):].strip(" -—·|")
+            if source and text.endswith(source):
+                text = text[: -len(source)].rstrip(" -—·|")
+            out.append({"title": title, "href": href, "body": text[:300], "source": source})
+            if len(out) >= max_results:
+                break
+        return out
+
+    async def _baidu_search(self, query: str, max_results: int = 5) -> str:
+        """Поиск в Baidu через primp (имитация браузера). При капче — DuckDuckGo с регионом cn-zh."""
+        import asyncio
+
+        def _sync() -> tuple[list[dict], str]:
+            import primp  # type: ignore[import]  # ставится вместе с ddgs
+            last = "Baidu не ответил"
+            for imp in ToolExecutor.BAIDU_IMPERSONATE:
+                try:
+                    client = primp.Client(impersonate=imp, timeout=20, follow_redirects=True)
+                    resp = client.get(
+                        "https://www.baidu.com/s",
+                        params={"wd": query, "ie": "utf-8", "rn": str(max(10, max_results))},
+                        headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5"},
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last = f"{imp}: {exc}"
+                    continue
+                html = resp.text or ""
+                if ToolExecutor._baidu_blocked(html, getattr(resp, "url", "") or ""):
+                    last = f"{imp}: капча/нет выдачи"
+                    log.info("baidu_search: blocked with %s", imp)
+                    continue
+                return ToolExecutor._parse_baidu_html(html, max_results), ""
+            return [], last
+
+        loop = asyncio.get_running_loop()
+        try:
+            results, err = await loop.run_in_executor(None, _sync)
+        except Exception as exc:  # noqa: BLE001
+            results, err = [], str(exc)
+        if results:
+            log.info("baidu_search %r → %d результатов", query[:60], len(results))
+            return json.dumps(results, ensure_ascii=False, indent=2)
+        log.warning("baidu_search failed (%s), falling back to DuckDuckGo cn-zh", err)
+
+        def _ddg() -> list[dict]:
+            try:
+                from ddgs import DDGS  # type: ignore[import]
+            except ImportError:
+                from duckduckgo_search import DDGS  # type: ignore[import]
+            with DDGS() as ddgs:
+                return list(ddgs.text(query, region="cn-zh", max_results=max_results))
+
+        try:
+            fallback = await loop.run_in_executor(None, _ddg)
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR baidu_search: Baidu недоступен ({err}); DuckDuckGo тоже: {exc}"
+        return (f"[Baidu недоступен: {err}. Ниже результаты DuckDuckGo, регион Китай]\n"
+                + json.dumps(fallback, ensure_ascii=False, indent=2))
 
     @staticmethod
     async def _fetch_git_log(repo: str, since: str | None = None, limit: int = 30) -> str:
