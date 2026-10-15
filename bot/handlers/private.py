@@ -54,6 +54,7 @@ from ..media_parser import (
 )
 from ..media_refs import missing_note, strip_images_block
 from ..orchestrator import Orchestrator
+from ..skills import load_skills, match_command
 from ..personal import (
     ARTIFACT_KINDS,
     SHARED_PREFIX,
@@ -403,7 +404,42 @@ _STEP_LABELS = {
     "move_file": "📁 переношу", "delete_file": "🗑 удаляю",
     "describe_media": "👁 смотрю файл", "generate_image": "🎨 рисую",
     "share_to_chat": "📤 делюсь с чатом", "get_current_time": "🕐 смотрю время",
+    "append_to_section": "✍️ дописываю секцию", "ask_choice": "❓ спрашиваю тебя",
+    "use_skill": "🧩 беру скил", "summarize_file": "🗜 конспектирую", "grep_dir": "🔎 ищу",
+    "search_wiki": "🔎 ищу в vault", "baidu_search": "🌐 ищу на Baidu", "fetch_image": "🖼 качаю картинку",
+    "fetch_file": "⬇️ качаю файл", "extract_archive": "📦 распаковываю",
 }
+
+
+def _fmt_k(n: int) -> str:
+    return f"{n / 1000:.0f}k" if n >= 1000 else str(n)
+
+
+def _fmt_dur(sec: float) -> str:
+    sec = int(sec)
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+def render_progress(steps: list[str], meta: dict, *, now: float) -> str:
+    """Текст живой плашки агента: шапка (время, шаг, контекст, токены, фаза) + хвост шагов."""
+    head = [f"⏳ {_fmt_dur(now - meta['t0'])}"]
+    if meta.get("step"):
+        head.append(f"шаг {meta['step']}/{meta.get('max_steps', '?')}")
+    if meta.get("ctx_chars"):
+        head.append(f"контекст {_fmt_k(meta['ctx_chars'])} симв")
+    if meta.get("tokens"):
+        cached = meta.get("tokens_cached") or 0
+        head.append(f"токены {_fmt_k(meta['tokens'])}" + (f" (кэш {_fmt_k(cached)})" if cached else ""))
+    phase = meta.get("phase") or ""
+    if phase == "thinking":
+        phase = f"🧠 думаю… {int(now - meta['phase_t0'])}с"
+    lines = [" · ".join(head)]
+    if phase:
+        lines.append(phase)
+    if meta.get("note"):
+        lines.append(f"💭 {meta['note']}")
+    lines += steps[-6:]
+    return "\n".join(lines)
 
 
 def _step_line(name: str, args: dict) -> str:
@@ -1337,25 +1373,71 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         who = "🤖 DuckSidian" + (f" · 📌 {ws_name}" if ws_name else "")
         space.append_inbox(who=who, text=text, ts=now, message_id=mid, chat_id=msg.chat.id)
 
-    def _draft_progress(msg: Message):
-        """Стриминг прогресса агента черновиком (Bot API sendMessageDraft, только личка)."""
-        draft_id = random.randint(1, 2**31 - 1)
-        steps: list[str] = []
-        state = {"ok": True}
+    class _DraftProgress:
+        """Живая плашка агента черновиком (Bot API sendMessageDraft, только личка): время,
+        шаг N/max, размер контекста, токены, текущая фаза и последние шаги. Черновик
+        Telegram гаснет без обновлений, поэтому пока модель думает — heartbeat."""
+        HEARTBEAT = 7.0
 
-        async def progress(name: str, args: dict) -> None:
-            if not state["ok"]:
+        def __init__(self, msg: Message) -> None:
+            self.msg = msg
+            self.draft_id = random.randint(1, 2**31 - 1)
+            self.steps: list[str] = []
+            now = asyncio.get_running_loop().time()
+            self.meta: dict = {"t0": now, "phase": "", "phase_t0": now}
+            self.ok = True
+            self.fails = 0
+            self._hb: asyncio.Task | None = None
+
+        def _now(self) -> float:
+            return asyncio.get_running_loop().time()
+
+        async def _push(self) -> None:
+            if not self.ok:
                 return
-            steps.append(_step_line(name, args))
-            text = "⏳ " + "\n".join(steps[-6:])
+            text = render_progress(self.steps, self.meta, now=self._now())
             try:
                 await bot.send_message_draft(
-                    msg.chat.id, draft_id, message_thread_id=_thread_id(msg), text=text[:3500],
+                    self.msg.chat.id, self.draft_id, message_thread_id=_thread_id(self.msg),
+                    text=text[:3500],
                 )
+                self.fails = 0
             except Exception as exc:  # noqa: BLE001
-                state["ok"] = False
-                log.debug("send_message_draft unavailable: %s", exc)
-        return progress
+                # Разовый сбой (флуд-лимит, сеть) не гасит плашку; три подряд — API нет.
+                self.fails += 1
+                if self.fails >= 3:
+                    self.ok = False
+                log.debug("send_message_draft failed (%d): %s", self.fails, exc)
+
+        async def _heartbeat(self) -> None:
+            while self.ok:
+                await asyncio.sleep(self.HEARTBEAT)
+                await self._push()
+
+        async def __call__(self, name: str, args: dict) -> None:
+            if self._hb is None:
+                self._hb = asyncio.create_task(self._heartbeat())
+            if name == "__thinking__":
+                self.meta.update({k: args[k] for k in
+                                  ("step", "max_steps", "ctx_chars", "tokens", "tokens_cached") if k in args})
+                self.meta["phase"], self.meta["phase_t0"] = "thinking", self._now()
+                self.meta["note"] = ""
+            elif name == "__note__":
+                note = " ".join(str(args.get("text") or "").split())
+                self.meta["note"] = note[:140] + ("…" if len(note) > 140 else "")
+            else:
+                line = _step_line(name, args)
+                self.steps.append(line)
+                self.meta["phase"], self.meta["phase_t0"] = line, self._now()
+            await self._push()
+
+        def close(self) -> None:
+            self.ok = False
+            if self._hb is not None:
+                self._hb.cancel()
+
+    def _draft_progress(msg: Message) -> "_DraftProgress":
+        return _DraftProgress(msg)
 
     async def _history(msg: Message, shared_project_slug: str | None = None) -> list[dict[str, str]]:
         """Последние реплики диалога. В совместном воркспейсе (project_slug вида
@@ -2224,6 +2306,21 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         if cb.message:
             await cb.message.answer("Как назвать воркспейс? Напиши имя одним сообщением (или /cancel).")
 
+    @router.message(Command("skills"))
+    async def cmd_skills(msg: Message) -> None:
+        space = await _guard(msg)
+        if not space:
+            return
+        ws = await _workspace(msg, space)
+        space = _space_for(space, ws)
+        skills = load_skills(space.wiki.root)
+        lines = ["<b>Скилы</b> — вызов: <code>/имя текст</code> или просто попроси словами.", ""]
+        for sk in skills.values():
+            src = "" if sk.source == "builtin" else f" <i>({_esc(sk.source)})</i>"
+            lines.append(f"• <code>/{_esc(sk.name)}</code> — {_esc(sk.description)}{src}")
+        lines += ["", "Свой скил: попроси «сделай скил …» — он ляжет в <code>skills/&lt;имя&gt;.md</code> vault."]
+        await msg.reply("\n".join(lines), parse_mode="HTML")
+
     @router.message(Command("cancel"))
     async def cmd_cancel(msg: Message) -> None:
         if msg.from_user and _awaiting.pop(msg.from_user.id, None):
@@ -2395,6 +2492,12 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             if await orch.deliver_answer(qid, msg.text):
                 await msg.reply("✅ ответ передан агенту")
                 return
+        # Агент ждёт ответа на ask_choice в этой теме — обычный текст и есть ответ.
+        pq = orch.pending_private_question(msg.chat.id, _thread_id(msg))
+        if pq and msg.text and not msg.text.startswith("/"):
+            if await orch.deliver_answer(pq, msg.text):
+                await _react(bot, msg, "👌")
+                return
         ws_pre = await db.get_workspace(msg.chat.id, _thread_id(msg)) if _thread_id(msg) else None
         if ws_pre is not None and ws_pre["project_slug"] and await _foreign_shared(msg, dict(ws_pre), space):
             return
@@ -2543,6 +2646,13 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             if prev:
                 agent_text = f"[Мой предыдущий ответ]:\n{prev[:1500]}\n\n[Реплика пользователя]:\n{full_text}"
 
+        # `/grill текст`, `/skill tidy` — явный вызов скила.
+        sk_cmd = match_command(full_text, load_skills(space.wiki.root))
+        if sk_cmd:
+            sk, rest = sk_cmd
+            agent_text = (f"[Пользователь вызвал скил «{sk.name}» — сразу use_skill('{sk.name}') "
+                          f"и действуй по нему.]\n{rest or '(без уточнений — по текущему проекту)'}")
+
         author_id = msg.from_user.id if msg.from_user else None
         queued = False
 
@@ -2573,13 +2683,15 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             notice = LiveNotice(bot, targets, author=who, ws_name=ws_name or "",
                                 request=text or transcript or _media_label(msg))
             await notice.start()
+            progress = _draft_progress(msg)
             try:
                 answer = await orch.personal_turn(
                     space, agent_text or "(без текста — см. вложение)",
                     message_id=msg.message_id, attached_media=attached, history=history,
-                    workspace=ws, progress=_draft_progress(msg),
+                    workspace=ws, progress=progress,
                     workspace_fn=_workspace_tool_fn(msg, pspace, space),
                     author_name=who, author_id=author_id, chat_id=msg.chat.id,
+                    thread_id=_thread_id(msg),
                 )
             except Exception as exc:  # noqa: BLE001
                 log.exception("personal_turn failed")
@@ -2588,6 +2700,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 await notice.fail(type(exc).__name__)
                 return
             finally:
+                progress.close()
                 stop.set()
                 typing.cancel()
                 typing_others.cancel()

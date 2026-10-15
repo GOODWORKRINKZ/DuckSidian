@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-WRITABLE_PREFIXES = ("raw/", "wiki/")
+WRITABLE_PREFIXES = ("raw/", "wiki/", "skills/")
 
 # Расширения, которым разрешена запись агентом в wiki/sources/ (вдруг нужно).
 # Для raw/ запись всегда запрещена агенту, но боту — разрешена через save_asset.

@@ -39,6 +39,8 @@ from .agent.prompts import (
 )
 from .agent.loop import MEDIA_TOOLS, UNCONFIRMED_MEDIA_NOTE
 from .agent.tools import PERSONAL_WRITE_TOOLS, ToolExecutor, personal_tool_schemas
+from .agent.wikitools import sections
+from .skills import catalog, load_skills
 from .config import ChatConfig, settings
 from .db import DB
 from .git_sync import commit_and_push
@@ -51,6 +53,33 @@ from .wiki import Wiki, WikiPathError
 log = logging.getLogger(__name__)
 
 UNCONFIRMED_WRITE_NOTE = "⚠️ в vault ничего не записано"
+
+
+_WRITE_VERB = {"write_file": "создан/перезаписан", "delete_file": "удалён", "move_file": "перенесён"}
+
+
+def writes_footer(writes: dict[str, str], limit: int = 8) -> str:
+    """Сводка реально изменённых файлов — генерирует код по логу инструментов, а не
+    модель, поэтому «записал» в ответе всегда можно сверить."""
+    paths = [p for p in writes if p.endswith(".md") and not p.startswith("raw/")]
+    if not paths:
+        return ""
+    items = []
+    for p in paths[:limit]:
+        verb = _WRITE_VERB.get(writes[p], "")
+        items.append(f"`{p}`" + (f" ({verb})" if verb else ""))
+    more = f" и ещё {len(paths) - limit}" if len(paths) > limit else ""
+    return "✍️ Изменено: " + ", ".join(items) + more
+
+
+def add_footer(answer: str, footer: str) -> str:
+    """Добавить строку до блока IMAGES: (его хвост бот отрезает перед отправкой)."""
+    if not footer:
+        return answer
+    m = find_images_marker(answer)
+    if not m:
+        return f"{answer.rstrip()}\n\n{footer}"
+    return f"{answer[:m.start()].rstrip()}\n\n{footer}\n\n{answer[m.start():].lstrip()}"
 
 
 def mark_unconfirmed_media(answer: str) -> str:
@@ -133,6 +162,9 @@ class Orchestrator:
         self.wiki = wiki  # глобальный wiki (для /ask, /search, /lint, /summary)
         self.client = LLMClient()
         self._waiters: dict[int, asyncio.Future[str]] = {}
+        # Открытый вопрос ask_choice в личке: (chat_id, thread_id) → qid. Пока он есть,
+        # обычное текстовое сообщение в этой теме — ответ на вопрос, а не новый запрос.
+        self._private_pending: dict[tuple[int, int | None], int] = {}
         # Личные пространства (DM): user_id → PersonalSpace
         self._spaces: dict[int, PersonalSpace] = {}
         # Накапливаем статистику токенов с момента старта бота
@@ -198,6 +230,48 @@ class Orchestrator:
         finally:
             self._waiters.pop(qid, None)
 
+    async def ask_private(
+        self, question: str, options: list[str] | None, chat_id: int, thread_id: int | None,
+        timeout: float = 15 * 60,
+    ) -> str:
+        """Вопрос агента пользователю в его личный чат/тему: кнопки-варианты + можно
+        ответить текстом. Ждём до timeout, потом агент решает сам."""
+        qid = await self.db.add_question(
+            batch_id=None, question=question,
+            options=json.dumps(options, ensure_ascii=False) if options else None,
+        )
+        kb = None
+        if options:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=opt[:60], callback_data=f"ans:{qid}:{i}")]
+                for i, opt in enumerate(options[:8])
+            ])
+        text = (
+            f"❓ {md_to_tg_html(question)}\n\n"
+            f"<i>Выбери вариант или просто напиши свой ответ. id={qid}.</i>"
+        )
+        sent = await self.bot.send_message(
+            chat_id=chat_id, text=text, message_thread_id=thread_id,
+            reply_markup=kb, parse_mode="HTML",
+        )
+        await self.db.attach_question_post(qid, sent.message_id)
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        self._waiters[qid] = fut
+        key = (chat_id, thread_id)
+        self._private_pending[key] = qid
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            return (f"(нет ответа за {int(timeout // 60)} мин — реши сам, явно пометь это как "
+                    "допущение и спроси в итоговом ответе)")
+        finally:
+            self._waiters.pop(qid, None)
+            if self._private_pending.get(key) == qid:
+                self._private_pending.pop(key, None)
+
+    def pending_private_question(self, chat_id: int, thread_id: int | None) -> int | None:
+        return self._private_pending.get((chat_id, thread_id))
+
     async def deliver_answer(self, qid: int, answer: str) -> bool:
         await self.db.answer_question(qid, answer)
         fut = self._waiters.get(qid)
@@ -209,13 +283,14 @@ class Orchestrator:
     def _make_executor(self, wiki: Wiki, chat_cfg: ChatConfig | None = None,
                        file_cache: dict[str, str] | None = None,
                        team_wikis: dict[str, Wiki] | None = None,
-                       share_fn: Any = None, workspace_fn: Any = None) -> ToolExecutor:
+                       share_fn: Any = None, workspace_fn: Any = None,
+                       choice_fn: Any = None) -> ToolExecutor:
         async def ask_user_cb(question: str, options: list[str] | None) -> str:
             return await self._ask_user(question, options, chat_cfg)
         return ToolExecutor(wiki, ask_user_cb, deepseek_client=self.client,
                             file_cache=file_cache, db=self.db,
                             team_wikis=team_wikis, share_fn=share_fn,
-                            workspace_fn=workspace_fn)
+                            workspace_fn=workspace_fn, choice_fn=choice_fn)
 
     # --- LLM model switching ---
 
@@ -322,6 +397,7 @@ class Orchestrator:
         author_name: str | None = None,
         author_id: int | None = None,
         chat_id: int | None = None,
+        thread_id: int | None = None,
     ) -> str:
         """Один ход диалога в личном режиме: агент классифицирует сообщение
         (запись / поиск / управление артефактами / разговор) и действует.
@@ -335,10 +411,18 @@ class Orchestrator:
         async def share_fn(path: str, chat: str, comment: str) -> str:
             return await self.share_to_chat(space, path, chat, comment=comment)
 
+        choice_fn = None
+        if chat_id is not None:
+            async def choice_fn(question: str, options: list[str] | None) -> str:
+                return await self.ask_private(question, options, chat_id, thread_id)
+
         executor = self._make_executor(
             space.wiki, space.cfg, team_wikis=self._team_wikis(), share_fn=share_fn,
-            workspace_fn=workspace_fn,
+            workspace_fn=workspace_fn, choice_fn=choice_fn,
         )
+        skills = load_skills(space.wiki.root)
+        skills_block = (f"СКИЛЫ (use_skill(name), когда запрос подходит):\n{catalog(skills)}\n"
+                        if skills else "")
 
         def _read_or(rel: str, cap: int) -> str:
             try:
@@ -358,6 +442,7 @@ class Orchestrator:
                 + "\n".join(f"- {m}" for m in attached_media)
             )
         ws_block = ""
+        pinned_block = ""
         if workspace:
             slug = workspace.get("project_slug") or ""
             ws_block = (
@@ -365,6 +450,13 @@ class Orchestrator:
                 + (f" → проект wiki/projects/{slug}.md" if slug else "")
                 + ". Всё ниже относится к нему, если не сказано иное.\n"
             )
+            pinned = self._project_pinned(space, slug)
+            if pinned:
+                pinned_block = (
+                    f"\n\n=== ЗАКРЕПЛЕНО: wiki/projects/{slug.rsplit('/', 1)[-1]}.md "
+                    "(Цель / Текущий статус / Решения — источник правды о проекте) ===\n"
+                    f"{pinned}"
+                )
         author_name = author_name or space.display_name
         author_id = author_id if author_id is not None else space.user_id
         if space.is_shared:
@@ -385,8 +477,9 @@ class Orchestrator:
             f"Групповые чаты для search_team_wiki/share_to_chat: {chats_desc}.\n"
             f"Бюджет шагов: {settings.personal_agent_max_steps}.\n"
             f"{ws_block}"
+            f"{skills_block}"
             f"Источник этой реплики: [[raw/inbox/{today}#{anchor}]].\n\n"
-            f"--- КОНТЕКСТ VAULT (не читай эти файлы через read_file) ---\n{head_ctx}\n"
+            f"--- КОНТЕКСТ VAULT (не читай эти файлы через read_file) ---\n{head_ctx}{pinned_block}\n"
             f"--- КОНЕЦ КОНТЕКСТА ---\n\n"
             f"СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n{text.strip()}{media_block}"
         )
@@ -428,7 +521,22 @@ class Orchestrator:
             answer = mark_unconfirmed_media(answer)
         if run.unconfirmed_write:
             answer = mark_unconfirmed_write(answer)
+        else:
+            answer = add_footer(answer, writes_footer(run.writes))
         return answer
+
+    @staticmethod
+    def _project_pinned(space: Any, slug: str, cap: int = 4_000) -> str:
+        """Цель / Текущий статус / Решения страницы проекта воркспейса — в каждый ход,
+        чтобы ключевые факты не вымывались из окна истории диалога."""
+        name = (slug or "").rsplit("/", 1)[-1]
+        if not name:
+            return ""
+        try:
+            text = space.wiki.read_file(f"wiki/projects/{name}.md", max_bytes=2_000_000)
+        except Exception:  # noqa: BLE001
+            return ""
+        return sections(text, ["Цель", "Текущий статус", "Статус", "Решения"], cap)
 
     async def summarize_for_voice(self, text: str, max_chars: int | None = None) -> str:
         """Сжать ответ в короткий устный пересказ для TTS: 1–3 фразы, суть, без

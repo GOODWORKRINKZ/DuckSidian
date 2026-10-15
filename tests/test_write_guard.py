@@ -170,5 +170,5 @@ async def test_personal_turn_recovered_after_nudge(space: PersonalSpace,
     ])
     with caplog.at_level(logging.WARNING, logger="bot.orchestrator"):
         answer = await _orch(client).personal_turn(space, "z", message_id=8)
-    assert answer == "Записал в wiki/notes/z.md"
+    assert answer == "Записал в wiki/notes/z.md\n\n✍️ Изменено: `wiki/notes/z.md`"
     assert any("recovered=True" in r.getMessage() for r in caplog.records)

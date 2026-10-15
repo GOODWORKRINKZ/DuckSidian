@@ -11,6 +11,7 @@ import httpx
 
 from ..wiki import Wiki, WikiPathError
 from ..media_index import MediaIndex
+from .wikitools import append_to_section, big_file_view, broken_links, fuzzy_replace, similar_pages
 
 log = logging.getLogger(__name__)
 
@@ -162,11 +163,33 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "append_to_section",
+            "description": (
+                "Дописать текст в конец секции markdown-страницы по её заголовку (например "
+                "heading='Задачи' или '## Заметки'). Регистр/эмодзи/количество # не важны; секции "
+                "нет — создастся. Лучший способ добавить задачу/заметку/решение в страницу "
+                "проекта: не нужно читать файл целиком и подбирать old_string."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "heading": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "heading", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "edit_file",
             "description": (
                 "Точечный str-replace в файле: заменить old_string на new_string. "
-                "old_string должен встречаться РОВНО ОДИН раз. Идеально для правки frontmatter "
-                "(updated/sources/tags) или патчинга строки без регенерации всего файла."
+                "old_string должен встречаться РОВНО ОДИН раз (пробелы/переносы сверяются нестрого). "
+                "Копируй old_string из свежего read_lines, а не по памяти. Для добавления в секцию — "
+                "append_to_section."
             ),
             "parameters": {
                 "type": "object",
@@ -702,11 +725,52 @@ _PERSONAL_EXCLUDE = {"ask_user", "defer_question", "tag_media"}
 # Инструменты, которые реально что-то меняют в vault (или в темах/чатах). Если агент
 # ответил «записал/добавил/готово», а ни один из них не вызывался — запись выдумана.
 PERSONAL_WRITE_TOOLS = frozenset({
-    "write_file", "append_file", "edit_file", "move_file", "delete_file",
+    "write_file", "append_file", "append_to_section", "edit_file", "move_file", "delete_file",
     "fetch_file", "fetch_image", "extract_archive", "generate_image",
     "share_to_chat", "create_workspace", "share_workspace",
     "set_workspace_icon", "rename_workspace",
 })
+
+
+PERSONAL_EXTRA_TOOLS += [
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_choice",
+            "description": (
+                "Спросить пользователя и ДОЖДАТЬСЯ ответа: вопрос + варианты кнопками в его "
+                "чате (он может и написать свой ответ). Для уточнения, когда от ответа зависит, "
+                "что и куда записать, или для подтверждения слияния/удаления. Варианты — "
+                "конкретные (цифры, имена, формулировки из материала), 2–5 шт. Не больше 4 "
+                "вопросов за ход; если можно решить самому — не спрашивай."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["question", "options"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "use_skill",
+            "description": (
+                "Загрузить инструкцию скила из каталога СКИЛЫ (в контексте) и действовать по "
+                "ней. Вызывай, когда запрос подходит под описание/триггеры скила или "
+                "пользователь назвал его."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    },
+]
 
 
 def personal_tool_schemas() -> list[dict]:
@@ -728,7 +792,8 @@ class ToolExecutor:
                  file_cache: dict[str, str] | None = None, db: Any = None,
                  team_wikis: dict[str, Wiki] | None = None,
                  share_fn: ShareFn | None = None,
-                 workspace_fn: WorkspaceFn | None = None):
+                 workspace_fn: WorkspaceFn | None = None,
+                 choice_fn: AskUserFn | None = None):
         self.wiki = wiki
         self.ask_user = ask_user
         self._ds = deepseek_client
@@ -737,10 +802,56 @@ class ToolExecutor:
         self._team_wikis: dict[str, Wiki] = team_wikis or {}
         self._share_fn = share_fn
         self._workspace_fn = workspace_fn
+        # Личный режим: вопрос с кнопками в чат пользователя (ask_choice).
+        self._choice_fn = choice_fn
         self._media_index = MediaIndex(wiki.root)
         # Кэш содержимого файлов в рамках run_agent (или прокинутый снаружи —
         # тогда живёт между несколькими run_agent одного дня). Ключ — rel path.
         self._fcache: dict[str, str] = file_cache if file_cache is not None else {}
+
+    # Сколько символов read_file отдаёт целиком; больше — начало + оглавление.
+    # Согласовано с tool_result_cap в run_agent (6000): иначе хвост молча отрезается.
+    READ_FULL_MAX = 5_800
+    # Страница проекта крупнее этого — сигнал агенту разгрузить её.
+    PAGE_WARN_CHARS = 30_000
+
+    def _lint_after_write(self, rel: str, written: str, *, new_page: bool = False) -> str:
+        """Предупреждения к OK записи: битые wikilinks в записанном тексте, похожие
+        страницы (для новой), раздутая страница проекта. Пусто — всё чисто."""
+        if not rel.endswith(".md"):
+            return ""
+        notes: list[str] = []
+        try:
+            bad = broken_links(written, self.wiki.root)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("lint broken_links failed: %s", exc)
+            bad = []
+        if bad:
+            notes.append(
+                "⚠️ битые ссылки (такого файла в этом vault нет): "
+                + ", ".join(f"[[{b}]]" for b in bad)
+                + ". Исправь на существующую страницу или убери [[ ]] (ссылки в другие "
+                "воркспейсы/чаты не работают — пиши текстом «воркспейс X» / «[chat:Y]»)."
+            )
+        if new_page and rel.startswith("wiki/"):
+            sim = similar_pages(self.wiki.root, rel)
+            if sim:
+                notes.append(
+                    "⚠️ похожие страницы уже есть: " + ", ".join(f"`{p}`" for p in sim)
+                    + ". Если тема та же — перенеси новое туда (append_to_section) и удали "
+                    "эту страницу (delete_file), чтобы не плодить дубли."
+                )
+        try:
+            size = (self.wiki.root / rel).stat().st_size
+        except OSError:
+            size = 0
+        if size > self.PAGE_WARN_CHARS and rel.startswith("wiki/projects/"):
+            notes.append(
+                f"⚠️ страница проекта {size // 1024} КБ — слишком большая. Историю держи в "
+                "log.md, разборы — в wiki/research/, в проекте только Цель/Статус/актуальные "
+                "Задачи/Решения со ссылками."
+            )
+        return ("\n" + "\n".join(notes)) if notes else ""
 
     async def call(self, name: str, arguments: dict[str, Any]) -> str:
         try:
@@ -765,11 +876,12 @@ class ToolExecutor:
                         "или read_lines('log.md', start, end) для куска. "
                         "Для записи новой строки используй append_file('log.md', ...).]"
                     )
-                if path in self._fcache:
-                    log.info("read_file %s -> cache hit (%d chars)", path, len(self._fcache[path]))
-                    return self._fcache[path] + "\n\n[cached: этот файл уже был прочитан/записан ранее в этом ране; не читай его снова]"
                 content = self.wiki.read_file(path)
                 self._fcache[path] = content
+                # Большой файл в контекст целиком не влезет (результат режется) — отдаём
+                # начало + оглавление с номерами строк, дальше read_lines по секциям.
+                if len(content) > self.READ_FULL_MAX:
+                    return big_file_view(path, content, self.READ_FULL_MAX - 1500)
                 return content
             if name == "read_lines":
                 path = self.wiki.find_md(arguments["path"])
@@ -868,11 +980,12 @@ class ToolExecutor:
                 if path.startswith("raw/"):
                     return "ERROR: raw/ is read-only for the agent"
                 content = arguments["content"]
+                is_new = not (self.wiki.root / path).exists()
                 rel = self.wiki.write_file(path, content)
                 # Актуализируем кэш под реальным rel-path и по исходному.
                 self._fcache[rel] = content
                 self._fcache[path] = content
-                return f"OK: wrote {rel}"
+                return f"OK: wrote {rel}" + self._lint_after_write(rel, content, new_page=is_new)
             if name == "append_file":
                 path = arguments.get("path") or arguments.get("filename") or arguments.get("file_path") or arguments.get("filepath")
                 if not path:
@@ -891,7 +1004,25 @@ class ToolExecutor:
                     except Exception:
                         pass
                 self._fcache[path] = self._fcache.get(rel, "")
-                return f"OK: appended {rel}"
+                return f"OK: appended {rel}" + self._lint_after_write(rel, addition)
+            if name == "append_to_section":
+                path = arguments.get("path") or arguments.get("file_path") or ""
+                heading = str(arguments.get("heading") or "").strip()
+                addition = str(arguments.get("content") or "")
+                if not path or not heading or not addition.strip():
+                    return "ERROR: missing 'path', 'heading' or 'content'"
+                if path.startswith("raw/"):
+                    return "ERROR: raw/ is read-only for the agent"
+                path = self.wiki.find_md(path)
+                try:
+                    current = self.wiki.read_file(path, max_bytes=5_000_000)
+                except WikiPathError as exc:
+                    return f"ERROR: {exc}"
+                updated, info = append_to_section(current, heading, addition)
+                rel = self.wiki.write_file(path, updated)
+                self._fcache[rel] = updated
+                self._fcache[path] = updated
+                return f"OK: {rel}: {info}" + self._lint_after_write(rel, addition)
             if name == "edit_file":
                 path = arguments.get("path") or arguments.get("file_path")
                 old_s = arguments.get("old_string", "")
@@ -901,29 +1032,21 @@ class ToolExecutor:
                 if path.startswith("raw/"):
                     return "ERROR: raw/ is read-only for the agent"
                 path = self.wiki.find_md(path)
-                # Берём из кэша или с диска
-                current = self._fcache.get(path)
-                if current is None:
-                    try:
-                        current = self.wiki.read_file(path)
-                    except WikiPathError as exc:
-                        return f"ERROR: {exc}"
-                cnt = current.count(old_s)
-                if cnt == 0:
-                    return (
-                        "ERROR: old_string не найден в файле. "
-                        "Проверь точное совпадение (пробелы/переносы) или используй read_lines."
-                    )
-                if cnt > 1:
-                    return (
-                        f"ERROR: old_string встречается {cnt} раз. "
-                        "Добавь контекст (соседние строки), чтобы old_string был уникален."
-                    )
-                updated = current.replace(old_s, new_s, 1)
+                # Всегда с диска: кэш мог устареть (другой прогон в общем воркспейсе) или
+                # быть обрезан лимитом read_file — запись из него потеряла бы хвост файла.
+                try:
+                    current = self.wiki.read_file(path, max_bytes=5_000_000)
+                except WikiPathError as exc:
+                    return f"ERROR: {exc}"
+                updated, info = fuzzy_replace(current, old_s, new_s)
+                if updated is None:
+                    return f"ERROR: {info}"
                 rel = self.wiki.write_file(path, updated)
                 self._fcache[rel] = updated
                 self._fcache[path] = updated
-                return f"OK: edited {rel} (замена {len(old_s)} → {len(new_s)} симв.)"
+                how = "" if info == "exact" else " (совпадение без учёта пробелов)"
+                return (f"OK: edited {rel} (замена {len(old_s)} → {len(new_s)} симв.){how}"
+                        + self._lint_after_write(rel, new_s))
             if name == "delete_file":
                 path = arguments.get("path", "")
                 if not path:
@@ -973,6 +1096,22 @@ class ToolExecutor:
                 else:
                     log.warning("defer_question: no db attached, falling back to ask_user")
                     return await self.ask_user(question, options)
+            if name == "ask_choice":
+                if self._choice_fn is None:
+                    return "ERROR: ask_choice недоступен — задай вопрос в ответе (finish)."
+                question = str(arguments.get("question") or "").strip()
+                opts = [str(o).strip() for o in (arguments.get("options") or []) if str(o).strip()]
+                if not question:
+                    return "ERROR: missing 'question'"
+                ans = await self._choice_fn(question, opts[:8] or None)
+                return f"Ответ пользователя: {ans}" if ans else "(нет ответа)"
+            if name == "use_skill":
+                from ..skills import load_skills  # noqa: PLC0415
+                skills = load_skills(self.wiki.root)
+                sk = skills.get(str(arguments.get("name") or "").strip().lower())
+                if sk is None:
+                    return "ERROR: нет такого скила. Есть: " + (", ".join(skills) or "—")
+                return f"[СКИЛ {sk.name} — следуй этой инструкции]\n{sk.body}"
             if name == "ask_user":
                 opts = arguments.get("options") or None
                 ans = await self.ask_user(arguments["question"], opts)

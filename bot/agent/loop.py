@@ -25,6 +25,11 @@ class AgentRun:
     tokens_completion: int = 0
     tokens_cached: int = 0
     tools_called: list[str] = field(default_factory=list)
+    # Инструменты, вернувшие успех (не «ERROR: …»). Guard записи смотрит сюда: упавший
+    # edit_file — не запись, ответ «записал» после него — выдумка.
+    tools_ok: list[str] = field(default_factory=list)
+    # Реально изменённые файлы vault (успешные write-инструменты): путь → действие.
+    writes: dict[str, str] = field(default_factory=dict)
     # Ответ утверждал запись, а write-инструменты не вызывались: nudged — агенту
     # один раз досылали подсказку; unconfirmed_write — так и не записал.
     write_nudged: bool = False
@@ -109,6 +114,16 @@ def claims_media(text: str) -> bool:
 
 def _ctx_chars(messages: list[dict[str, Any]]) -> int:
     return sum(len(str(m.get("content") or "")) for m in messages)
+
+
+async def _emit(on_step: Any, name: str, args: dict[str, Any]) -> None:
+    """Служебное событие прогресса (`__thinking__`, `__note__`); ошибки колбэка не роняют прогон."""
+    if on_step is None:
+        return
+    try:
+        await on_step(name, args)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("on_step failed: %s", exc)
 
 
 async def _compress_old_tool_results(
@@ -212,7 +227,7 @@ async def run_agent(
     def _fake_write(text: str) -> bool:
         return (
             write_tools is not None
-            and not any(t in write_tools for t in run.tools_called)
+            and not any(t in write_tools for t in run.tools_ok)
             and claims_write(text)
         )
 
@@ -285,6 +300,12 @@ async def run_agent(
                     "что у тебя уже есть. Лучше неполный отчёт, чем пустой."
                 ),
             })
+        await _emit(on_step, "__thinking__", {
+            "step": step + 1, "max_steps": max_steps, "ctx_chars": ctx_chars,
+            "ctx_msgs": len(messages),
+            "tokens": run.tokens_prompt + run.tokens_completion,
+            "tokens_cached": run.tokens_cached,
+        })
         resp = await client.chat(messages=messages, tools=tool_schemas)
         _p, _c, _ca = extract_usage(resp)
         run.tokens_prompt += _p
@@ -311,6 +332,10 @@ async def run_agent(
         tool_calls = msg.get("tool_calls") or []
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
+            # Пояснение модели рядом с tool-call'ами («сейчас проверю X») — в прогресс.
+            note = _strip_think(raw_content).strip()
+            if note:
+                await _emit(on_step, "__note__", {"text": note})
         messages.append(assistant_msg)
 
         # DeepSeek иногда пишет tool-calls прямо в content как XML-разметку
@@ -377,6 +402,11 @@ async def run_agent(
                 except Exception as exc:  # noqa: BLE001
                     log.debug("on_step failed: %s", exc)
             result = await executor.call(name, args)
+            if not result.lstrip().startswith("ERROR"):
+                run.tools_ok.append(name)
+                target = args.get("dst") or args.get("path") or args.get("file_path")
+                if write_tools is not None and name in write_tools and target:
+                    run.writes[str(target).lstrip("/")] = name
             log.info("agent step %d: tool=%s result_len=%d head=%r",
                      step, name, len(result), result[:120])
             # Trim too-large tool outputs to keep context window sane.
