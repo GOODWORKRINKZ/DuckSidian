@@ -85,8 +85,6 @@ LLM_PROVIDERS: dict[str, LLMProvider] = {
                 "qwen3.6-flash", "deepseek-v4.1-flash", "deepseek-v4-pro",
                 "deepseek-v4-flash-0731", "glm-5.3", "glm-5.2", "auto"],
         price_in=0.40, price_out=1.20, price_cached=0.10,
-        extra_payload={"enable_thinking": False},
-        extra_payload_prefixes=["qwen"],
     ),
     "openai": LLMProvider(
         key="openai", title="OpenAI",
