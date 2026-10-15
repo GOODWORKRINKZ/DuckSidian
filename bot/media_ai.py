@@ -25,6 +25,7 @@ from typing import Any
 import httpx
 
 from .config import settings
+from .media_refs import strip_images_block
 
 log = logging.getLogger(__name__)
 tokens_log = logging.getLogger("bot.tokens")
@@ -48,7 +49,7 @@ def _strip_think(s: str) -> str:
 def _md_for_tts(text: str) -> str:
     """Убрать markdown/ссылки/служебные блоки, чтобы озвучивать чистый текст."""
     t = text or ""
-    t = re.split(r"(?im)^\s*IMAGES\s*:\s*$", t)[0]
+    t = strip_images_block(t)[0]
     t = re.sub(r"```.*?```", " ", t, flags=re.DOTALL)
     t = re.sub(r"`([^`]*)`", r"\1", t)
     t = re.sub(r"!\[\[[^\]]*\]\]", " ", t)

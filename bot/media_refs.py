@@ -25,6 +25,7 @@ _PATH_RE = re.compile(
     rf"(?<![\w/.-])((?:[\w.-]+/)*[\w.-]+\.(?:{_EXT_ALT}))(?![\w])",
     re.IGNORECASE | re.UNICODE,
 )
+_WHOLE_PATH_RE = re.compile(rf"[^\s`<>|\"']+(?: [^\s`<>|\"']+)*\.(?:{_EXT_ALT})", re.IGNORECASE)
 # Любое упоминание raw/assets/… в тексте (вне блока IMAGES).
 _ASSET_RE = re.compile(rf"raw/assets/[^\s`\)\]\}}\"'<>|]+?\.(?:{_EXT_ALT})(?![\w])", re.IGNORECASE)
 
@@ -72,12 +73,16 @@ def parse_images_block(answer: str) -> list[str]:
             if rels:
                 break
             continue
-        pm = _PATH_RE.search(line)
-        if not pm:
+        # Вся строка — путь (в т.ч. с пробелами внутри [[ ]] / бэктиков).
+        if _WHOLE_PATH_RE.fullmatch(line):
+            rel = line
+        elif pm := _PATH_RE.search(line):
+            rel = pm.group(1)
+        else:
             if re.fullmatch(r"\S+\.\w{2,5}", line):   # путь к не-медиа (pdf, …) — пропускаем
                 continue
             break
-        rel = pm.group(1).lstrip("./")
+        rel = rel[2:] if rel.startswith("./") else rel
         if rel not in rels:
             rels.append(rel)
     return rels
@@ -118,6 +123,6 @@ def mentioned_media(answer: str) -> list[str]:
 
 def missing_note(missing: list[str]) -> str:
     """Одна строка для пользователя о файлах, которых нет в vault."""
-    names = ", ".join(f"`{p}`" for p in missing[:5])
+    names = ", ".join(missing[:5])
     more = f" и ещё {len(missing) - 5}" if len(missing) > 5 else ""
     return f"⚠️ Не нашёл в vault файлы: {names}{more} — не отправляю."

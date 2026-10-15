@@ -52,6 +52,7 @@ from ..media_parser import (
     extract_text_from_file,
     transcribe_video,
 )
+from ..media_refs import missing_note, strip_images_block
 from ..orchestrator import Orchestrator
 from ..personal import (
     ARTIFACT_KINDS,
@@ -78,7 +79,7 @@ from .admin_shared import (
     is_admin,
     is_private_allowed,
 )
-from .commands import REACT_ERROR, REACT_QUEUED, _download_ask_media, _extract_image_refs, _react, _reply_html
+from .commands import REACT_ERROR, REACT_QUEUED, _download_ask_media, _image_refs, _react, _reply_html
 from .listener import _download_media, handle_answer_callback, question_id_from_reply
 
 log = logging.getLogger(__name__)
@@ -314,16 +315,18 @@ async def _typing_loop(bot: Bot, chat_id: int, stop: asyncio.Event,
 
 
 def _strip_images_block(answer: str) -> tuple[str, bool]:
-    m = re.search(r"(?im)^\s*IMAGES\s*:\s*$", answer or "")
-    if not m:
-        return (answer or "").strip(), False
-    return answer[: m.start()].rstrip(), True
+    """(текст без блока IMAGES, был ли блок) — терпимо к «**IMAGES:**», «IMAGES :»."""
+    return strip_images_block(answer)
 
 
 async def _attach_media(msg: Message, answer: str, wiki_root) -> None:
-    """Прикрепить файлы из блока IMAGES: ответа агента."""
+    """Прикрепить файлы из блока IMAGES: ответа агента. Каждый путь проверяется в
+    vault текущего пространства; отсутствующие не шлём и называем одной строкой."""
     try:
-        paths = _extract_image_refs(answer or "", wiki_root, max_n=5)
+        paths, missing = _image_refs(answer or "", wiki_root, max_n=5)
+        if missing:
+            log.warning("private: IMAGES paths not in vault %s: %s", wiki_root, missing)
+            await msg.answer(missing_note(missing))
         paths = [p for p in paths if os.path.getsize(p) <= _TG_MAX_BYTES]
         for p in paths:
             ext = "." + p.lower().rsplit(".", 1)[-1]
