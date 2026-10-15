@@ -72,7 +72,7 @@ LLM_PROVIDERS: dict[str, LLMProvider] = {
     "qwen": LLMProvider(
         key="qwen", title="Qwen (Alibaba DashScope)",
         base_url="https://token-plan.maas.qwencloudapi.com/compatible-mode/v1",
-        api_key_env="DASHSCOPE_API_KEY",
+        api_key_env="QWEN_API_KEY",
         default_model="qwen3.7-plus",
         # Модели token-plan ключа (текст/рассуждение); сторонние — тоже через этот эндпоинт.
         models=["qwen3.7-plus", "qwen3.8-max", "qwen3.7-max", "qwen3.8-flash",
@@ -156,8 +156,8 @@ class Settings(BaseSettings):
     # Ключи вендоров (все опциональны — нужен хотя бы один для активного провайдера).
     deepseek_api_key: str = ""
     minimax_api_key: str = ""
-    dashscope_api_key: str = Field(
-        default="", validation_alias=AliasChoices("DASHSCOPE_API_KEY", "QWEN_API_KEY"))
+    qwen_api_key: str = Field(
+        default="", validation_alias=AliasChoices("QWEN_API_KEY", "DASHSCOPE_API_KEY"))
     # Эндпоинт Qwen (OpenAI-compatible); QWEN_BASE_URL в .env перекрывает.
     qwen_base_url: str = "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1"
     openai_api_key: str = ""
@@ -226,7 +226,7 @@ class Settings(BaseSettings):
         env_to_attr = {
             "DEEPSEEK_API_KEY": self.deepseek_api_key,
             "MINIMAX_API_KEY": self.minimax_api_key,
-            "DASHSCOPE_API_KEY": self.dashscope_api_key,
+            "QWEN_API_KEY": self.qwen_api_key,
             "OPENAI_API_KEY": self.openai_api_key,
             "OPENROUTER_API_KEY": self.openrouter_api_key,
             "OLLAMA_API_KEY": self.ollama_api_key,

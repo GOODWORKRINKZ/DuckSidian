@@ -184,7 +184,7 @@ Telegram с Bot API 9.3/9.4 поддерживает темы (topics) в лич
 |---|---|---|
 | `deepseek` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
 | `minimax` | `https://api.minimax.io/v1` (модель по умолчанию `MiniMax-M3`) | `MINIMAX_API_KEY` |
-| `qwen` | `https://token-plan.maas.qwencloudapi.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
+| `qwen` | `https://token-plan.maas.qwencloudapi.com/compatible-mode/v1` | `QWEN_API_KEY` |
 | `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
 | `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
 | `ollama` | `http://localhost:11434/v1` | — |
