@@ -284,3 +284,19 @@ async def test_request_stop_cancels_only_for_allowed_user() -> None:
         assert request_stop("nope", 42) == "gone"
     finally:
         _running_turns.pop("t1", None)
+
+
+def test_busy_count_counts_running_queued_and_ingest(monkeypatch) -> None:
+    from bot.handlers import private
+
+    class _T:
+        def __init__(self, done: bool) -> None:
+            self._d = done
+
+        def done(self) -> bool:
+            return self._d
+    monkeypatch.setattr(private, "_running_turns", {"a": private.RunningTurn(_T(False), 1, None, {1}),
+                                                    "b": private.RunningTurn(_T(True), 1, None, {1})})
+    monkeypatch.setattr(private, "_queue_depth", {1: 2})
+    monkeypatch.setattr(private, "_ingest_tasks", {1: _T(False)})
+    assert private.busy_count() == 4

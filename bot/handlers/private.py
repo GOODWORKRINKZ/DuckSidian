@@ -244,6 +244,13 @@ _running_turns: dict[str, RunningTurn] = {}
 STOP_BUTTON_DELAY = 15.0
 
 
+def busy_count() -> int:
+    """Идущие ходы агента + ждущие в очереди + фоновые разборы (0 — можно перезапускать)."""
+    running = sum(1 for rt in _running_turns.values() if not rt.task.done())
+    ingest = sum(1 for t in _ingest_tasks.values() if not t.done())
+    return running + sum(_queue_depth.values()) + ingest
+
+
 def request_stop(token: str, user_id: int | None) -> str:
     """'ok' — ход отменяется; 'forbidden' — чужой ход; 'gone' — уже закончился."""
     rt = _running_turns.get(token)

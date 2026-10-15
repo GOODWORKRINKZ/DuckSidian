@@ -54,8 +54,15 @@ async def _run_health_server() -> None:
     async def healthz(_: web.Request) -> web.Response:
         return web.Response(text="ok")
 
+    async def busy(_: web.Request) -> web.Response:
+        """Сколько ходов агента идёт/ждёт в очереди — для перезапуска без обрыва
+        (scripts/restart_when_idle.sh ждёт здесь 0)."""
+        from .handlers.private import busy_count  # noqa: PLC0415
+        return web.Response(text=str(busy_count()))
+
     app = web.Application()
     app.router.add_get("/healthz", healthz)
+    app.router.add_get("/busy", busy)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8080)
