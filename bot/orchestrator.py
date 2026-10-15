@@ -37,10 +37,12 @@ from .agent.prompts import (
     SUMMARY_SYSTEM,
     TRIZ_SYSTEM,
 )
+from .agent.loop import MEDIA_TOOLS, UNCONFIRMED_MEDIA_NOTE
 from .agent.tools import PERSONAL_WRITE_TOOLS, ToolExecutor, personal_tool_schemas
 from .config import ChatConfig, settings
 from .db import DB
 from .git_sync import commit_and_push
+from .media_refs import find_images_marker, strip_images_block
 from .personal import PersonalSpace, is_user_cfg, share_artifact, share_workspace
 from .tg_format import md_to_tg_html, split_tg_chunks
 from .topic_manager import ensure_bot_topic
@@ -49,13 +51,19 @@ from .wiki import Wiki, WikiPathError
 log = logging.getLogger(__name__)
 
 UNCONFIRMED_WRITE_NOTE = "⚠️ в vault ничего не записано"
-_IMAGES_MARKER_RE = re.compile(r"(?im)^\s*IMAGES\s*:\s*$")
+
+
+def mark_unconfirmed_media(answer: str) -> str:
+    """Ответ показывает/описывает картинку, которую агент не скачивал и не смотрел:
+    блок IMAGES (с выдуманными путями) убираем, в конце — явная пометка."""
+    text, _ = strip_images_block(answer)
+    return f"{text}\n\n{UNCONFIRMED_MEDIA_NOTE}"
 
 
 def mark_unconfirmed_write(answer: str) -> str:
     """Пометить ответ, утверждающий запись, которой не было. Пометка — до блока
     IMAGES: (его хвост бот отрезает от текста перед отправкой)."""
-    m = _IMAGES_MARKER_RE.search(answer)
+    m = find_images_marker(answer)
     if not m:
         return f"{answer.rstrip()}\n\n{UNCONFIRMED_WRITE_NOTE}"
     return f"{answer[:m.start()].rstrip()}\n\n{UNCONFIRMED_WRITE_NOTE}\n\n{answer[m.start():].lstrip()}"
@@ -396,6 +404,7 @@ class Orchestrator:
             ),
             on_step=progress,
             write_tools=PERSONAL_WRITE_TOOLS,
+            media_tools=MEDIA_TOOLS,
         )
         self._record_run(f"personal/{space.user_id}", run)
         if settings.git_autocommit:
@@ -408,6 +417,15 @@ class Orchestrator:
                 author_name, author_id, space.cfg.name, not run.unconfirmed_write,
                 run.tools_called, answer[:200],
             )
+        if run.media_nudged or run.unconfirmed_media:
+            log.warning(
+                "personal: answer showed/described media it never fetched — user=%s (id=%s) "
+                "space=%s recovered=%s tools=%s head=%r",
+                author_name, author_id, space.cfg.name, not run.unconfirmed_media,
+                run.tools_called, answer[:200],
+            )
+        if run.unconfirmed_media:
+            answer = mark_unconfirmed_media(answer)
         if run.unconfirmed_write:
             answer = mark_unconfirmed_write(answer)
         return answer

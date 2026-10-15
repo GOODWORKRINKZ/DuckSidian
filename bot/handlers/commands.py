@@ -23,6 +23,16 @@ from aiogram.types import (
 
 from ..config import ChatConfig, settings
 from ..db import DB
+from ..media_refs import (
+    GIF_EXTS,
+    IMG_EXTS,
+    MEDIA_EXTS,
+    VID_EXTS,
+    missing_note,
+    parse_images_block,
+    split_existing,
+    strip_images_block,
+)
 from ..orchestrator import Orchestrator, _chat_wiki
 from ..tg_format import md_to_tg_html, split_tg_chunks
 from ..topic_manager import ensure_bot_topic, reset_bot_topic
@@ -142,14 +152,15 @@ def _slugify_query(text: str, max_len: int = 40) -> str:
 
 
 # Расширения, которые Telegram умеет показывать как фото/видео/анимация.
-_IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
-_VID_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
-_GIF_EXTS = {".gif"}
-_MEDIA_EXTS = _IMG_EXTS | _VID_EXTS | _GIF_EXTS
+_IMG_EXTS = IMG_EXTS
+_VID_EXTS = VID_EXTS
+_GIF_EXTS = GIF_EXTS
+_MEDIA_EXTS = MEDIA_EXTS
 
 
-def _extract_image_refs(answer: str, wiki_root, max_n: int = 10) -> list:
-    """Найти медиафайлы в финальном блоке IMAGES: ответа агента.
+def _image_refs(answer: str, wiki_root, max_n: int = 10) -> tuple[list[str], list[str]]:
+    """Медиафайлы из финального блока IMAGES: ответа агента → (найденные абсолютные
+    пути, пути из блока, которых нет в vault).
 
     Формат, который агент обязан использовать (см. QUERY_SYSTEM):
 
@@ -159,49 +170,17 @@ def _extract_image_refs(answer: str, wiki_root, max_n: int = 10) -> list:
         raw/assets/2026-04-28/photo_1.jpg
         raw/assets/2026-04-28/video_1.mp4
 
-    Любые `raw/assets/...` упоминания вне этого блока игнорируются —
-    они часто оказываются левыми (агент копирует из wiki-источников).
-    Файл должен реально существовать в vault'е чата; jpg/jpeg/png/webp/mp4/mov.
+    Терпим к «**IMAGES:**», «IMAGES :», путям в бэктиках и в [[ ]] (см. media_refs).
+    Пути вне блока игнорируются — они часто левые (агент копирует их из wiki).
+    Файл должен реально существовать в vault'е чата/пространства (wiki_root).
     """
-    if not answer:
-        return []
-    # Берём всё после последнего "IMAGES:" (case-insensitive), до конца.
-    m = re.search(r"(?im)^\s*IMAGES\s*:\s*$", answer)
-    if not m:
-        return []
-    tail = answer[m.end():]
-    rels: list[str] = []
-    seen: set[str] = set()
-    line_re = re.compile(r"raw/assets/[^\s\)\]\}\"'<>|]+", re.UNICODE)
-    for raw_line in tail.splitlines():
-        line = raw_line.strip().lstrip("-*•").strip().strip("`").strip()
-        if not line:
-            # пустая строка завершает блок IMAGES
-            if rels:
-                break
-            continue
-        # Если строка явно не путь — выходим (блок закончился).
-        lm = line_re.search(line)
-        if not lm:
-            break
-        rel = lm.group(0).rstrip(".,;:!?")
-        ext = rel.lower().rsplit(".", 1)
-        if len(ext) != 2 or "." + ext[1] not in _MEDIA_EXTS:
-            continue
-        if rel in seen:
-            continue
-        seen.add(rel)
-        try:
-            target = (wiki_root / rel).resolve()
-            target.relative_to(wiki_root)  # safety
-        except Exception:  # noqa: BLE001
-            continue
-        if not target.is_file():
-            continue
-        rels.append(str(target))
-        if len(rels) >= max_n:
-            break
-    return rels
+    found, missing = split_existing(parse_images_block(answer or ""), wiki_root)
+    return [str(p) for p in found[:max_n]], missing
+
+
+def _extract_image_refs(answer: str, wiki_root, max_n: int = 10) -> list:
+    """Существующие медиафайлы из блока IMAGES: (см. _image_refs)."""
+    return _image_refs(answer, wiki_root, max_n)[0]
 
 
 def _is_admin(user_id: int | None) -> bool:
@@ -447,11 +426,8 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
         try:
             answer = await orch.query(q)
             # Отрезаем технический блок IMAGES: — пользователю он не нужен
-            # (картинки прикрепим отдельно через _extract_image_refs).
-            display = answer or ""
-            _img_marker = re.search(r"(?im)^\s*IMAGES\s*:\s*$", display)
-            if _img_marker:
-                display = display[: _img_marker.start()].rstrip()
+            # (картинки прикрепим отдельно через _image_refs).
+            display, _ = strip_images_block(answer or "")
             await _reply_html(msg, display or "(пусто)")
             # Прикрепить картинки из ответа (если агент сослался на raw/assets/*.jpg|png|...)
             try:
@@ -459,7 +435,10 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
                 from aiogram.exceptions import TelegramRetryAfter
                 _TG_MAX_BYTES = 50 * 1024 * 1024  # Telegram Bot API limit for video upload
                 chat_wiki = _wiki_for_msg(msg)
-                img_paths = _extract_image_refs(answer or "", chat_wiki.root)
+                img_paths, missing = _image_refs(answer or "", chat_wiki.root)
+                if missing:
+                    log.warning("ask: IMAGES paths not in vault: %s", missing)
+                    await msg.answer(missing_note(missing))
                 # Фильтруем файлы > 50 МБ (Telegram не принимает)
                 oversized = [p for p in img_paths if os.path.getsize(p) > _TG_MAX_BYTES]
                 img_paths = [p for p in img_paths if os.path.getsize(p) <= _TG_MAX_BYTES]
@@ -571,10 +550,7 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
         await msg.chat.do("typing")
         try:
             answer = await orch.query(q)
-            display = answer or ""
-            _img_marker = re.search(r"(?im)^\s*IMAGES\s*:\s*$", display)
-            if _img_marker:
-                display = display[: _img_marker.start()].rstrip()
+            display, _ = strip_images_block(answer or "")
             await _reply_html(msg, display or "(пусто)")
 
             # Прикрепить картинки из ответа
@@ -582,7 +558,10 @@ def setup(db: DB, wiki: Wiki, orch: Orchestrator) -> Router:
                 import asyncio
                 from aiogram.exceptions import TelegramRetryAfter
                 _TG_MAX_BYTES = 50 * 1024 * 1024
-                img_paths = _extract_image_refs(answer or "", chat_wiki.root)
+                img_paths, missing = _image_refs(answer or "", chat_wiki.root)
+                if missing:
+                    log.warning("followup: IMAGES paths not in vault: %s", missing)
+                    await msg.answer(missing_note(missing))
                 img_paths = [p for p in img_paths if os.path.getsize(p) <= _TG_MAX_BYTES]
                 if img_paths:
                     def _ext(p: str) -> str:

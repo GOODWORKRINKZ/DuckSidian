@@ -5,8 +5,10 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from ..media_refs import has_images_block, mentioned_media, resolve_in_vault
 from .deepseek import LLMClient, extract_usage
 from .tools import TOOL_SCHEMAS, ToolExecutor
 
@@ -27,6 +29,10 @@ class AgentRun:
     # один раз досылали подсказку; unconfirmed_write — так и не записал.
     write_nudged: bool = False
     unconfirmed_write: bool = False
+    # То же для медиа: ответ с блоком IMAGES / «посмотрел картинку», а файл не
+    # скачивали и не открывали (fetch_image / describe_media / generate_image).
+    media_nudged: bool = False
+    unconfirmed_media: bool = False
 
 
 # «Записал / добавила / сохранили / готово / обновлено» — но не «не записал».
@@ -56,6 +62,49 @@ WRITE_NUDGE = (
 def claims_write(text: str) -> bool:
     """Текст ответа утверждает, что что-то записано/сохранено."""
     return bool(text) and bool(_WRITE_CLAIM_RE.search(text))
+
+
+_MEDIA_NOUN = r"(?:картинк|фотк|фото|изображени|снимк|снимок|скриншот|скрин|иллюстраци)\w*"
+_MEDIA_VERB = (
+    r"(?<![Нн]е )(?<!\w)(?:"
+    r"(?:по|про|рас|за)?смотрел[аи]?|глянул[аи]?|увидел[аи]?|вижу|разглядел[аи]?"
+    r"|скачал[аи]?|загрузил[аи]?|нашёл|нашел|нашл[аи]|достал[аи]?"
+    r"|прикрепил[аи]?|прикрепляю|прикреплю|отправляю|пришлю|присылаю|высылаю|скидываю|кидаю"
+    r"|сгенерировал[аи]?|нарисовал[аи]?"
+    r")(?!\w)"
+)
+# «посмотрел/скачал/прикрепляю … картинку», «фото прикрепил», «на картинке видно»,
+# «что увидел по картинке», «вот фото …» — но не «не нашёл картинку».
+_MEDIA_CLAIM_RE = re.compile(
+    rf"{_MEDIA_VERB}[^.!?\n]{{0,40}}?{_MEDIA_NOUN}"
+    rf"|(?<!\w){_MEDIA_NOUN}[^.!?\n]{{0,25}}?{_MEDIA_VERB}"
+    rf"|(?<!\w)(?:на|по)\s+(?:этой\s+|той\s+|самой\s+)?{_MEDIA_NOUN}[^.!?\n]{{0,40}}?"
+    r"(?<!\w)(?:видн\w*|изображ\w*|запечатл\w*|показан\w*|различим\w*)"
+    rf"|(?<!\w)вот\s+(?:\w+\s+)?{_MEDIA_NOUN}",
+    re.IGNORECASE,
+)
+
+# Инструменты, после которых ответ может законно показывать/описывать картинку.
+MEDIA_TOOLS = frozenset({"fetch_image", "describe_media", "generate_image"})
+
+MEDIA_NUDGE = (
+    "[Служебная проверка бота — пользователь её не видит.] Твой ответ показывает или "
+    "описывает картинку (блок IMAGES, «посмотрел/скачал/прикрепляю», «на фото видно»), но "
+    "в этом ходе ты не вызывал fetch_image / describe_media / generate_image, а файлов из "
+    "блока IMAGES в vault нет — ты не скачивал и не смотрел файл. Этот вариант ответа "
+    "пользователю НЕ отправлен. Вызови fetch_image(url) (картинку найди через web_search / "
+    "fetch_url) и при необходимости describe_media(path), либо честно скажи, что картинку не "
+    "нашёл. Не описывай то, чего не видел, и не указывай в IMAGES несуществующие пути. "
+    "Пиши финальный ответ так, будто это твой первый ответ: не упоминай эту проверку и "
+    "прошлый вариант ответа."
+)
+
+UNCONFIRMED_MEDIA_NOTE = "⚠️ картинку не скачал и не смотрел — описание выше не подтверждено"
+
+
+def claims_media(text: str) -> bool:
+    """Текст ответа утверждает, что картинка получена/просмотрена/прикреплена."""
+    return bool(text) and (has_images_block(text) or bool(_MEDIA_CLAIM_RE.search(text)))
 
 
 def _ctx_chars(messages: list[dict[str, Any]]) -> int:
@@ -142,6 +191,7 @@ async def run_agent(
     ctx_char_budget: int = 400_000,
     compress_ctx_threshold: int = 80_000,
     write_tools: frozenset[str] | set[str] | None = None,
+    media_tools: frozenset[str] | set[str] | None = None,
 ) -> AgentRun:
     """Один прогон агента до вызова finish() или исчерпания шагов.
 
@@ -149,7 +199,15 @@ async def run_agent(
     «готово»…), а ни один из этих инструментов не вызывался, — один раз
     возвращаем агента в цикл с WRITE_NUDGE; если и потом записи нет —
     run.unconfirmed_write=True (решение, что показать пользователю, — у вызывающего).
+
+    media_tools: то же для картинок — ответ с блоком IMAGES или «посмотрел/прикрепляю
+    картинку», а ни один из этих инструментов не вызывался и ни один упомянутый
+    медиафайл не существует в vault → MEDIA_NUDGE, потом run.unconfirmed_media.
+
+    Подсказка за прогон одна (общая для обоих guard'ов): если модель после неё
+    перефразировала выдумку, второй подсказки нет, но флаг unconfirmed_* ставится.
     """
+    vault_root: Path | None = getattr(getattr(executor, "wiki", None), "root", None)
 
     def _fake_write(text: str) -> bool:
         return (
@@ -157,6 +215,37 @@ async def run_agent(
             and not any(t in write_tools for t in run.tools_called)
             and claims_write(text)
         )
+
+    def _fake_media(text: str) -> bool:
+        if media_tools is None or any(t in media_tools for t in run.tools_called):
+            return False
+        if not claims_media(text):
+            return False
+        # Ссылается на реальный файл vault (из list_dir / прошлых ходов) — не выдумка.
+        if vault_root is not None and any(
+            resolve_in_vault(rel, vault_root) for rel in mentioned_media(text)
+        ):
+            return False
+        return True
+
+    def _nudge(text: str, step: int, where: str) -> bool:
+        """Досылает подсказку(и), если ответ выдуман и подсказок ещё не было."""
+        if run.write_nudged or run.media_nudged:
+            return False
+        fake_write, fake_media = _fake_write(text), _fake_media(text)
+        if not (fake_write or fake_media):
+            return False
+        if fake_write:
+            run.write_nudged = True
+            log.warning("agent step %d: %s claims a write without write tools, nudging. head=%r",
+                        step, where, text[:160])
+            messages.append({"role": "system", "content": WRITE_NUDGE})
+        if fake_media:
+            run.media_nudged = True
+            log.warning("agent step %d: %s shows/describes media it never fetched, nudging. head=%r",
+                        step, where, text[:160])
+            messages.append({"role": "system", "content": MEDIA_NUDGE})
+        return True
 
     tool_schemas = tools if tools is not None else TOOL_SCHEMAS
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
@@ -248,11 +337,7 @@ async def run_agent(
         if not tool_calls:
             # Модель решила ответить без tool-call → считаем что закончила.
             run.summary = _strip_think(raw_content)
-            if not run.write_nudged and _fake_write(run.summary):
-                run.write_nudged = True
-                log.warning("agent step %d: claims a write without write tools, nudging. head=%r",
-                            step, run.summary[:160])
-                messages.append({"role": "system", "content": WRITE_NUDGE})
+            if _nudge(run.summary, step, "answer"):
                 continue
             run.finished = True
             break
@@ -307,12 +392,8 @@ async def run_agent(
             )
 
         if finish_called:
-            if not run.write_nudged and _fake_write(run.summary):
-                run.write_nudged = True
+            if _nudge(run.summary, step, "finish()"):
                 run.finished = False
-                log.warning("agent step %d: finish() claims a write without write tools, nudging. head=%r",
-                            step, run.summary[:160])
-                messages.append({"role": "system", "content": WRITE_NUDGE})
                 continue
             break
 
@@ -350,6 +431,7 @@ async def run_agent(
             run.summary = run.summary or "(agent stopped without finish())"
     run.summary = _sanitize_summary(run.summary)
     run.unconfirmed_write = _fake_write(run.summary)
+    run.unconfirmed_media = _fake_media(run.summary)
     log.info(
         "agent done: steps=%d tokens_prompt=%d tokens_completion=%d "
         "tokens_total=%d tokens_cached=%d",
