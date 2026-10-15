@@ -590,6 +590,19 @@ class DB:
             ) as cur:
                 return list(await cur.fetchall())
 
+    async def last_activity_in_workspace(self, project_slug: str) -> dict[int, str]:
+        """user_id → ts (ISO) последнего сообщения каждого человека во всех темах,
+        привязанных к project_slug (для /ws members в совместном воркспейсе)."""
+        async with self.conn() as db:
+            async with db.execute(
+                """SELECT m.user_id AS user_id, MAX(m.ts) AS ts FROM messages m
+                   JOIN workspaces w ON w.chat_id = m.chat_id AND w.topic_id = m.topic_id
+                   WHERE w.project_slug = ? AND m.user_id IS NOT NULL
+                   GROUP BY m.user_id""",
+                (project_slug,),
+            ) as cur:
+                return {int(r["user_id"]): str(r["ts"]) for r in await cur.fetchall()}
+
     async def find_user_id_by_username(self, username: str) -> int | None:
         """user_id по @username среди всех, кто писал боту (в т.ч. в группе)."""
         u = username.lstrip("@").strip().lower()

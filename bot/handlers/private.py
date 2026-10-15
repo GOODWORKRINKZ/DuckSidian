@@ -80,6 +80,15 @@ from .admin_shared import (
 )
 from .commands import REACT_ERROR, REACT_QUEUED, _download_ask_media, _extract_image_refs, _react, _reply_html
 from .listener import _download_media, handle_answer_callback, question_id_from_reply
+from .shared_live import (
+    LiveNotice,
+    member_targets,
+    members_report,
+    queue_wait_text,
+    running_request,
+    serialized_turn,
+    typing_many,
+)
 
 log = logging.getLogger(__name__)
 
@@ -212,8 +221,7 @@ _ingest_tasks: dict[int, asyncio.Task] = {}
 _PENDING_MAX = 300
 # Кому уже сказали «нет доступа» (чтобы не спамить на каждое сообщение)
 _denied_notified: set[int] = set()
-# Последовательная обработка сообщений одного пользователя
-_user_locks: dict[Any, asyncio.Lock] = {}
+# Сколько сообщений пользователя ждут очереди (текст «принял, жди» шлём один раз)
 _queue_depth: dict[Any, int] = {}
 
 
@@ -261,13 +269,6 @@ def _trim(d: dict) -> None:
         d.pop(next(iter(d)))
 
 
-def _lock(user_id: Any) -> asyncio.Lock:
-    lk = _user_locks.get(user_id)
-    if lk is None:
-        lk = _user_locks[user_id] = asyncio.Lock()
-    return lk
-
-
 def _display_name(msg: Message) -> str:
     u = msg.from_user
     if not u:
@@ -294,6 +295,16 @@ def history_messages(rows: list[Any], *, bot_id: int, skip: tuple[int, int] | No
             text = f"[{author}]: {text}"
         out.append({"role": "user", "content": text[:2000]})
     return out[-limit:] if limit > 0 else []
+
+
+def _media_label(msg: Message) -> str:
+    """Чем является сообщение без текста (для очереди: «выполняется запрос … (голосовое)»)."""
+    for attr, label in (("voice", "голосовое"), ("video_note", "видео-кружок"), ("audio", "аудио"),
+                        ("photo", "фото"), ("video", "видео"), ("document", "файл"),
+                        ("animation", "гифка"), ("sticker", "стикер")):
+        if getattr(msg, attr, None):
+            return label
+    return ""
 
 
 def _thread_id(msg: Message) -> int | None:
@@ -1027,27 +1038,6 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             pass
         return True
 
-    async def _notify_members(ws: dict[str, Any] | None, exclude_chat_id: int, author: str, text: str) -> None:
-        """В совместном воркспейсе — коротко сообщить остальным участникам, что добавил коллега."""
-        if not ws or not shared_slug_of(ws.get("project_slug")):
-            return
-        try:
-            rows = await db.find_workspaces_by_slug(ws["project_slug"])
-            members = set(await db.shared_members(shared_slug_of(ws["project_slug"]) or ""))
-        except Exception:  # noqa: BLE001
-            return
-        rows = [r for r in rows if int(r["chat_id"]) in members]
-        snippet = text.strip().replace("\n", " ")
-        snippet = snippet[:300] + ("…" if len(snippet) > 300 else "")
-        for r in rows:
-            if int(r["chat_id"]) == exclude_chat_id:
-                continue
-            try:
-                await bot.send_message(int(r["chat_id"]), f"👥 <b>{_esc(author)}</b> в «{_esc(ws['name'])}»:\n<i>{_esc(snippet)}</i>",
-                                       message_thread_id=int(r["topic_id"]), parse_mode="HTML")
-            except Exception as exc:  # noqa: BLE001
-                log.debug("notify member failed: %s", exc)
-
     async def _bind_workspace(space: PersonalSpace, chat_id: int, tid: int, name: str) -> str:
         """Привязать тему к проекту (создать страницу при необходимости). Возвращает slug."""
         name = (name or "").strip()[:128] or f"topic-{tid}"
@@ -1633,12 +1623,11 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 return
             v = await db.get_shared_vault(sslug)
             if sub == "members":
-                lines = [f"<b>Участники «{_esc(ws['name'])}»:</b>"]
-                for uid_ in await db.shared_members(sslug):
-                    crown = " 👑 владелец" if v and int(v["owner_user_id"]) == uid_ else ""
-                    lines.append(f"• {_esc(await db.user_label(uid_))}{crown}")
-                lines.append("\nУбрать участника (только владелец): /ws kick <user_id|@username>")
-                await msg.reply("\n".join(lines), parse_mode="HTML")
+                members = [(uid_, await db.user_label(uid_), bool(v and int(v["owner_user_id"]) == uid_))
+                           for uid_ in await db.shared_members(sslug)]
+                last_seen = await db.last_activity_in_workspace(ws["project_slug"])
+                await msg.reply(members_report(ws["name"], members, last_seen, running_request(ws["project_slug"])),
+                                parse_mode="HTML")
                 return
             if await shared_role(db, sslug, space.user_id) != "owner":
                 await msg.reply("Убирать участников может только владелец воркспейса.")
@@ -2407,27 +2396,11 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         if ws_pre is not None and ws_pre["project_slug"] and await _foreign_shared(msg, dict(ws_pre), space):
             return
         lock_key: Any = ws_pre["project_slug"] if (ws_pre and shared_slug_of(ws_pre["project_slug"])) else space.user_id
-        lk = _lock(lock_key)
-        if lk.locked():
-            # Запросы одного пользователя идут строго по очереди (общие файлы, история
-            # диалога). Покажем, что сообщение принято и ждёт.
-            _queue_depth[space.user_id] = _queue_depth.get(space.user_id, 0) + 1
-            await _react(bot, msg, REACT_QUEUED)
-            if _queue_depth[space.user_id] == 1:
-                try:
-                    await msg.reply("⏳ Принял, отвечу сразу после текущего запроса.")
-                except Exception:  # noqa: BLE001
-                    pass
-            try:
-                async with lk:
-                    await _process_message(msg, space)
-            finally:
-                _queue_depth[space.user_id] = max(0, _queue_depth.get(space.user_id, 1) - 1)
-            return
-        async with lk:
-            await _process_message(msg, space)
+        await _process_message(msg, space, lock_key)
 
-    async def _process_message(msg: Message, space: PersonalSpace) -> None:
+    async def _process_message(msg: Message, space: PersonalSpace, lock_key: Any) -> None:
+        """Скачивание и расшифровка медиа, журнал — без блокировки; под блокировкой
+        lock_key (совместный воркспейс или пользователь) — только агент и запись ответа."""
         ts = msg.date or datetime.now(timezone.utc)
         who = _display_name(msg)
         text = (msg.text or msg.caption or "").strip()
@@ -2567,34 +2540,66 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             if prev:
                 agent_text = f"[Мой предыдущий ответ]:\n{prev[:1500]}\n\n[Реплика пользователя]:\n{full_text}"
 
-        history = await _history(msg, SHARED_PREFIX + ws["project_slug"] if space.is_shared and ws else None)
-        if not has_media:
-            await _react(bot, msg, "👀")
-        stop = asyncio.Event()
-        typing = asyncio.create_task(_typing_loop(bot, msg.chat.id, stop, _thread_id(msg)))
+        author_id = msg.from_user.id if msg.from_user else None
+        queued = False
+
+        async def on_queued(rr) -> None:
+            # Запросы одного пользователя (и одного совместного воркспейса) идут строго по
+            # очереди (общие файлы, история диалога). Покажем, что сообщение принято и ждёт,
+            # и чей запрос сейчас выполняется.
+            nonlocal queued
+            queued = True
+            _queue_depth[space.user_id] = _queue_depth.get(space.user_id, 0) + 1
+            await _react(bot, msg, REACT_QUEUED)
+            if _queue_depth[space.user_id] == 1:
+                try:
+                    await msg.reply(queue_wait_text(rr, space.user_id))
+                except Exception:  # noqa: BLE001
+                    pass
+
+        async def turn() -> None:
+            history = await _history(msg, SHARED_PREFIX + ws["project_slug"] if space.is_shared and ws else None)
+            if not has_media:
+                await _react(bot, msg, "👀")
+            stop = asyncio.Event()
+            typing = asyncio.create_task(_typing_loop(bot, msg.chat.id, stop, _thread_id(msg)))
+            # В совместном воркспейсе партнёры тоже видят «печатает…» в своих темах.
+            targets = (await member_targets(db, SHARED_PREFIX + ws["project_slug"], msg.chat.id)
+                       if (space.is_shared and ws) else [])
+            typing_others = asyncio.create_task(typing_many(bot, targets, stop))
+            notice = LiveNotice(bot, targets, author=who, ws_name=ws_name or "",
+                                request=text or transcript or _media_label(msg))
+            await notice.start()
+            try:
+                answer = await orch.personal_turn(
+                    space, agent_text or "(без текста — см. вложение)",
+                    message_id=msg.message_id, attached_media=attached, history=history,
+                    workspace=ws, progress=_draft_progress(msg),
+                    workspace_fn=_workspace_tool_fn(msg, pspace, space),
+                    author_name=who, author_id=author_id, chat_id=msg.chat.id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("personal_turn failed")
+                await _react(bot, msg, REACT_ERROR)
+                await msg.reply(f"⚠️ Ошибка агента: {type(exc).__name__}. Попробуй ещё раз.")
+                await notice.fail(type(exc).__name__)
+                return
+            finally:
+                stop.set()
+                typing.cancel()
+                typing_others.cancel()
+            mode = await _voice_mode(space.user_id)
+            voice = mode == "on" or (mode == "auto" and spoke)
+            title_hint = (text or transcript or "Ответ").splitlines()[0]
+            await _send_agent_answer(msg, space, answer, title_hint=title_hint, ws_name=ws_name, voice=voice)
+            await notice.finish(_strip_images_block(answer)[0])
+
         try:
-            answer = await orch.personal_turn(
-                space, agent_text or "(без текста — см. вложение)",
-                message_id=msg.message_id, attached_media=attached, history=history,
-                workspace=ws, progress=_draft_progress(msg),
-                workspace_fn=_workspace_tool_fn(msg, pspace, space),
-                author_name=who, author_id=msg.from_user.id if msg.from_user else None,
-                chat_id=msg.chat.id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("personal_turn failed")
-            await _react(bot, msg, REACT_ERROR)
-            await msg.reply(f"⚠️ Ошибка агента: {type(exc).__name__}. Попробуй ещё раз.")
-            return
+            await serialized_turn(lock_key, author=who, author_id=author_id,
+                                  text=text or transcript or _media_label(msg),
+                                  body=turn, on_queued=on_queued)
         finally:
-            stop.set()
-            typing.cancel()
-        mode = await _voice_mode(space.user_id)
-        voice = mode == "on" or (mode == "auto" and spoke)
-        title_hint = (text or transcript or "Ответ").splitlines()[0]
-        await _send_agent_answer(msg, space, answer, title_hint=title_hint, ws_name=ws_name, voice=voice)
-        if space.is_shared:
-            await _notify_members(ws | {"project_slug": SHARED_PREFIX + ws["project_slug"]}, msg.chat.id,
-                                  _display_name(msg), (text or transcript or "") + "\n→ " + _strip_images_block(answer)[0])
+            if queued:
+                _queue_depth[space.user_id] = max(0, _queue_depth.get(space.user_id, 1) - 1)
 
     return router
