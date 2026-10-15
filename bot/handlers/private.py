@@ -2135,7 +2135,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 f"🗣 Голосовые ответы: <b>{await _voice_mode(space.user_id)}</b>, голос "
                 f"<code>{_esc(await _voice_id(space.user_id))}</code>.\n"
                 "/voice on|off|auto — режим (auto = отвечать голосом на голосовые)\n"
-                "/voice set <voice_id> — выбрать голос (/voices — список)",
+                "/voices — список голосов кнопками (нажми — выберу и дам послушать)\n"
+                "/voice set &lt;voice_id&gt; — выбрать голос по id",
                 parse_mode="HTML",
             )
             return
@@ -2164,11 +2165,32 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             await msg.reply(f"Голосов с префиксом «{_esc(prefix)}» не найдено. Попробуй /voices English.",
                             parse_mode="HTML")
             return
+        current = await _voice_id(space.user_id)
         lines = [f"<b>Голоса ({_esc(prefix)}):</b>"]
+        buttons: list[InlineKeyboardButton] = []
         for v in voices[:25]:
-            lines.append(f"• <code>{_esc(v['voice_id'])}</code> — {_esc(v['description'][:90])}")
-        lines.append("\nВыбрать: /voice set <voice_id>")
-        await msg.reply("\n".join(lines)[:4000], parse_mode="HTML")
+            mark = "✅ " if v["voice_id"] == current else ""
+            lines.append(f"• {mark}<code>{_esc(v['voice_id'])}</code> — {_esc(v['description'][:90])}")
+            data = f"pvoice:{v['voice_id']}"
+            if len(data.encode()) <= 64:
+                label = v["voice_id"].removeprefix(prefix).lstrip("_") or v["voice_id"]
+                buttons.append(InlineKeyboardButton(text=(mark + label)[:40], callback_data=data))
+        lines.append("\nНажми кнопку — выберу голос и пришлю образец. Или /voice set &lt;voice_id&gt;.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 2] for i in range(0, len(buttons), 2)])
+        await msg.reply("\n".join(lines)[:4000], parse_mode="HTML",
+                        reply_markup=kb if buttons else None)
+
+    @router.callback_query(F.data.startswith("pvoice:"))
+    async def cb_voice_pick(cb: CallbackQuery) -> None:
+        voice = (cb.data or "").split(":", 1)[1]
+        uid = cb.from_user.id if cb.from_user else None
+        if not voice or not await is_private_allowed(db, uid) or not isinstance(cb.message, Message):
+            await cb.answer("⌛ недоступно")
+            return
+        space = orch.personal_space(uid)  # type: ignore[arg-type]
+        await db.set_state(f"voice_id_{space.user_id}", voice)
+        await cb.answer(f"Голос: {voice}")
+        await _send_voice(cb.message, space, f"Привет! Теперь я говорю этим голосом — {voice.split('_', 1)[-1]}.")
 
     @router.message(Command("imagine", "draw", "img"))
     async def cmd_imagine(msg: Message, command: CommandObject) -> None:
