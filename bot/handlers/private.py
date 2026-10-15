@@ -2567,7 +2567,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             targets = (await member_targets(db, SHARED_PREFIX + ws["project_slug"], msg.chat.id)
                        if (space.is_shared and ws) else [])
             typing_others = asyncio.create_task(typing_many(bot, targets, stop))
-            notice = LiveNotice(bot, targets, author=who, ws_name=ws_name or "", request=text or transcript)
+            notice = LiveNotice(bot, targets, author=who, ws_name=ws_name or "",
+                                request=text or transcript or _media_label(msg))
             await notice.start()
             try:
                 answer = await orch.personal_turn(
