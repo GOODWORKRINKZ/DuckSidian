@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import shlex
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,14 @@ _ID_RE = re.compile(r"^\d{6,20}$")
 _TARGET_RE = re.compile(r"^(\d{6,20}|b2b-[\w-]{4,60})$")
 # Браузер с одним профилем — запросы строго по одному.
 _lock = asyncio.Lock()
+# CLI сказал «нужен 1688 login» — до этого момента (monotonic) инструмент скрыт от агента.
+LOGIN_RETRY_SECONDS = 30 * 60
+_login_blocked_until = 0.0
+
+
+def available() -> bool:
+    """False — недавно был отказ «не залогинен»; через LOGIN_RETRY_SECONDS пробуем снова."""
+    return time.monotonic() >= _login_blocked_until
 
 SCHEMA: dict = {
     "type": "function",
@@ -256,8 +265,9 @@ def format_result(mode: str, data: Any, cap: int = 5_500) -> str:
 # ----------------------------------------------------------------- запуск
 
 _EXIT_HINTS = {
-    3: ("ERROR: сессия 1688 не залогинена. Скажи пользователю: нужен разовый вход — на сервере "
-        "бота выполнить `1688 login` и отсканировать QR в приложении 1688. Повторно не вызывай."),
+    3: ("ERROR: сессия 1688 не залогинена. Скажи пользователю: отправь боту команду /login1688 — "
+        "бот пришлёт QR, его нужно отсканировать в приложении 1688 или Taobao. Пока ищи через "
+        "baidu_search/web_search. search_1688 повторно не вызывай."),
     4: ("ERROR: 1688 показал слайдер-капчу. Скажи пользователю, что нужен ручной проход "
         "(`1688 search … --headed` на сервере). Повторно не вызывай."),
 }
@@ -289,8 +299,13 @@ async def run(cli: str, a: dict[str, Any], vault_root: Path, *, timeout: float =
             # Ход остановлен пользователем — не оставляем браузер CLI висеть.
             proc.kill()
             raise
+    global _login_blocked_until
+    if proc.returncode == 3:
+        _login_blocked_until = time.monotonic() + LOGIN_RETRY_SECONDS
+        log.warning("1688-cli: not logged in — search_1688 hidden for %d min", LOGIN_RETRY_SECONDS // 60)
     if proc.returncode in _EXIT_HINTS:
         return _EXIT_HINTS[proc.returncode]
+    _login_blocked_until = 0.0
     text = out.decode("utf-8", "replace").strip()
     try:
         data = json.loads(text) if text else None
@@ -301,3 +316,51 @@ async def run(cli: str, a: dict[str, Any], vault_root: Path, *, timeout: float =
         tail = err.decode("utf-8", "replace").strip().splitlines()[-3:]
         return f"ERROR: 1688-cli код {proc.returncode}: {msg or ' / '.join(tail) or text[:300]}"
     return format_result(mode, data)
+
+
+_QR_RE = re.compile(r"QR saved as PNG:\s*(\S+)")
+
+
+async def login_flow(cli: str, on_qr: Any, *, timeout: int = 600, profile: str = "") -> tuple[bool, str]:
+    """Вход в 1688 по QR — ТОЛЬКО по явной команде человека (/login1688). Запускает
+    `1688 login`, как только CLI сохранил PNG с QR — `await on_qr(path)` (бот шлёт картинку),
+    ждёт сканирования. Возвращает (успех, пояснение)."""
+    global _login_blocked_until
+    cmd = shlex.split(cli) + ["login", "--timeout", str(timeout), "--json"] + (
+        ["--profile", profile] if profile else [])
+    async with _lock:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                stdin=asyncio.subprocess.DEVNULL)
+        except FileNotFoundError:
+            return False, "1688-cli не установлен на сервере (ONE688_CLI)."
+        tail: list[str] = []
+        qr_sent = False
+
+        async def _pump() -> None:
+            nonlocal tail, qr_sent
+            assert proc.stdout is not None
+            async for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace").rstrip()
+                if line:
+                    tail = (tail + [line])[-6:]
+                m = _QR_RE.search(line)
+                if m and not qr_sent:
+                    qr_sent = True
+                    await on_qr(m.group(1))
+            await proc.wait()
+
+        try:
+            await asyncio.wait_for(_pump(), timeout=timeout + 90)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return False, "не дождался сканирования QR."
+        except asyncio.CancelledError:
+            proc.kill()
+            raise
+    if proc.returncode == 0:
+        _login_blocked_until = 0.0
+        return True, "вход выполнен" if qr_sent else "сессия уже была активна"
+    return False, " / ".join(tail[-3:]) or f"код {proc.returncode}"

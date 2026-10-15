@@ -109,6 +109,14 @@ args = sys.argv[1:]
 open(sys.argv[0] + ".log", "a", encoding="utf-8").write(json.dumps(args, ensure_ascii=False) + "\\n")
 q = args[1] if len(args) > 1 else ""
 if q == "LOGIN": sys.exit(3)
+if args[0] == "login":
+    import os
+    png = os.path.join(os.path.dirname(sys.argv[0]), "qr.png")
+    open(png, "wb").write(b"png")
+    print("Scan with your 1688 or Taobao app:")
+    print("QR saved as PNG: " + png.replace(os.sep, "/"), flush=True)
+    print("Waiting for scan + confirmation...")
+    sys.exit(0 if os.environ.get("FAKE_LOGIN_FAIL") is None else 1)
 if q == "SLIDER": sys.exit(4)
 if q == "SLOW":
     import time; time.sleep(5)
@@ -116,6 +124,11 @@ if q == "BROKEN":
     print('{"ok": false, "code": "X", "message": "сломалось"}'); sys.exit(1)
 print(json.dumps(json.loads(%r), ensure_ascii=False))
 ''' % json.dumps(SEARCH_JSON, ensure_ascii=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_login_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(one688, "_login_blocked_until", 0.0)
 
 
 @pytest.fixture
@@ -131,7 +144,10 @@ async def test_run_ok_and_exit_codes(fake_cli, tmp_path: Path) -> None:
     out = await one688.run(cli, {"mode": "search", "query": "电机"}, tmp_path)
     assert out.startswith("[1688: 2 шт.")
     assert json.loads(log.read_text(encoding="utf-8").splitlines()[0])[-1] == "--json"
-    assert "1688 login" in await one688.run(cli, {"mode": "search", "query": "LOGIN"}, tmp_path)
+    assert "/login1688" in await one688.run(cli, {"mode": "search", "query": "LOGIN"}, tmp_path)
+    assert not one688.available()                       # скрыт после «не залогинен»
+    await one688.run(cli, {"mode": "search", "query": "電機"}, tmp_path)
+    assert one688.available()                           # успешный вызов снимает блок
     assert "слайдер" in await one688.run(cli, {"mode": "search", "query": "SLIDER"}, tmp_path)
     assert "сломалось" in await one688.run(cli, {"mode": "search", "query": "BROKEN"}, tmp_path)
     out = await one688.run(cli, {"mode": "search", "query": "SLOW"}, tmp_path, timeout=0.5)
@@ -150,6 +166,7 @@ async def test_tool_gated_by_config(fake_cli, tmp_path: Path, monkeypatch: pytes
     assert "не настроен" in await ex.call("search_1688", {"mode": "search", "query": "a"})
     monkeypatch.setattr(settings, "one688_cli", fake_cli[0])
     assert "search_1688" in {t["function"]["name"] for t in personal_tool_schemas()}
+    ex = ToolExecutor(Wiki(tmp_path), ask)       # новый ход — без памяти о прошлых вызовах
     assert (await ex.call("search_1688", {"mode": "search", "query": "a"})).startswith("[1688: 2 шт.")
 
 
@@ -163,3 +180,41 @@ async def test_run_cancel_kills_cli(fake_cli, tmp_path: Path) -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert not one688._lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_login_flow_sends_qr_and_unblocks(fake_cli, tmp_path: Path, monkeypatch) -> None:
+    cli, _ = fake_cli
+    monkeypatch.setattr(one688, "_login_blocked_until", 1e18)
+    got: list[str] = []
+
+    async def on_qr(path: str) -> None:
+        got.append(path)
+    ok, info = await one688.login_flow(cli, on_qr, timeout=30)
+    assert ok and info == "вход выполнен" and got and got[0].endswith("qr.png")
+    assert one688.available()
+    monkeypatch.setenv("FAKE_LOGIN_FAIL", "1")
+    ok, info = await one688.login_flow(cli, on_qr, timeout=30)
+    assert not ok and "Waiting for scan" in info
+
+
+@pytest.mark.asyncio
+async def test_repeat_calls_are_not_executed_twice(tmp_path: Path, monkeypatch) -> None:
+    calls: list = []
+
+    async def fake_impl(self, name, arguments):
+        calls.append((name, arguments))
+        return "[1688 не отдал карточку]"
+    monkeypatch.setattr(ToolExecutor, "_call_impl", fake_impl)
+
+    async def ask(_q, _o):
+        return ""
+    ex = ToolExecutor(Wiki(tmp_path), ask)
+    a = await ex.call("fetch_url", {"url": "https://detail.1688.com/offer/804827869776.html?share_token=x"})
+    b = await ex.call("fetch_url", {"url": "https://m.1688.com/offer/804827869776.html"})
+    c = await ex.call("fetch_url", {"url": "https://detail.1688.com/offer/566634192031.html"})
+    await ex.call("list_dir", {"path": "wiki"})
+    await ex.call("list_dir", {"path": "wiki"})                  # локальные — без дедупа
+    assert a == "[1688 не отдал карточку]" and b.startswith("[ПОВТОР") and "не отдал" in b
+    assert c == "[1688 не отдал карточку]" and ex.repeat_hits == 1
+    assert [n for n, _ in calls] == ["fetch_url", "fetch_url", "list_dir", "list_dir"]

@@ -128,6 +128,8 @@ HELP_TEXT = (
     "/voice on|off|auto — голосовые ответы; /voice set &lt;voice_id&gt;; /voices — список\n"
     "/imagine &lt;описание&gt; [16:9] — сгенерировать картинку\n"
     "/space — что лежит в пространстве · /log — операции · /chats — куда шарить\n"
+    "/stop — остановить текущий запрос · /skills — скилы (/grill, /tidy, /interview)\n"
+    "/login1688 — вход в 1688 по QR для поиска поставщиков <i>(admin)</i>\n"
     "/model — модель LLM <i>(admin)</i> · /allow /deny /users — доступ <i>(admin)</i>\n"
 )
 
@@ -694,13 +696,17 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
 
     @router.message(Command("stop"))
     async def cmd_stop(msg: Message) -> None:
+        """Остановить идущий запрос агента в этой теме и/или фоновый разбор."""
         uid = msg.from_user.id if msg.from_user else 0
+        stopped = []
+        if stop_turns_in(msg.chat.id, _thread_id(msg), uid):
+            stopped.append("запрос")
         task = _ingest_tasks.get(uid)
         if task and not task.done():
             task.cancel()
-            await msg.reply("⏹ Останавливаю разбор…")
-        else:
-            await msg.reply("Фоновых задач нет.")
+            stopped.append("разбор")
+        await msg.reply(f"⏹ Останавливаю: {', '.join(stopped)}…" if stopped
+                        else "Сейчас ничего не выполняется.")
 
     async def _resolve_user_target(target: str) -> int | None:
         t = (target or "").strip()
@@ -2354,12 +2360,47 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         if cb.message:
             await cb.message.answer("Как назвать воркспейс? Напиши имя одним сообщением (или /cancel).")
 
-    @router.message(Command("stop"))
-    async def cmd_stop(msg: Message) -> None:
-        if not await _guard(msg):
+    @router.message(Command("login1688"))
+    async def cmd_login1688(msg: Message) -> None:
+        """Вход 1688-cli по QR: бот запускает `1688 login` и присылает QR сюда (только админ —
+        сессия одна на весь бот)."""
+        uid = msg.from_user.id if msg.from_user else None
+        if not is_admin(uid):
+            await msg.reply("⛔ Вход в 1688 делает админ бота.")
             return
-        n = stop_turns_in(msg.chat.id, _thread_id(msg), msg.from_user.id if msg.from_user else None)
-        await msg.reply("⏹ Останавливаю текущий запрос…" if n else "Сейчас ничего не выполняется.")
+        if not settings.one688_cli.strip():
+            await msg.reply("1688-cli не настроен (ONE688_CLI) — см. docs/1688-cli.md.")
+            return
+        from ..agent import one688  # noqa: PLC0415
+        status = await msg.reply("🔑 Запускаю вход в 1688, сейчас пришлю QR…")
+        qr_msgs: list[Message] = []
+
+        async def on_qr(path: str) -> None:
+            try:
+                qr_msgs.append(await msg.answer_photo(
+                    FSInputFile(path),
+                    caption="📱 Отсканируй в приложении 1688 или Taobao и подтверди вход. Жду до 10 минут."))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("login1688: send QR failed: %s", exc)
+                await msg.reply(f"Не смог отправить QR ({type(exc).__name__}). Файл на сервере: {path}")
+
+        try:
+            ok, info = await one688.login_flow(settings.one688_cli, on_qr, timeout=600,
+                                               profile=settings.one688_profile)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("login1688 failed")
+            ok, info = False, type(exc).__name__
+        for m in qr_msgs:
+            try:
+                await m.delete()
+            except Exception:  # noqa: BLE001
+                pass
+        text = (f"✅ 1688: {info}. Можно искать — «найди на 1688 …» или фото + «где купить»."
+                if ok else f"❌ 1688: вход не удался — {_esc(info)[:400]}. Попробуй /login1688 ещё раз.")
+        try:
+            await status.edit_text(text)
+        except Exception:  # noqa: BLE001
+            await msg.reply(text)
 
     @router.message(Command("skills"))
     async def cmd_skills(msg: Message) -> None:

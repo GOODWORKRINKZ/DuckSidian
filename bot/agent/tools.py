@@ -783,7 +783,9 @@ def personal_tool_schemas() -> list[dict]:
     from ..config import settings  # noqa: PLC0415
     from .one688 import SCHEMA as ONE688_SCHEMA  # noqa: PLC0415
     base = [t for t in TOOL_SCHEMAS if t["function"]["name"] not in _PERSONAL_EXCLUDE]
-    extra = [ONE688_SCHEMA] if settings.one688_cli.strip() else []
+    from .one688 import available as one688_available  # noqa: PLC0415
+    # Нет входа в 1688 (CLI вернул «login») — инструмент скрыт на время, чтобы агент не тратил шаги.
+    extra = [ONE688_SCHEMA] if (settings.one688_cli.strip() and one688_available()) else []
     return base + PERSONAL_EXTRA_TOOLS + extra
 
 
@@ -812,6 +814,9 @@ class ToolExecutor:
         self._workspace_fn = workspace_fn
         # Личный режим: вопрос с кнопками в чат пользователя (ask_choice).
         self._choice_fn = choice_fn
+        # Внешние вызовы этого хода (ключ → результат): повтор не ходит наружу снова.
+        self._seen_calls: dict[str, str] = {}
+        self.repeat_hits = 0
         self._media_index = MediaIndex(wiki.root)
         # Кэш содержимого файлов в рамках run_agent (или прокинутый снаружи —
         # тогда живёт между несколькими run_agent одного дня). Ключ — rel path.
@@ -861,7 +866,46 @@ class ToolExecutor:
             )
         return ("\n" + "\n".join(notes)) if notes else ""
 
+    # Инструменты «сходить наружу»: тот же вызов в одном ходе вернёт тот же ответ, поэтому
+    # повтор не выполняется — агент получает прошлый результат и требование сменить подход.
+    # (Агент крутился по 5–6 раз на одной закрытой карточке 1688.)
+    NO_REPEAT_TOOLS = frozenset({
+        "fetch_url", "web_search", "baidu_search", "search_1688", "fetch_git_log",
+        "summarize_file", "describe_media", "fetch_image", "fetch_file",
+        "search_team_wiki", "read_team_file",
+    })
+    REPEAT_NOTE = (
+        "[ПОВТОР: ровно этот вызов уже был в этом ходе, результат тот же (ниже). Не повторяй "
+        "его — смени запрос или источник, а если вариантов нет — ответь пользователю с тем, "
+        "что есть, и скажи, чего не хватает (например, скриншот карточки).]\n"
+    )
+
+    @staticmethod
+    def call_key(name: str, arguments: dict[str, Any] | None) -> str:
+        """Ключ повтора: имя + аргументы; ссылки 1688 сводятся к offer id (share-токены
+        и m./detail. — один и тот же товар)."""
+        import re as _re
+        args = dict(arguments or {})
+        if name == "fetch_url":
+            url = str(args.get("url") or "").strip()
+            m = _re.search(r"1688\.com/offer/(\d+)", url)
+            args = {"url": f"1688:{m.group(1)}" if m else url.split("#", 1)[0]}
+        return name + json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
+
     async def call(self, name: str, arguments: dict[str, Any]) -> str:
+        if name not in self.NO_REPEAT_TOOLS:
+            return await self._call_impl(name, arguments)
+        key = self.call_key(name, arguments)
+        prev = self._seen_calls.get(key)
+        if prev is not None:
+            self.repeat_hits += 1
+            log.info("tool repeat blocked: %s (hits=%d)", key[:160], self.repeat_hits)
+            return self.REPEAT_NOTE + prev[:1500]
+        result = await self._call_impl(name, arguments)
+        self._seen_calls[key] = result
+        return result
+
+    async def _call_impl(self, name: str, arguments: dict[str, Any]) -> str:
         try:
             if name == "get_current_time":
                 import datetime as _dt
