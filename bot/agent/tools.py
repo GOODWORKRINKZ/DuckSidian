@@ -775,8 +775,11 @@ PERSONAL_EXTRA_TOOLS += [
 
 def personal_tool_schemas() -> list[dict]:
     """Набор инструментов для личного режима."""
+    from ..config import settings  # noqa: PLC0415
+    from .one688 import SCHEMA as ONE688_SCHEMA  # noqa: PLC0415
     base = [t for t in TOOL_SCHEMAS if t["function"]["name"] not in _PERSONAL_EXCLUDE]
-    return base + PERSONAL_EXTRA_TOOLS
+    extra = [ONE688_SCHEMA] if settings.one688_cli.strip() else []
+    return base + PERSONAL_EXTRA_TOOLS + extra
 
 
 AskUserFn = Callable[[str, list[str] | None], Awaitable[str]]
@@ -1105,6 +1108,13 @@ class ToolExecutor:
                     return "ERROR: missing 'question'"
                 ans = await self._choice_fn(question, opts[:8] or None)
                 return f"Ответ пользователя: {ans}" if ans else "(нет ответа)"
+            if name == "search_1688":
+                from ..config import settings  # noqa: PLC0415
+                from . import one688  # noqa: PLC0415
+                if not settings.one688_cli.strip():
+                    return "ERROR: поиск по 1688 не настроен (ONE688_CLI) — используй baidu_search/web_search."
+                return await one688.run(settings.one688_cli, dict(arguments or {}), self.wiki.root,
+                                        timeout=settings.one688_timeout, profile=settings.one688_profile)
             if name == "use_skill":
                 from ..skills import load_skills  # noqa: PLC0415
                 skills = load_skills(self.wiki.root)

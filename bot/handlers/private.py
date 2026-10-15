@@ -405,7 +405,7 @@ _STEP_LABELS = {
     "describe_media": "👁 смотрю файл", "generate_image": "🎨 рисую",
     "share_to_chat": "📤 делюсь с чатом", "get_current_time": "🕐 смотрю время",
     "append_to_section": "✍️ дописываю секцию", "ask_choice": "❓ спрашиваю тебя",
-    "use_skill": "🧩 беру скил", "summarize_file": "🗜 конспектирую", "grep_dir": "🔎 ищу",
+    "use_skill": "🧩 беру скил", "search_1688": "🏭 ищу на 1688", "summarize_file": "🗜 конспектирую", "grep_dir": "🔎 ищу",
     "search_wiki": "🔎 ищу в vault", "baidu_search": "🌐 ищу на Baidu", "fetch_image": "🖼 качаю картинку",
     "fetch_file": "⬇️ качаю файл", "extract_archive": "📦 распаковываю",
 }
@@ -445,7 +445,7 @@ def render_progress(steps: list[str], meta: dict, *, now: float) -> str:
 def _step_line(name: str, args: dict) -> str:
     label = _STEP_LABELS.get(name, f"⚙️ {name}")
     arg = ""
-    for key in ("query", "path", "url", "chat", "prompt", "repo", "src"):
+    for key in ("query", "path", "url", "chat", "prompt", "repo", "src", "image", "target"):
         v = args.get(key)
         if v:
             arg = str(v)

@@ -205,6 +205,13 @@ class Settings(BaseSettings):
     # Сколько последних сообщений диалога подмешивать агенту как контекст.
     personal_history_size: int = 12
 
+    # --- 1688-cli (github.com/superjack2050/1688-cli) — поиск на 1688, только чтение ---
+    # Команда запуска CLI ("1688" или "npx 1688-cli"); пусто — инструмент search_1688 выключен.
+    # Вход в аккаунт покупателя — один раз вручную на сервере: `1688 login` (QR).
+    one688_cli: str = ""
+    one688_timeout: int = 180
+    one688_profile: str = ""
+
     # --- STT ---
     # Модель openai-whisper: tiny | base | small | medium | large. Для русского
     # рекомендуется минимум `small` (~460MB), `tiny` часто даёт мусор.
