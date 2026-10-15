@@ -80,6 +80,7 @@ from .admin_shared import (
 )
 from .commands import REACT_ERROR, REACT_QUEUED, _download_ask_media, _extract_image_refs, _react, _reply_html
 from .listener import _download_media, handle_answer_callback, question_id_from_reply
+from .shared_live import member_targets, typing_many
 
 log = logging.getLogger(__name__)
 
@@ -2572,6 +2573,9 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             await _react(bot, msg, "👀")
         stop = asyncio.Event()
         typing = asyncio.create_task(_typing_loop(bot, msg.chat.id, stop, _thread_id(msg)))
+        # В совместном воркспейсе партнёры тоже видят «печатает…» в своих темах.
+        targets = await member_targets(db, SHARED_PREFIX + ws["project_slug"], msg.chat.id)             if (space.is_shared and ws) else []
+        typing_others = asyncio.create_task(typing_many(bot, targets, stop))
         try:
             answer = await orch.personal_turn(
                 space, agent_text or "(без текста — см. вложение)",
@@ -2589,6 +2593,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         finally:
             stop.set()
             typing.cancel()
+            typing_others.cancel()
         mode = await _voice_mode(space.user_id)
         voice = mode == "on" or (mode == "auto" and spoke)
         title_hint = (text or transcript or "Ответ").splitlines()[0]
