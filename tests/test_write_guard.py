@@ -57,7 +57,9 @@ def _executor(space: PersonalSpace) -> ToolExecutor:
 
 
 def _nudges(client: _FakeClient) -> int:
-    return sum(1 for m in client.calls[-1] if m.get("content") == WRITE_NUDGE)
+    nudges = [m for m in client.calls[-1] if m.get("content") == WRITE_NUDGE]
+    assert all(m["role"] == "system" for m in nudges)   # служебное, не реплика пользователя
+    return len(nudges)
 
 
 def test_claims_write_detection() -> None:

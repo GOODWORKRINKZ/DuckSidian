@@ -40,11 +40,16 @@ _WRITE_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Служебное сообщение (role=system): пользователь его не видит, и первый вариант
+# ответа ему тоже не отправлен — финальный ответ не должен на них ссылаться.
 WRITE_NUDGE = (
-    "⚠️ Ты ответил, что записал/добавил/сохранил, но за этот ход НЕ вызвал ни одного "
-    "инструмента записи (edit_file / write_file / append_file …) — в vault ничего не "
-    "изменилось. Либо вызови нужные инструменты сейчас и потом finish(), либо честно "
-    "ответь пользователю, что ничего не записал (без слов «записал/добавил/готово»)."
+    "[Служебная проверка бота — пользователь её не видит.] Твой ответ утверждает запись "
+    "(«записал/добавил/готово»), но в этом ходе не было ни одного вызова инструмента "
+    "записи (edit_file / write_file / append_file …) — в vault ничего не изменилось. "
+    "Этот вариант ответа пользователю НЕ отправлен. Сделай запись инструментами и "
+    "заверши finish(), а если записывать нечего — ответь без слов «записал/добавил/готово». "
+    "Пиши финальный ответ так, будто это твой первый ответ: не упоминай эту проверку, "
+    "прошлый вариант ответа, «теперь по-настоящему», «в прошлом ходу» и т.п."
 )
 
 
@@ -247,7 +252,7 @@ async def run_agent(
                 run.write_nudged = True
                 log.warning("agent step %d: claims a write without write tools, nudging. head=%r",
                             step, run.summary[:160])
-                messages.append({"role": "user", "content": WRITE_NUDGE})
+                messages.append({"role": "system", "content": WRITE_NUDGE})
                 continue
             run.finished = True
             break
@@ -307,7 +312,7 @@ async def run_agent(
                 run.finished = False
                 log.warning("agent step %d: finish() claims a write without write tools, nudging. head=%r",
                             step, run.summary[:160])
-                messages.append({"role": "user", "content": WRITE_NUDGE})
+                messages.append({"role": "system", "content": WRITE_NUDGE})
                 continue
             break
 
