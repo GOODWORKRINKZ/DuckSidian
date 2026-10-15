@@ -45,6 +45,12 @@ class LLMProvider(BaseModel):
     price_cached: float = 0.0
     # DeepSeek-специфичный параметр `thinking` — другие вендоры могут вернуть 400.
     supports_thinking_flag: bool = False
+    # Доп. поля тела запроса (например, enable_thinking=False у Qwen: без него
+    # reasoning-модели думают минутами и упираются в таймаут клиента).
+    extra_payload: dict = Field(default_factory=dict)
+    # Применять extra_payload только к моделям с этими префиксами (пусто = ко всем):
+    # glm-5.* на том же эндпоинте отвергает enable_thinking=False.
+    extra_payload_prefixes: list[str] = Field(default_factory=list)
     # Есть ли endpoint баланса (/user/balance есть только у DeepSeek).
     has_balance_api: bool = False
 
@@ -79,6 +85,8 @@ LLM_PROVIDERS: dict[str, LLMProvider] = {
                 "qwen3.6-flash", "deepseek-v4.1-flash", "deepseek-v4-pro",
                 "deepseek-v4-flash-0731", "glm-5.3", "glm-5.2", "auto"],
         price_in=0.40, price_out=1.20, price_cached=0.10,
+        extra_payload={"enable_thinking": False},
+        extra_payload_prefixes=["qwen"],
     ),
     "openai": LLMProvider(
         key="openai", title="OpenAI",

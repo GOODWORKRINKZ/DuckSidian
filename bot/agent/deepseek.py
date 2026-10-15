@@ -223,6 +223,9 @@ class LLMClient:
             # DeepSeek: явно отключаем thinking mode — нам нужен быстрый
             # tool-calling. Другим вендорам этот параметр не шлём (400).
             payload["thinking"] = {"type": "disabled"}
+        prefixes = self.provider.extra_payload_prefixes
+        if not prefixes or self.model.startswith(tuple(prefixes)):
+            payload.update(self.provider.extra_payload)
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
