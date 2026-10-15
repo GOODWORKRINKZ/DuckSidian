@@ -92,6 +92,18 @@ CREATE TABLE IF NOT EXISTS shares (
     posted_message_id INTEGER,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS shared_vaults (
+    slug TEXT PRIMARY KEY,
+    owner_user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS shared_members (
+    slug TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    added_by INTEGER,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (slug, user_id)
+);
 """
 
 
@@ -156,7 +168,47 @@ class DB:
                     created_at TEXT NOT NULL
                 )"""
             )
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS shared_vaults (
+                    slug TEXT PRIMARY KEY,
+                    owner_user_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS shared_members (
+                    slug TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    added_by INTEGER,
+                    added_at TEXT NOT NULL,
+                    PRIMARY KEY (slug, user_id)
+                )"""
+            )
             await db.commit()
+            await self._migrate_shared_vaults(db)
+
+    async def _migrate_shared_vaults(self, db: aiosqlite.Connection) -> None:
+        """Совместные vault'ы, созданные до появления владельцев: владелец — тот, чья тема
+        привязана к shared/<slug> раньше всех, участники — все, у кого есть такая тема."""
+        now = datetime.now(timezone.utc).isoformat()
+        async with db.execute(
+            """SELECT project_slug, chat_id, created_at FROM workspaces
+               WHERE project_slug LIKE 'shared/%' ORDER BY project_slug, created_at"""
+        ) as cur:
+            rows = await cur.fetchall()
+        for project_slug, chat_id, created_at in rows:
+            slug = project_slug[len("shared/"):]
+            if not slug:
+                continue
+            await db.execute(
+                "INSERT OR IGNORE INTO shared_vaults (slug, owner_user_id, created_at) VALUES (?, ?, ?)",
+                (slug, int(chat_id), created_at or now),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO shared_members (slug, user_id, added_by, added_at) VALUES (?, ?, NULL, ?)",
+                (slug, int(chat_id), created_at or now),
+            )
+        await db.commit()
 
     @asynccontextmanager
     async def conn(self) -> AsyncIterator[aiosqlite.Connection]:
@@ -553,6 +605,20 @@ class DB:
         return int(row["user_id"]) if row else None
 
 
+    async def user_label(self, user_id: int) -> str:
+        """«Имя (@username, id)» по последнему сообщению пользователя; без сообщений — просто id."""
+        async with self.conn() as db:
+            async with db.execute(
+                "SELECT full_name, username FROM messages WHERE user_id=? ORDER BY ts DESC LIMIT 1", (user_id,)
+            ) as cur:
+                row = await cur.fetchone()
+        if not row:
+            return str(user_id)
+        name = row["full_name"] or ""
+        tag = f"@{row['username']}" if row["username"] else ""
+        extra = ", ".join(x for x in (tag, str(user_id)) if x)
+        return f"{name} ({extra})" if name else extra
+
     async def find_workspaces_by_slug(self, project_slug: str) -> list[aiosqlite.Row]:
         """Все темы (всех пользователей), привязанные к project_slug (для shared/<slug>)."""
         async with self.conn() as db:
@@ -560,3 +626,66 @@ class DB:
                 "SELECT * FROM workspaces WHERE project_slug=? ORDER BY updated_at", (project_slug,)
             ) as cur:
                 return list(await cur.fetchall())
+
+    # --- совместные vault'ы: владелец и участники ---
+
+    async def get_shared_vault(self, slug: str) -> aiosqlite.Row | None:
+        async with self.conn() as db:
+            async with db.execute("SELECT * FROM shared_vaults WHERE slug=?", (slug,)) as cur:
+                return await cur.fetchone()
+
+    async def register_shared_vault(self, slug: str, owner_user_id: int) -> None:
+        """Зарегистрировать общий vault (если ещё нет) и записать владельца участником."""
+        now = datetime.now(timezone.utc).isoformat()
+        async with self.conn() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO shared_vaults (slug, owner_user_id, created_at) VALUES (?, ?, ?)",
+                (slug, owner_user_id, now),
+            )
+            async with db.execute("SELECT owner_user_id FROM shared_vaults WHERE slug=?", (slug,)) as cur:
+                row = await cur.fetchone()
+            if row is not None and int(row["owner_user_id"]) == owner_user_id:
+                # участником записываем только настоящего владельца; чужой vault не трогаем
+                await db.execute(
+                    "INSERT OR IGNORE INTO shared_members (slug, user_id, added_by, added_at) VALUES (?, ?, NULL, ?)",
+                    (slug, owner_user_id, now),
+                )
+            await db.commit()
+
+    async def add_shared_member(self, slug: str, user_id: int, added_by: int | None) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        async with self.conn() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO shared_members (slug, user_id, added_by, added_at) VALUES (?, ?, ?, ?)",
+                (slug, user_id, added_by, now),
+            )
+            await db.commit()
+
+    async def remove_shared_member(self, slug: str, user_id: int) -> None:
+        """Убрать участника и отвязать его темы от общего vault (владельца убрать нельзя)."""
+        async with self.conn() as db:
+            await db.execute("DELETE FROM shared_members WHERE slug=? AND user_id=?", (slug, user_id))
+            await db.execute(
+                "UPDATE workspaces SET project_slug=NULL WHERE chat_id=? AND project_slug=?",
+                (user_id, "shared/" + slug),
+            )
+            await db.commit()
+
+    async def shared_members(self, slug: str) -> list[int]:
+        async with self.conn() as db:
+            async with db.execute(
+                "SELECT user_id FROM shared_members WHERE slug=? ORDER BY added_at", (slug,)
+            ) as cur:
+                return [int(r["user_id"]) for r in await cur.fetchall()]
+
+    async def shared_role(self, slug: str, user_id: int) -> str:
+        """'owner' | 'member' | 'none' — роль пользователя в общем vault."""
+        async with self.conn() as db:
+            async with db.execute("SELECT owner_user_id FROM shared_vaults WHERE slug=?", (slug,)) as cur:
+                v = await cur.fetchone()
+            if v is not None and int(v["owner_user_id"]) == user_id:
+                return "owner"
+            async with db.execute(
+                "SELECT 1 FROM shared_members WHERE slug=? AND user_id=?", (slug, user_id)
+            ) as cur:
+                return "member" if await cur.fetchone() else "none"
