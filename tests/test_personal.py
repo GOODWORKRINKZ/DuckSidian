@@ -711,7 +711,11 @@ def test_split_voice_block_and_footer() -> None:
 @pytest.mark.asyncio
 async def test_list_voices_legacy() -> None:
     from bot.media_ai import LEGACY_VOICES, MediaAI
-    voices = await MediaAI().list_voices("legacy")
+    ai = MediaAI()
+    try:
+        voices = await ai.list_voices("legacy")
+    finally:
+        await ai._client.aclose()
     ids = {v["voice_id"] for v in voices}
     assert "female-shaonv" in ids and ids == set(LEGACY_VOICES)
     assert all(v["description"] for v in voices)
