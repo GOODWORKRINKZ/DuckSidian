@@ -38,6 +38,8 @@ class AgentRun:
     # скачивали и не открывали (fetch_image / describe_media / generate_image).
     media_nudged: bool = False
     unconfirmed_media: bool = False
+    # Произвольная проверка ответа (answer_check вызывающего) один раз вернула подсказку.
+    check_nudged: bool = False
 
 
 # «Записал / добавила / сохранили / готово / обновлено» — но не «не записал».
@@ -208,6 +210,7 @@ async def run_agent(
     compress_ctx_threshold: int = 80_000,
     write_tools: frozenset[str] | set[str] | None = None,
     media_tools: frozenset[str] | set[str] | None = None,
+    answer_check: Any = None,
 ) -> AgentRun:
     """Один прогон агента до вызова finish() или исчерпания шагов.
 
@@ -222,6 +225,10 @@ async def run_agent(
 
     Подсказка за прогон одна (общая для обоих guard'ов): если модель после неё
     перефразировала выдумку, второй подсказки нет, но флаг unconfirmed_* ставится.
+
+    answer_check(text) -> str | None: проверка вызывающего (например, «ответ спрашивает
+    автора репоста, хотя он указан»); вернула текст — он досылается агенту как system
+    и агент делает ещё шаг (тоже один раз за прогон, run.check_nudged=True).
     """
     vault_root: Path | None = getattr(getattr(executor, "wiki", None), "root", None)
 
@@ -246,11 +253,17 @@ async def run_agent(
 
     def _nudge(text: str, step: int, where: str) -> bool:
         """Досылает подсказку(и), если ответ выдуман и подсказок ещё не было."""
-        if run.write_nudged or run.media_nudged:
+        if run.write_nudged or run.media_nudged or run.check_nudged:
             return False
         fake_write, fake_media = _fake_write(text), _fake_media(text)
-        if not (fake_write or fake_media):
+        extra = answer_check(text) if (answer_check is not None and text) else None
+        if not (fake_write or fake_media or extra):
             return False
+        if extra and not (fake_write or fake_media):
+            run.check_nudged = True
+            log.warning("agent step %d: %s failed answer_check, nudging. head=%r", step, where, text[:160])
+            messages.append({"role": "system", "content": extra})
+            return True
         if fake_write:
             run.write_nudged = True
             log.warning("agent step %d: %s claims a write without write tools, nudging. head=%r",

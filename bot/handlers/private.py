@@ -53,6 +53,7 @@ from ..media_parser import (
     transcribe_video,
 )
 from ..media_refs import missing_note, split_voice_block, strip_images_block
+from ..forwards import forward_header as _forward_header  # noqa: F401  (тесты импортируют отсюда)
 from ..orchestrator import Orchestrator
 from ..skills import load_skills, match_command
 from ..personal import (
@@ -334,65 +335,6 @@ def _display_name(msg: Message) -> str:
     if not u:
         return "anon"
     return u.full_name or (f"@{u.username}" if u.username else str(u.id))
-
-
-def _user_label(u: Any) -> str:
-    """«Имя Фамилия (@username, id=N)» для User/Chat-подобного объекта."""
-    name = (getattr(u, "full_name", None) or getattr(u, "title", None)
-            or " ".join(x for x in (getattr(u, "first_name", None), getattr(u, "last_name", None)) if x)
-            or "").strip()
-    extra = [f"@{u.username}" if getattr(u, "username", None) else "",
-             f"id={u.id}" if getattr(u, "id", None) is not None else ""]
-    extra = [e for e in extra if e]
-    return (name or "без имени") + (f" ({', '.join(extra)})" if extra else "")
-
-
-def _forward_header(msg: Message) -> str | None:
-    """Пометка для агента и журнала: сообщение переслано (репост) — от кого и когда.
-    Telegram даёт forward_origin: user (открытый профиль), hidden_user (только имя —
-    у автора закрыта пересылка), chat (от имени группы), channel (пост канала).
-    Без пересылки — None."""
-    origin = getattr(msg, "forward_origin", None)
-    who = ""
-    date = None
-    if origin is not None:
-        kind = getattr(origin, "type", "") or ""
-        date = getattr(origin, "date", None)
-        if kind == "user" or getattr(origin, "sender_user", None) is not None:
-            who = f"пользователь {_user_label(origin.sender_user)}"
-        elif kind == "hidden_user" or getattr(origin, "sender_user_name", None):
-            who = (f"пользователь «{origin.sender_user_name}» (профиль скрыт настройками "
-                   "приватности — ни @username, ни id Telegram не отдаёт)")
-        elif kind == "chat" or getattr(origin, "sender_chat", None) is not None:
-            who = f"чат «{getattr(origin.sender_chat, 'title', '') or ''}»"
-            sig = getattr(origin, "author_signature", None)
-            if sig:
-                who += f", автор {sig}"
-        elif kind == "channel" or getattr(origin, "chat", None) is not None:
-            ch = origin.chat
-            who = f"канал «{getattr(ch, 'title', '') or ''}»"
-            if getattr(ch, "username", None):
-                who += f" (@{ch.username})"
-            sig = getattr(origin, "author_signature", None)
-            if sig:
-                who += f", автор {sig}"
-    else:  # старые поля Bot API (< 7.0)
-        if getattr(msg, "forward_from", None) is not None:
-            who = f"пользователь {_user_label(msg.forward_from)}"
-        elif getattr(msg, "forward_sender_name", None):
-            who = f"пользователь «{msg.forward_sender_name}» (профиль скрыт настройками приватности)"
-        elif getattr(msg, "forward_from_chat", None) is not None:
-            who = f"канал/чат «{getattr(msg.forward_from_chat, 'title', '') or ''}»"
-        date = getattr(msg, "forward_date", None)
-    if not who:
-        return None
-    when = ""
-    if date is not None:
-        try:
-            when = f", оригинал от {date.strftime('%Y-%m-%d %H:%M')} UTC"
-        except Exception:  # noqa: BLE001
-            when = ""
-    return f"↪️ ПЕРЕСЛАНО (репост), автор — {who}{when}. Текст репоста ниже:"
 
 
 def history_messages(rows: list[Any], *, bot_id: int, skip: tuple[int, int] | None = None,

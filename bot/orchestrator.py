@@ -45,6 +45,7 @@ from .config import ChatConfig, settings
 from .db import DB
 from .git_sync import commit_and_push
 from .media_refs import find_images_marker, find_tail_marker, strip_images_block
+from .forwards import AUTHOR_NUDGE, asks_for_author, forward_hint, is_forward
 from .personal import PersonalSpace, is_user_cfg, share_artifact, share_workspace
 from .tg_format import md_to_tg_html, split_tg_chunks
 from .topic_manager import ensure_bot_topic
@@ -483,6 +484,8 @@ class Orchestrator:
         else:
             who_block = f"Сегодня: {today}. Владелец: {author_name} (user_id={author_id}).\n"
         anchor = space.msg_anchor(message_id, chat_id if chat_id is not None else author_id)
+        forwarded = is_forward(text)
+        fwd_block = (forward_hint(author_name) + "\n\n") if forwarded else ""
         user_prompt = (
             f"{who_block}"
             f"Групповые чаты для search_team_wiki/share_to_chat: {chats_desc}.\n"
@@ -492,8 +495,13 @@ class Orchestrator:
             f"Источник этой реплики: [[raw/inbox/{today}#{anchor}]].\n\n"
             f"--- КОНТЕКСТ VAULT (не читай эти файлы через read_file) ---\n{head_ctx}{pinned_block}\n"
             f"--- КОНЕЦ КОНТЕКСТА ---\n\n"
+            f"{fwd_block}"
             f"СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n{text.strip()}{media_block}"
         )
+        answer_check = None
+        if forwarded:
+            def answer_check(ans: str) -> str | None:
+                return AUTHOR_NUDGE if asks_for_author(ans) else None
         run = await run_agent(
             client=self.client,
             executor=executor,
@@ -510,6 +518,7 @@ class Orchestrator:
             interject=interject,
             write_tools=PERSONAL_WRITE_TOOLS,
             media_tools=MEDIA_TOOLS,
+            answer_check=answer_check,
         )
         self._record_run(f"personal/{space.user_id}", run)
         if settings.git_autocommit:
