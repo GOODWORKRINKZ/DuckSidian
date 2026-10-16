@@ -112,8 +112,9 @@ def test_bundle_text() -> None:
     out = bundle_text([f"{FORWARD_MARK}, автор — пользователь A. Текст репоста ниже:\n\nпривет",
                        "", f"{FORWARD_MARK}, автор — пользователь B. Текст репоста ниже:\n\nответ"])
     assert out.startswith(BUNDLE_MARK) and "2 сообщений" in out
-    assert "[1] " in out and "[2] " in out and "[3]" not in out
-    assert out.index("[1]") < out.index("[2]")
+    p1, p2 = "[1] " + FORWARD_MARK, "[2] " + FORWARD_MARK
+    assert p1 in out and p2 in out and "[3] " not in out
+    assert out.index(p1) < out.index(p2)
     assert is_forward(out)
 
 
