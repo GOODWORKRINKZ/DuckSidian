@@ -213,7 +213,12 @@ class LLMClient:
         tools: list[dict] | None = None,
         tool_choice: str | dict = "auto",
         temperature: float = 0.2,
+        thinking: bool | None = None,
     ) -> dict:
+        """thinking=False — попросить модель не рассуждать (короткие служебные запросы:
+        пересказ для озвучки и т.п.). Qwen/DashScope думает по умолчанию: пересказ в одну
+        фразу занимал ~30 с и ~1700 токенов рассуждений; с enable_thinking=false — ~3 с.
+        DeepSeek отключается всегда (см. ниже); остальным вендорам флаг не шлём."""
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -223,6 +228,8 @@ class LLMClient:
             # DeepSeek: явно отключаем thinking mode — нам нужен быстрый
             # tool-calling. Другим вендорам этот параметр не шлём (400).
             payload["thinking"] = {"type": "disabled"}
+        if thinking is False and self.provider.key == "qwen":
+            payload["enable_thinking"] = False
         prefixes = self.provider.extra_payload_prefixes
         if not prefixes or self.model.startswith(tuple(prefixes)):
             payload.update(self.provider.extra_payload)

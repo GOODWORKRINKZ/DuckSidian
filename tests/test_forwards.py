@@ -153,3 +153,41 @@ async def test_bundler_flush_error_is_logged(caplog: pytest.LogCaptureFixture) -
     await asyncio.sleep(0.05)
     assert not b.is_open("k")
     assert any("bundle flush failed" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------- finish(): ответ рядом с вызовом
+
+def test_prefer_body() -> None:
+    from bot.agent.loop import prefer_body
+    joke = "Денис, бро, ты дрессировщик, а не программист: " * 4
+    assert prefer_body(joke, "Прикольный ответ на подборку из 15 сообщений: Denis M хвалит Sol. Ответ готов для озвучки.")
+    assert prefer_body(joke, "Ответ готов для озвучки.")
+    assert prefer_body(joke + "\n\nVOICE:\nДенис, бро…", "Денис, бро, держи голосовое.")
+    assert prefer_body(joke, "")
+    # обычный случай: summary — и есть ответ, рядом — короткая ремарка
+    assert not prefer_body("Готово, завершаю.", "Записал источник в wiki/sources/x.md, вот что важно: …" * 3)
+    assert not prefer_body("", "Нормальный ответ.")
+    assert not prefer_body(joke, joke + " И ещё немного текста в самом summary, чтобы он был длиннее.")
+
+
+@pytest.mark.asyncio
+async def test_finish_uses_body_when_summary_is_stub(space: PersonalSpace) -> None:
+    async def ask(_q, _o):
+        return ""
+    joke = "Денис, бро, Sol не отделяет инфру от бизнеса, потому что учится у тебя 😄 " * 3
+    resp = {"choices": [{"message": {"content": joke, "tool_calls": [{
+        "id": "c1", "type": "function",
+        "function": {"name": "finish", "arguments": json.dumps(
+            {"summary": "Прикольный ответ на подборку из 15 сообщений. Ответ готов для озвучки."}, ensure_ascii=False)},
+    }]}}]}
+    run = await run_agent(client=_FakeClient([resp]), executor=ToolExecutor(space.wiki, ask),
+                          system_prompt="s", user_prompt="u", max_steps=3)
+    assert run.finished and run.summary.strip() == joke.strip()
+
+    resp = {"choices": [{"message": {"content": "Готово.", "tool_calls": [{
+        "id": "c1", "type": "function",
+        "function": {"name": "finish", "arguments": json.dumps({"summary": "Записал в wiki/notes/a.md: три пункта."})},
+    }]}}]}
+    run = await run_agent(client=_FakeClient([resp]), executor=ToolExecutor(space.wiki, ask),
+                          system_prompt="s", user_prompt="u", max_steps=3)
+    assert run.summary == "Записал в wiki/notes/a.md: три пункта."

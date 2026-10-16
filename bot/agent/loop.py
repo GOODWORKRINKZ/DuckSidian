@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..media_refs import has_images_block, mentioned_media, resolve_in_vault
+from ..media_refs import find_voice_marker, has_images_block, mentioned_media, resolve_in_vault
 from .deepseek import LLMClient, extract_usage
 from .tools import TOOL_SCHEMAS, ToolExecutor
 
@@ -64,6 +64,30 @@ WRITE_NUDGE = (
     "Пиши финальный ответ так, будто это твой первый ответ: не упоминай эту проверку, "
     "прошлый вариант ответа, «теперь по-настоящему», «в прошлом ходу» и т.п."
 )
+
+
+# finish(summary=«Ответ готов для озвучки» / «Прикольный ответ на подборку: …») — модель
+# описала ответ вместо ответа, а сам текст написала рядом с вызовом (content).
+_STUB_SUMMARY_RE = re.compile(
+    r"(?:ответ|текст|шутка|отчёт|пересказ)[^.!?\n]{0,60}?(?:готов|составлен|сформирован|ниже|выше|для озвучки|для пересылки)"
+    r"|^(?:прикольный|готовый|короткий|краткий|мой)\s+(?:ответ|текст|отчёт)\b",
+    re.IGNORECASE,
+)
+
+
+def prefer_body(body: str, summary: str) -> bool:
+    """Текст рядом с finish() — настоящий ответ, а summary — заглушка/описание?"""
+    body = (body or '').strip()
+    summary = (summary or '').strip()
+    if len(body) < 80:
+        return False
+    if not summary:
+        return True
+    if find_voice_marker(body) and not find_voice_marker(summary):
+        return True
+    if _STUB_SUMMARY_RE.search(summary) and len(body) > len(summary):
+        return True
+    return len(body) > 2 * len(summary) and len(summary) < 400
 
 
 def claims_write(text: str) -> bool:
@@ -404,7 +428,15 @@ async def run_agent(
                 args = {}
 
             if name == "finish":
-                run.summary = str(args.get("summary", ""))
+                summary = str(args.get("summary", ""))
+                body = _strip_think(raw_content).strip()
+                if prefer_body(body, summary):
+                    # Модель написала ответ рядом с вызовом, а в summary — описание
+                    # («ответ готов для озвучки»): пользователю нужен сам ответ.
+                    log.info("agent step %d: finish(): summary is a stub (%d chars), using assistant text (%d chars)",
+                             step, len(summary), len(body))
+                    summary = body
+                run.summary = summary
                 run.finished = True
                 finish_called = True
                 log.info("agent step %d: finish(summary=%r)", step, run.summary[:120])

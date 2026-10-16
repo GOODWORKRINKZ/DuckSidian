@@ -578,7 +578,7 @@ class Orchestrator:
             resp = await self.client.chat(
                 messages=[{"role": "system", "content": sys_prompt},
                           {"role": "user", "content": plain[:6000]}],
-                tools=None, temperature=0.3,
+                tools=None, temperature=0.3, thinking=False,
             )
             out = (resp["choices"][0]["message"].get("content") or "").strip()
             from .agent.loop import _sanitize_summary  # noqa: PLC0415

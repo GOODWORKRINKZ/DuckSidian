@@ -341,7 +341,9 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "finish",
-            "description": "Завершить работу. Аргумент — итоговый отчёт/ответ.",
+            "description": ("Завершить работу. summary — ПОЛНЫЙ текст ответа пользователю: он уйдёт в чат "
+                            "как есть. Не описание и не пересказ ответа («ответ готов», «прикольный ответ "
+                            "про …»), а сам ответ целиком."),
             "parameters": {
                 "type": "object",
                 "properties": {"summary": {"type": "string"}},
