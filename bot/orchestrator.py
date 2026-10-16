@@ -44,7 +44,7 @@ from .skills import catalog, load_skills
 from .config import ChatConfig, settings
 from .db import DB
 from .git_sync import commit_and_push
-from .media_refs import find_images_marker, strip_images_block
+from .media_refs import find_images_marker, find_tail_marker, strip_images_block
 from .personal import PersonalSpace, is_user_cfg, share_artifact, share_workspace
 from .tg_format import md_to_tg_html, split_tg_chunks
 from .topic_manager import ensure_bot_topic
@@ -73,10 +73,10 @@ def writes_footer(writes: dict[str, str], limit: int = 8) -> str:
 
 
 def add_footer(answer: str, footer: str) -> str:
-    """Добавить строку до блока IMAGES: (его хвост бот отрезает перед отправкой)."""
+    """Добавить строку до блоков IMAGES:/VOICE: (их хвост бот отрезает перед отправкой)."""
     if not footer:
         return answer
-    m = find_images_marker(answer)
+    m = find_tail_marker(answer)
     if not m:
         return f"{answer.rstrip()}\n\n{footer}"
     return f"{answer[:m.start()].rstrip()}\n\n{footer}\n\n{answer[m.start():].lstrip()}"
@@ -90,9 +90,9 @@ def mark_unconfirmed_media(answer: str) -> str:
 
 
 def mark_unconfirmed_write(answer: str) -> str:
-    """Пометить ответ, утверждающий запись, которой не было. Пометка — до блока
-    IMAGES: (его хвост бот отрезает от текста перед отправкой)."""
-    m = find_images_marker(answer)
+    """Пометить ответ, утверждающий запись, которой не было. Пометка — до блоков
+    IMAGES:/VOICE: (их хвост бот отрезает от текста перед отправкой)."""
+    m = find_tail_marker(answer)
     if not m:
         return f"{answer.rstrip()}\n\n{UNCONFIRMED_WRITE_NOTE}"
     return f"{answer[:m.start()].rstrip()}\n\n{UNCONFIRMED_WRITE_NOTE}\n\n{answer[m.start():].lstrip()}"

@@ -645,3 +645,73 @@ def test_shared_space_and_convert(vault: Path) -> None:
     # второй участник открывает тот же общий vault
     other = PersonalSpace.shared(slug, "Петя")
     assert other.root == shared.root and other.wiki.read_file("wiki/sources/v.md").startswith("---")
+
+
+# ---------------------------------------------------------------- репосты, VOICE-блок, legacy-голоса
+
+def test_forward_header_variants() -> None:
+    from datetime import datetime, timezone
+    from types import SimpleNamespace as NS
+    from bot.handlers.private import _forward_header
+
+    d = datetime(2026, 10, 16, 11, 10, tzinfo=timezone.utc)
+    user = NS(id=777, username="vasya", full_name="Вася Пупкин", first_name="Вася", last_name="Пупкин")
+    msg = NS(forward_origin=NS(type="user", date=d, sender_user=user))
+    h = _forward_header(msg)
+    assert h and h.startswith("↪️ ПЕРЕСЛАНО (репост)")
+    assert "Вася Пупкин" in h and "@vasya" in h and "id=777" in h and "2026-10-16 11:10" in h
+
+    msg = NS(forward_origin=NS(type="hidden_user", date=d, sender_user_name="Скрытый Юзер"))
+    h = _forward_header(msg)
+    assert h and "«Скрытый Юзер»" in h and "скрыт" in h
+
+    msg = NS(forward_origin=NS(type="channel", date=d, chat=NS(title="Техноновости", username="technews", id=-1),
+                               message_id=5, author_signature="Редакция"))
+    h = _forward_header(msg)
+    assert h and "канал «Техноновости»" in h and "@technews" in h and "Редакция" in h
+
+    msg = NS(forward_origin=NS(type="chat", date=d, sender_chat=NS(title="Мамкины инвесторы", id=-2),
+                               author_signature=None))
+    h = _forward_header(msg)
+    assert h and "чат «Мамкины инвесторы»" in h
+
+    # старые поля Bot API
+    msg = NS(forward_origin=None, forward_from=user, forward_sender_name=None, forward_from_chat=None, forward_date=None)
+    assert "Вася Пупкин" in (_forward_header(msg) or "")
+    msg = NS(forward_origin=None, forward_from=None, forward_sender_name="Аноним", forward_from_chat=None, forward_date=None)
+    assert "«Аноним»" in (_forward_header(msg) or "")
+    # обычное сообщение — без пометки
+    assert _forward_header(NS(forward_origin=None, forward_from=None, forward_sender_name=None,
+                              forward_from_chat=None, forward_date=None)) is None
+    assert _forward_header(NS()) is None
+
+
+def test_split_voice_block_and_footer() -> None:
+    from bot.media_ai import _md_for_tts
+    from bot.media_refs import split_voice_block
+    from bot.orchestrator import add_footer, mark_unconfirmed_write
+
+    text, speech = split_voice_block("Пояснение.\n\nVOICE:\nПривет, бро, это голос!\n")
+    assert text == "Пояснение." and speech == "Привет, бро, это голос!"
+    text, speech = split_voice_block("Ответ\n\n**VOICE:**\nСкажу вслух.\n\nIMAGES:\nraw/assets/a.jpg")
+    assert speech == "Скажу вслух." and text.startswith("Ответ") and "IMAGES:" in text and "raw/assets/a.jpg" in text
+    assert "Скажу" not in text
+    assert split_voice_block("Без блока") == ("Без блока", None)
+    # футер «Изменено» и пометки — до VOICE, а не внутрь озвучки
+    out = add_footer("Готово.\n\nVOICE:\nВслух.", "✍️ Изменено: `a.md`")
+    text, speech = split_voice_block(out)
+    assert speech == "Вслух." and "Изменено" in text
+    out = mark_unconfirmed_write("Записал.\n\nVOICE:\nВслух.")
+    text, speech = split_voice_block(out)
+    assert speech == "Вслух." and "Вслух" not in text
+    # пересказ для TTS не содержит служебный маркер
+    assert "VOICE" not in _md_for_tts("Текст\n\nVOICE:\nвслух")
+
+
+@pytest.mark.asyncio
+async def test_list_voices_legacy() -> None:
+    from bot.media_ai import LEGACY_VOICES, MediaAI
+    voices = await MediaAI().list_voices("legacy")
+    ids = {v["voice_id"] for v in voices}
+    assert "female-shaonv" in ids and ids == set(LEGACY_VOICES)
+    assert all(v["description"] for v in voices)

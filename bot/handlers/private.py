@@ -52,7 +52,7 @@ from ..media_parser import (
     extract_text_from_file,
     transcribe_video,
 )
-from ..media_refs import missing_note, strip_images_block
+from ..media_refs import missing_note, split_voice_block, strip_images_block
 from ..orchestrator import Orchestrator
 from ..skills import load_skills, match_command
 from ..personal import (
@@ -125,7 +125,7 @@ HELP_TEXT = (
     "/share (реплаем на мой ответ) [чат] — поделиться ответом\n"
     "/del &lt;№|имя|путь&gt; — удалить артефакт\n"
     "/say &lt;текст&gt; (или реплаем) — озвучить голосом\n"
-    "/voice on|off|auto — голосовые ответы; /voice set &lt;voice_id&gt;; /voices — список\n"
+    "/voice on|off|auto — голосовые ответы; /voice set &lt;voice_id&gt;; /voices — список (/voices English, /voices legacy — старые голоса MiniMax)\n"
     "/imagine &lt;описание&gt; [16:9] — сгенерировать картинку\n"
     "/space — что лежит в пространстве · /log — операции · /chats — куда шарить\n"
     "/stop — остановить текущий запрос · /skills — скилы (/grill, /tidy, /interview)\n"
@@ -334,6 +334,65 @@ def _display_name(msg: Message) -> str:
     if not u:
         return "anon"
     return u.full_name or (f"@{u.username}" if u.username else str(u.id))
+
+
+def _user_label(u: Any) -> str:
+    """«Имя Фамилия (@username, id=N)» для User/Chat-подобного объекта."""
+    name = (getattr(u, "full_name", None) or getattr(u, "title", None)
+            or " ".join(x for x in (getattr(u, "first_name", None), getattr(u, "last_name", None)) if x)
+            or "").strip()
+    extra = [f"@{u.username}" if getattr(u, "username", None) else "",
+             f"id={u.id}" if getattr(u, "id", None) is not None else ""]
+    extra = [e for e in extra if e]
+    return (name or "без имени") + (f" ({', '.join(extra)})" if extra else "")
+
+
+def _forward_header(msg: Message) -> str | None:
+    """Пометка для агента и журнала: сообщение переслано (репост) — от кого и когда.
+    Telegram даёт forward_origin: user (открытый профиль), hidden_user (только имя —
+    у автора закрыта пересылка), chat (от имени группы), channel (пост канала).
+    Без пересылки — None."""
+    origin = getattr(msg, "forward_origin", None)
+    who = ""
+    date = None
+    if origin is not None:
+        kind = getattr(origin, "type", "") or ""
+        date = getattr(origin, "date", None)
+        if kind == "user" or getattr(origin, "sender_user", None) is not None:
+            who = f"пользователь {_user_label(origin.sender_user)}"
+        elif kind == "hidden_user" or getattr(origin, "sender_user_name", None):
+            who = (f"пользователь «{origin.sender_user_name}» (профиль скрыт настройками "
+                   "приватности — ни @username, ни id Telegram не отдаёт)")
+        elif kind == "chat" or getattr(origin, "sender_chat", None) is not None:
+            who = f"чат «{getattr(origin.sender_chat, 'title', '') or ''}»"
+            sig = getattr(origin, "author_signature", None)
+            if sig:
+                who += f", автор {sig}"
+        elif kind == "channel" or getattr(origin, "chat", None) is not None:
+            ch = origin.chat
+            who = f"канал «{getattr(ch, 'title', '') or ''}»"
+            if getattr(ch, "username", None):
+                who += f" (@{ch.username})"
+            sig = getattr(origin, "author_signature", None)
+            if sig:
+                who += f", автор {sig}"
+    else:  # старые поля Bot API (< 7.0)
+        if getattr(msg, "forward_from", None) is not None:
+            who = f"пользователь {_user_label(msg.forward_from)}"
+        elif getattr(msg, "forward_sender_name", None):
+            who = f"пользователь «{msg.forward_sender_name}» (профиль скрыт настройками приватности)"
+        elif getattr(msg, "forward_from_chat", None) is not None:
+            who = f"канал/чат «{getattr(msg.forward_from_chat, 'title', '') or ''}»"
+        date = getattr(msg, "forward_date", None)
+    if not who:
+        return None
+    when = ""
+    if date is not None:
+        try:
+            when = f", оригинал от {date.strftime('%Y-%m-%d %H:%M')} UTC"
+        except Exception:  # noqa: BLE001
+            when = ""
+    return f"↪️ ПЕРЕСЛАНО (репост), автор — {who}{when}. Текст репоста ниже:"
 
 
 def history_messages(rows: list[Any], *, bot_id: int, skip: tuple[int, int] | None = None,
@@ -1530,14 +1589,21 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
     async def _send_agent_answer(msg: Message, space: PersonalSpace, answer: str, *,
                                  title_hint: str, ws_name: str | None = None,
                                  voice: bool = False) -> None:
+        answer, speech = split_voice_block(answer)
         display, has_images = _strip_images_block(answer)
+        if not display and speech:
+            display = speech   # агент дал только текст для озвучки — он же и текстовый ответ
         linked, refs = await _linkify_answer(space, display)
         sent_ids = await _reply_html(msg, linked or "(пусто)")
         if has_images:
             await _attach_media(msg, answer, space.wiki.root)
         await _send_table_images(msg, display)
         await _save_bot_reply(space, msg, display, sent_ids, ws_name)
-        if voice and display:
+        if speech:
+            # Блок VOICE: агент сам сформулировал, что сказать вслух (например, ответ на
+            # репост для пересылки) — озвучиваем дословно, независимо от режима /voice.
+            await _send_voice(msg, space, speech, summarize=False)
+        elif voice and display:
             await _send_voice(msg, space, display, summarize=True)
         # Кнопки: открыть упомянутые страницы (Telegraph, один тап) + поделиться ответом.
         rows: list[list[InlineKeyboardButton]] = []
@@ -2162,13 +2228,14 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             await msg.reply(f"❌ {_esc(str(exc))}", parse_mode="HTML")
             return
         if not voices:
-            await msg.reply(f"Голосов с префиксом «{_esc(prefix)}» не найдено. Попробуй /voices English.",
+            await msg.reply(f"Голосов с префиксом «{_esc(prefix)}» не найдено. Попробуй /voices English "
+                            "или /voices legacy.",
                             parse_mode="HTML")
             return
         current = await _voice_id(space.user_id)
         lines = [f"<b>Голоса ({_esc(prefix)}):</b>"]
         buttons: list[InlineKeyboardButton] = []
-        for v in voices[:25]:
+        for v in voices[:50]:
             mark = "✅ " if v["voice_id"] == current else ""
             lines.append(f"• {mark}<code>{_esc(v['voice_id'])}</code> — {_esc(v['description'][:90])}")
             data = f"pvoice:{v['voice_id']}"
@@ -2762,8 +2829,12 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                     stop.set()
                     typing.cancel()
 
-        # Текст для агента и для журнала.
+        # Текст для агента и для журнала. Репост — сначала пометка, от кого.
         parts: list[str] = []
+        fwd = _forward_header(msg)
+        if fwd:
+            log.info("private: forwarded message %s/%s: %s", msg.chat.id, msg.message_id, fwd[:160])
+            parts.append(fwd)
         if text:
             parts.append(text)
         if transcript:
@@ -2910,7 +2981,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             voice = mode == "on" or (mode == "auto" and spoke)
             title_hint = (text or transcript or "Ответ").splitlines()[0]
             await _send_agent_answer(msg, space, answer, title_hint=title_hint, ws_name=ws_name, voice=voice)
-            await notice.finish(_strip_images_block(answer)[0])
+            await notice.finish(_strip_images_block(split_voice_block(answer)[0])[0])
 
         try:
             await serialized_turn(lock_key, author=who, author_id=author_id,

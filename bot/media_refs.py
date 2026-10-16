@@ -38,6 +38,45 @@ def find_images_marker(answer: str) -> re.Match[str] | None:
     return last
 
 
+# Блок VOICE: — текст, который бот озвучит дословно и пришлёт голосовым (а не краткий
+# пересказ ответа). Оформление такое же терпимое, как у IMAGES.
+VOICE_MARKER_RE = re.compile(
+    r"(?im)^[ \t]*(?:[#>]+[ \t]*)?[*_]*[ \t]*VOICE[ \t]*[*_]*[ \t]*:[ \t]*[*_]*[ \t]*$"
+)
+
+
+def find_voice_marker(answer: str) -> re.Match[str] | None:
+    """Первый маркер блока VOICE (после него — только текст для озвучки и, возможно, IMAGES)."""
+    return VOICE_MARKER_RE.search(answer or "")
+
+
+def find_tail_marker(answer: str) -> re.Match[str] | None:
+    """Самый ранний из служебных маркеров (IMAGES / VOICE): всё, что бот дописывает
+    к ответу (футер «Изменено», пометки), должно встать ДО него."""
+    cands = [m for m in (find_images_marker(answer), find_voice_marker(answer)) if m]
+    return min(cands, key=lambda m: m.start()) if cands else None
+
+
+def split_voice_block(answer: str) -> tuple[str, str | None]:
+    """(ответ без блока VOICE, текст для озвучки или None). Блок VOICE тянется до
+    маркера IMAGES (если он идёт после) или до конца; IMAGES при этом остаётся в ответе."""
+    a = answer or ""
+    m = find_voice_marker(a)
+    if not m:
+        return a.strip(), None
+    tail = a[m.end():]
+    im = find_images_marker(tail)
+    if im:
+        speech, rest = tail[: im.start()], tail[im.start():]
+    else:
+        speech, rest = tail, ""
+    speech = speech.strip().strip("`").strip()
+    text = a[: m.start()].rstrip()
+    if rest.strip():
+        text = f"{text}\n\n{rest.strip()}"
+    return text.strip(), (speech or None)
+
+
 def has_images_block(answer: str) -> bool:
     return find_images_marker(answer) is not None
 

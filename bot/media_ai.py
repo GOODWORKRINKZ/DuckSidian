@@ -25,7 +25,7 @@ from typing import Any
 import httpx
 
 from .config import settings
-from .media_refs import strip_images_block
+from .media_refs import split_voice_block, strip_images_block
 
 log = logging.getLogger(__name__)
 tokens_log = logging.getLogger("bot.tokens")
@@ -50,6 +50,7 @@ def _md_for_tts(text: str) -> str:
     """Убрать markdown/ссылки/служебные блоки, чтобы озвучивать чистый текст."""
     t = text or ""
     t = strip_images_block(t)[0]
+    t = split_voice_block(t)[0]
     t = re.sub(r"```.*?```", " ", t, flags=re.DOTALL)
     t = re.sub(r"`([^`]*)`", r"\1", t)
     t = re.sub(r"!\[\[[^\]]*\]\]", " ", t)
@@ -60,6 +61,58 @@ def _md_for_tts(text: str) -> str:
     t = re.sub(r"[ \t]{2,}", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
+
+
+# Старые («legacy») системные голоса MiniMax. В /v1/get_voice их нет, но voice_id
+# принимается синтезом. Первая часть — название в терминах MiniMax, вторая — описание.
+LEGACY_VOICES: dict[str, tuple[str, str]] = {
+    "female-shaonv": ("少女音 Shaonv", "юная девушка, звонкий «аниме»-голос (кит. база, по-русски — с акцентом)"),
+    "female-shaonv-jingpin": ("少女音 Shaonv 精品", "то же, премиум-версия"),
+    "female-yujie": ("御姐音 Yujie", "уверенная взрослая женщина, низковатый тембр"),
+    "female-yujie-jingpin": ("御姐音 Yujie 精品", "то же, премиум-версия"),
+    "female-chengshu": ("成熟女性音 Chengshu", "зрелая спокойная женщина"),
+    "female-chengshu-jingpin": ("成熟女性音 Chengshu 精品", "то же, премиум-версия"),
+    "female-tianmei": ("甜美女性音 Tianmei", "сладкий, мягкий женский"),
+    "female-tianmei-jingpin": ("甜美女性音 Tianmei 精品", "то же, премиум-версия"),
+    "male-qn-qingse": ("青涩青年音 Qingse", "застенчивый юноша"),
+    "male-qn-qingse-jingpin": ("青涩青年音 Qingse 精品", "то же, премиум-версия"),
+    "male-qn-jingying": ("精英青年音 Jingying", "собранный молодой «элитный» мужской"),
+    "male-qn-jingying-jingpin": ("精英青年音 Jingying 精品", "то же, премиум-версия"),
+    "male-qn-badao": ("霸道青年音 Badao", "властный, напористый юноша"),
+    "male-qn-badao-jingpin": ("霸道青年音 Badao 精品", "то же, премиум-версия"),
+    "male-qn-daxuesheng": ("青年大学生音 Daxuesheng", "студент, бодрый мужской"),
+    "male-qn-daxuesheng-jingpin": ("青年大学生音 Daxuesheng 精品", "то же, премиум-версия"),
+    "presenter_male": ("男性主持人", "мужчина-ведущий"),
+    "presenter_female": ("女性主持人", "женщина-ведущая"),
+    "audiobook_male_1": ("男性有声书1", "мужской голос аудиокниги 1"),
+    "audiobook_male_2": ("男性有声书2", "мужской голос аудиокниги 2"),
+    "audiobook_female_1": ("女性有声书1", "женский голос аудиокниги 1"),
+    "audiobook_female_2": ("女性有声书2", "женский голос аудиокниги 2"),
+    "clever_boy": ("聪明男童", "смышлёный мальчик"),
+    "cute_boy": ("可爱男童", "милый мальчик"),
+    "lovely_girl": ("萌萌女童", "милая девочка"),
+    "cartoon_pig": ("卡通猪小琪", "мультяшный поросёнок"),
+    "bingjiao_didi": ("病娇弟弟", "«яндере»-братик"),
+    "junlang_nanyou": ("俊朗男友", "красавчик-бойфренд"),
+    "chunzhen_xuedi": ("纯真学弟", "наивный младшекурсник"),
+    "lengdan_xiongzhang": ("冷淡学长", "холодный старшекурсник"),
+    "badao_shaoye": ("霸道少爷", "властный молодой господин"),
+    "tianxin_xiaoling": ("甜心小玲", "сладкая Сяолин"),
+    "qiaopi_mengmei": ("俏皮萌妹", "озорная милашка"),
+    "wumei_yujie": ("妩媚御姐", "обольстительная взрослая"),
+    "diadia_xuemei": ("嗲嗲学妹", "кокетливая младшекурсница"),
+    "danya_xuejie": ("淡雅学姐", "элегантная старшекурсница"),
+    "Santa_Claus": ("Santa Claus", "Санта (англ. база)"),
+    "Grinch": ("Grinch", "Гринч (англ. база)"),
+    "Rudolph": ("Rudolph", "Рудольф (англ. база)"),
+    "Arnold": ("Arnold", "Арнольд (англ. база)"),
+    "Charming_Santa": ("Charming Santa", "обаятельный Санта"),
+    "Charming_Lady": ("Charming Lady", "обаятельная леди"),
+    "Sweet_Girl": ("Sweet Girl", "милая девушка (англ. база)"),
+    "Cute_Elf": ("Cute Elf", "милый эльф"),
+    "Attractive_Girl": ("Attractive Girl", "привлекательная девушка"),
+    "Serene_Woman": ("Serene Woman", "безмятежная женщина"),
+}
 
 
 class MediaAI:
@@ -284,7 +337,12 @@ class MediaAI:
         return mp3
 
     async def list_voices(self, lang_prefix: str = "Russian") -> list[dict[str, str]]:
-        """Системные голоса (voice_id, name, description), отфильтрованные по префиксу."""
+        """Системные голоса (voice_id, name, description), отфильтрованные по префиксу.
+        «legacy» — старые голоса MiniMax (female-shaonv и т.п.): get_voice их не отдаёт,
+        но для синтеза они работают, список зашит в LEGACY_VOICES."""
+        if (lang_prefix or "").strip().lower() in {"legacy", "old", "классика", "легаси"}:
+            return [{"voice_id": vid, "name": name, "description": desc}
+                    for vid, (name, desc) in LEGACY_VOICES.items()]
         if not self.configured:
             raise MediaAIError("MINIMAX_API_KEY не задан")
         resp = await self._client.post(
