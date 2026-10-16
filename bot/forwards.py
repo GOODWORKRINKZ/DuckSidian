@@ -6,8 +6,12 @@
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
-from typing import Any
+from typing import Any, Awaitable, Callable
+
+log = logging.getLogger(__name__)
 
 FORWARD_MARK = "↪️ ПЕРЕСЛАНО (репост)"
 
@@ -72,8 +76,10 @@ def forward_header(msg: Any) -> str | None:
 
 
 def is_forward(text: str) -> bool:
-    """Текст реплики начинается с пометки репоста (так её кладёт private-хендлер)."""
-    return (text or "").lstrip().startswith(FORWARD_MARK)
+    """Текст реплики начинается с пометки репоста или подборки репостов (так их кладёт
+    private-хендлер)."""
+    t = (text or "").lstrip()
+    return t.startswith(FORWARD_MARK) or t.startswith(BUNDLE_MARK)
 
 
 # «кто автор?», «от кого это?», «перешли с именем/контактом», «скинь имя/ник автора»,
@@ -100,7 +106,8 @@ def asks_for_author(text: str) -> bool:
 def forward_hint(owner: str) -> str:
     """Блок в промпт хода рядом с репостом: автор известен, спрашивать нечего."""
     return (
-        "⚠️ ЭТО РЕПОСТ. Автор оригинала указан в пометке «↪️ ПЕРЕСЛАНО…» в начале сообщения — "
+        "⚠️ ЭТО РЕПОСТ (или подборка репостов — один сюжет, один ответ на всё). Автор оригинала "
+        "указан в пометке «↪️ ПЕРЕСЛАНО…» в начале сообщения (у подборки — у каждой части) — "
         "он известен; НЕ спрашивай «кто автор», «от кого», «перешли с именем» и не проси контакт. "
         f"Переслал владелец ({owner}) — обращайся к нему; шутка/разбор — про автора репоста и "
         "его текст. Если автор репоста — сам бот (DuckSidianBot), это твой прежний ответ, "
@@ -119,3 +126,59 @@ AUTHOR_NUDGE = (
     "воркспейса), без вопросов про автора. Пиши финальный ответ так, будто это твой первый "
     "ответ: не упоминай эту проверку и прошлый вариант."
 )
+
+
+BUNDLE_MARK = "📨 ПОДБОРКА"
+
+
+def bundle_text(parts: list[str]) -> str:
+    """Текст хода из нескольких сообщений, пересланных подряд: один сюжет — одна реплика
+    агенту, части пронумерованы по порядку. Одна часть — возвращается как есть."""
+    parts = [p.strip() for p in parts if p and p.strip()]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    head = (f"{BUNDLE_MARK}: {len(parts)} сообщений, пересланных подряд — это ОДИН сюжет "
+            "(цитата и реакции на неё, по порядку). Ответ один, на весь сюжет; автор каждой части — "
+            "в её пометке «↪️ ПЕРЕСЛАНО…», часть без пометки написал сам владелец.")
+    return head + "\n\n" + "\n\n".join(f"[{i}] {p}" for i, p in enumerate(parts, 1))
+
+
+class Bundler:
+    """Склейка сообщений, пришедших подряд (пачка форвардов). add(key, item) копит по
+    ключу и перезапускает таймер; через delay секунд без новых — flush(key, items).
+    Пока ключ открыт (is_open), очередное сообщение того же автора в той же теме
+    тоже идёт в пачку."""
+
+    def __init__(self, delay: float, flush: Callable[[Any, list[Any]], Awaitable[None]]) -> None:
+        self.delay = delay
+        self._flush = flush
+        self._items: dict[Any, list[Any]] = {}
+        self._timers: dict[Any, asyncio.Task[None]] = {}
+
+    def is_open(self, key: Any) -> bool:
+        return key in self._items
+
+    def add(self, key: Any, item: Any) -> int:
+        """Положить в пачку; возвращает её текущий размер."""
+        self._items.setdefault(key, []).append(item)
+        t = self._timers.pop(key, None)
+        if t is not None:
+            t.cancel()
+        self._timers[key] = asyncio.get_running_loop().create_task(self._later(key))
+        return len(self._items[key])
+
+    async def _later(self, key: Any) -> None:
+        try:
+            await asyncio.sleep(self.delay)
+        except asyncio.CancelledError:
+            return
+        self._timers.pop(key, None)
+        items = self._items.pop(key, [])
+        if not items:
+            return
+        try:
+            await self._flush(key, items)
+        except Exception:  # noqa: BLE001
+            log.exception("bundle flush failed (key=%s, %d items)", key, len(items))

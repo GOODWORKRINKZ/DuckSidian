@@ -53,7 +53,7 @@ from ..media_parser import (
     transcribe_video,
 )
 from ..media_refs import missing_note, split_voice_block, strip_images_block
-from ..forwards import forward_header as _forward_header  # noqa: F401  (тесты импортируют отсюда)
+from ..forwards import Bundler, bundle_text, forward_header as _forward_header  # noqa: F401  (тесты импортируют _forward_header отсюда)
 from ..orchestrator import Orchestrator
 from ..skills import load_skills, match_command
 from ..personal import (
@@ -249,6 +249,26 @@ class RunningTurn:
 _running_turns: dict[str, RunningTurn] = {}
 # Через сколько секунд хода показать кнопку остановки (короткие ходы — без лишнего сообщения).
 STOP_BUTTON_DELAY = 15.0
+# Сколько ждать следующий форвард, прежде чем отдать пачку агенту одним ходом.
+FORWARD_BUNDLE_DELAY = 2.5
+
+
+class _Intake:
+    """Разобранное входящее сообщение: текст для агента/журнала и что скачалось."""
+
+    def __init__(self, msg: Message) -> None:
+        self.msg = msg
+        self.text = (msg.text or msg.caption or "").strip()
+        self.media_type: str | None = None
+        self.media_path: str | None = None
+        self.transcript: str | None = None
+        self.intake_block: str | None = None
+        self.attached: list[str] = []
+        self.has_media = bool(msg.photo or msg.video or msg.document or msg.audio
+                              or msg.voice or msg.video_note or msg.animation or msg.sticker)
+        self.spoke = bool(msg.voice or msg.video_note or msg.audio)
+        self.fwd = _forward_header(msg)
+        self.full_text = ""
 
 
 def busy_count() -> int:
@@ -2671,37 +2691,28 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         if ws_pre is not None and ws_pre["project_slug"] and await _foreign_shared(msg, dict(ws_pre), space):
             return
         lock_key: Any = ws_pre["project_slug"] if (ws_pre and shared_slug_of(ws_pre["project_slug"])) else space.user_id
-        await _process_message(msg, space, lock_key)
+        # Пачка форвардов (несколько пересланных подряд) — один ход агента: копим
+        # FORWARD_BUNDLE_DELAY секунд; текст владельца, пришедший пока пачка открыта, — туда же.
+        bkey = (msg.chat.id, _thread_id(msg), msg.from_user.id if msg.from_user else 0)
+        if (_forward_header(msg) is not None or _bundler.is_open(bkey)) and not (msg.text or '').startswith('/'):
+            n = _bundler.add(bkey, (msg, space, lock_key))
+            log.info("private: bundle %s/%s +1 (size %d)", msg.chat.id, msg.message_id, n)
+            return
+        await _process_message([msg], space, lock_key)
 
-    async def _process_message(msg: Message, space: PersonalSpace, lock_key: Any) -> None:
-        """Скачивание и расшифровка медиа, журнал — без блокировки; под блокировкой
-        lock_key (совместный воркспейс или пользователь) — только агент и запись ответа."""
-        ts = msg.date or datetime.now(timezone.utc)
-        who = _display_name(msg)
-        text = (msg.text or msg.caption or "").strip()
-        media_type: str | None = None
-        media_path: str | None = None
-        transcript: str | None = None
-        extracted: str | None = None
-        intake_block: str | None = None
-        attached: list[str] = []
-        ws = await _workspace(msg, space)
-        ws_name = ws["name"] if ws else None
-        pspace = space                      # личное пространство (для create_workspace и т.п.)
-        space = _space_for(space, ws)        # рабочее: общий vault, если тема совместная
-        if ws and shared_slug_of(ws.get("project_slug")):
-            ws = dict(ws)
-            ws["project_slug"] = _ws_slug(ws)   # агенту — плоский slug внутри общего vault
-
-        has_media = bool(msg.photo or msg.video or msg.document or msg.audio
-                         or msg.voice or msg.video_note or msg.animation or msg.sticker)
-        spoke = bool(msg.voice or msg.video_note or msg.audio)
-        if has_media:
+    async def _intake_one(it: _Intake, space: PersonalSpace, *, quiet: bool = False) -> bool:
+        """Скачать и расшифровать медиа одного сообщения, собрать it.full_text (текст для
+        агента и журнала: пометка репоста, текст, расшифровка, разбор вложения).
+        False — сообщение пропускаем (не скачалось / пустое); пользователю уже ответили
+        (в пачке, quiet=True, пустое пропускаем молча)."""
+        msg = it.msg
+        text = it.text
+        if it.has_media:
             await _react(bot, msg, "👀")
-            media_type, media_path = await _download_media(
+            it.media_type, it.media_path = await _download_media(
                 bot, msg, settings.vault_path, space.cfg.name,
             )
-            if media_type and not media_path:
+            if it.media_type and not it.media_path:
                 # Telegram Bot API не отдаёт ботам файлы > 20 МБ (getFile). Не зовём агента —
                 # иначе он найдёт в raw/assets старый файл и разберёт его повторно.
                 size = 0
@@ -2721,47 +2732,47 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                        if big else "Попробуй ещё раз или пришли прямую ссылку на файл."),
                     parse_mode="HTML",
                 )
-                return
-            if media_path:
-                abs_path = space.root / media_path
+                return False
+            if it.media_path:
+                abs_path = space.root / it.media_path
                 ext = abs_path.suffix.lower()
                 stop = asyncio.Event()
                 typing = asyncio.create_task(_typing_loop(bot, msg.chat.id, stop, _thread_id(msg),
-                                                          "upload_document" if media_type == "document" else "typing"))
+                                                          "upload_document" if it.media_type == "document" else "typing"))
                 try:
-                    if media_type in {"voice", "audio"} or ext in AUDIO_EXTENSIONS:
-                        transcript = await extract_text_from_file(abs_path)
-                    elif media_type in {"video_note", "video"} or ext in VIDEO_EXTENSIONS:
-                        transcript = await transcribe_video(abs_path)
-                        attached.append(media_path)
+                    if it.media_type in {"voice", "audio"} or ext in AUDIO_EXTENSIONS:
+                        it.transcript = await extract_text_from_file(abs_path)
+                    elif it.media_type in {"video_note", "video"} or ext in VIDEO_EXTENSIONS:
+                        it.transcript = await transcribe_video(abs_path)
+                        it.attached.append(it.media_path)
                     else:
                         # документы, архивы, фото → единый приём: текст/OCR/описание + sidecar
-                        intake = await process_attachment(space.wiki, media_path, media_type)
-                        attached.append(media_path)
-                        intake_block = intake.agent_block()
+                        intake = await process_attachment(space.wiki, it.media_path, it.media_type)
+                        it.attached.append(it.media_path)
+                        it.intake_block = intake.agent_block()
                         if intake.archive is not None and intake.archive.dates:
                             await _offer_archive_ingest(msg, space, intake)
                 except Exception as exc:  # noqa: BLE001
-                    log.warning("private: media parse failed %s: %s", media_path, exc)
+                    log.warning("private: media parse failed %s: %s", it.media_path, exc)
                 finally:
                     stop.set()
                     typing.cancel()
-                if transcript and transcript.startswith("("):
-                    log.warning("private: STT placeholder: %s", transcript)
-                    await msg.reply(f"⚠️ Не смог распознать речь: {_esc(transcript)}", parse_mode="HTML")
-                    transcript = None
+                if it.transcript and it.transcript.startswith("("):
+                    log.warning("private: STT placeholder: %s", it.transcript)
+                    await msg.reply(f"⚠️ Не смог распознать речь: {_esc(it.transcript)}", parse_mode="HTML")
+                    it.transcript = None
 
         # Ссылки на файлы в тексте (архив/док из облака) — скачиваем сами (обход лимита 20 МБ).
-        if text and not has_media:
+        if text and not it.has_media:
             for url in FILE_URL_RE.findall(text)[:2]:
                 stop = asyncio.Event()
                 typing = asyncio.create_task(_typing_loop(bot, msg.chat.id, stop, _thread_id(msg), "upload_document"))
                 try:
                     rel = await download_url_to_vault(space.wiki, url)
                     intake = await process_attachment(space.wiki, rel)
-                    attached.append(rel)
-                    media_type, media_path = "url_file", rel
-                    intake_block = (intake_block + "\n\n" if intake_block else "") + intake.agent_block()
+                    it.attached.append(rel)
+                    it.media_type, it.media_path = "url_file", rel
+                    it.intake_block = (it.intake_block + "\n\n" if it.intake_block else "") + intake.agent_block()
                     if intake.archive is not None and intake.archive.dates:
                         await _offer_archive_ingest(msg, space, intake)
                 except Exception as exc:  # noqa: BLE001
@@ -2773,58 +2784,97 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
 
         # Текст для агента и для журнала. Репост — сначала пометка, от кого.
         parts: list[str] = []
-        fwd = _forward_header(msg)
-        if fwd:
-            log.info("private: forwarded message %s/%s: %s", msg.chat.id, msg.message_id, fwd[:160])
-            parts.append(fwd)
+        if it.fwd:
+            log.info("private: forwarded message %s/%s: %s", msg.chat.id, msg.message_id, it.fwd[:160])
+            parts.append(it.fwd)
         if text:
             parts.append(text)
-        if transcript:
-            parts.append(f"🎤 (голосовое, расшифровка): {transcript.strip()}")
-        if extracted and not extracted.startswith("("):
-            parts.append(f"📄 (содержимое файла {media_path}):\n{extracted.strip()[:6000]}")
-        if intake_block:
-            parts.append(intake_block)
-        full_text = "\n\n".join(parts).strip()
-        if not full_text and not attached:
-            await msg.reply("Пустое сообщение — нечего обрабатывать.")
-            return
+        if it.transcript:
+            parts.append(f"🎤 (голосовое, расшифровка): {it.transcript.strip()}")
+        if it.intake_block:
+            parts.append(it.intake_block)
+        it.full_text = "\n\n".join(parts).strip()
+        if not it.full_text and not it.attached:
+            if not quiet:
+                await msg.reply("Пустое сообщение — нечего обрабатывать.")
+            return False
+        return True
 
-        # Журнал: БД + raw/inbox.
+    async def _journal(it: _Intake, space: PersonalSpace, ws_name: str | None) -> None:
+        """Журнал одного сообщения: БД + raw/inbox (+ расшифровка голосового в чат)."""
+        msg = it.msg
+        ts = msg.date or datetime.now(timezone.utc)
+        who = _display_name(msg)
         try:
             await db.save_message(
                 chat_id=msg.chat.id, message_id=msg.message_id, topic_id=_thread_id(msg),
                 user_id=msg.from_user.id if msg.from_user else None,
                 username=msg.from_user.username if msg.from_user else None,
-                full_name=who, text=full_text or None,
-                media_type=media_type, media_path=media_path,
+                full_name=who, text=it.full_text or None,
+                media_type=it.media_type, media_path=it.media_path,
                 reply_to_message_id=msg.reply_to_message.message_id if msg.reply_to_message else None,
                 ts=ts,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("private: save_message failed: %s", exc)
-        space.append_inbox(who=who + (f" · 📌 {ws_name}" if ws_name else ""), text=full_text, ts=ts,
-                           message_id=msg.message_id, media_type=media_type, media_path=media_path,
+        space.append_inbox(who=who + (f" · 📌 {ws_name}" if ws_name else ""), text=it.full_text, ts=ts,
+                           message_id=msg.message_id, media_type=it.media_type, media_path=it.media_path,
                            chat_id=msg.chat.id)
+        if it.transcript:
+            await msg.reply(f"🎤 <i>{_esc(it.transcript.strip()[:3000])}</i>", parse_mode="HTML")
 
-        if transcript:
-            await msg.reply(f"🎤 <i>{_esc(transcript.strip()[:3000])}</i>", parse_mode="HTML")
+    async def _process_message(msgs: list[Message], space: PersonalSpace, lock_key: Any) -> None:
+        """msgs — одно сообщение или пачка пересланных подряд (см. _bundler): один ход
+        агента и один ответ — на последнее сообщение пачки. Скачивание и расшифровка
+        медиа, журнал — без блокировки; под блокировкой lock_key (совместный воркспейс
+        или пользователь) — только агент и запись ответа."""
+        msgs = sorted(msgs, key=lambda m: m.message_id)
+        msg = msgs[-1]
+        who = _display_name(msg)
+        ws = await _workspace(msg, space)
+        ws_name = ws["name"] if ws else None
+        pspace = space                      # личное пространство (для create_workspace и т.п.)
+        space = _space_for(space, ws)        # рабочее: общий vault, если тема совместная
+        if ws and shared_slug_of(ws.get("project_slug")):
+            ws = dict(ws)
+            ws["project_slug"] = _ws_slug(ws)   # агенту — плоский slug внутри общего vault
 
-        # Контекст: реплай пользователя на сообщение бота (не на корень темы).
-        agent_text = full_text
-        r = msg.reply_to_message
-        if r is not None and r.from_user and r.from_user.id == bot.id and not r.forum_topic_created \
-                and r.message_id != msg.message_thread_id:
-            prev = (r.text or r.caption or "").strip()
-            if prev:
-                agent_text = f"[Мой предыдущий ответ]:\n{prev[:1500]}\n\n[Реплика пользователя]:\n{full_text}"
+        bundle = len(msgs) > 1
+        items: list[_Intake] = []
+        for m in msgs:
+            it = _Intake(m)
+            if await _intake_one(it, space, quiet=bundle):
+                items.append(it)
+        if not items:
+            return
+        for it in items:
+            await _journal(it, space, ws_name)
 
-        # `/grill текст`, `/skill tidy` — явный вызов скила.
-        sk_cmd = match_command(full_text, load_skills(space.wiki.root))
-        if sk_cmd:
-            sk, rest = sk_cmd
-            agent_text = (f"[Пользователь вызвал скил «{sk.name}» — сразу use_skill('{sk.name}') "
-                          f"и действуй по нему.]\n{rest or '(без уточнений — по текущему проекту)'}")
+        text = next((it.text for it in items if it.text), "")
+        transcript = next((it.transcript for it in items if it.transcript), None)
+        attached = [p for it in items for p in it.attached]
+        has_media = any(it.has_media for it in items)
+        spoke = any(it.spoke for it in items)
+        full_text = items[-1].full_text
+
+        if len(items) > 1:
+            log.info("private: forward bundle of %d messages in %s/%s", len(items), msg.chat.id, _thread_id(msg))
+            agent_text = bundle_text([it.full_text for it in items])
+        else:
+            agent_text = full_text
+            # Контекст: реплай пользователя на сообщение бота (не на корень темы).
+            r = msg.reply_to_message
+            if r is not None and r.from_user and r.from_user.id == bot.id and not r.forum_topic_created \
+                    and r.message_id != msg.message_thread_id:
+                prev = (r.text or r.caption or "").strip()
+                if prev:
+                    agent_text = f"[Мой предыдущий ответ]:\n{prev[:1500]}\n\n[Реплика пользователя]:\n{full_text}"
+            # `/grill текст`, `/skill tidy` — явный вызов скила.
+            sk_cmd = match_command(full_text, load_skills(space.wiki.root))
+            if sk_cmd:
+                sk, rest = sk_cmd
+                agent_text = (f"[Пользователь вызвал скил «{sk.name}» — сразу use_skill('{sk.name}') "
+                              f"и действуй по нему.]\n{rest or '(без уточнений — по текущему проекту)'}")
 
         author_id = msg.from_user.id if msg.from_user else None
         queued = False
@@ -2932,5 +2982,11 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         finally:
             if queued:
                 _queue_depth[space.user_id] = max(0, _queue_depth.get(space.user_id, 1) - 1)
+
+    async def _flush_bundle(_key: Any, items: list[tuple[Message, PersonalSpace, Any]]) -> None:
+        space, lock_key = items[-1][1], items[-1][2]
+        await _process_message([m for m, _s, _k in items], space, lock_key)
+
+    _bundler = Bundler(FORWARD_BUNDLE_DELAY, _flush_bundle)
 
     return router

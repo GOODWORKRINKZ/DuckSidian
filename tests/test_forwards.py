@@ -101,3 +101,55 @@ async def test_answer_check_not_triggered(space: PersonalSpace) -> None:
                           user_prompt="u", max_steps=3,
                           answer_check=lambda a: AUTHOR_NUDGE if asks_for_author(a) else None)
     assert not run.check_nudged and run.finished and len(client.calls) == 1
+
+
+# ---------------------------------------------------------------- пачка форвардов
+
+def test_bundle_text() -> None:
+    from bot.forwards import BUNDLE_MARK, bundle_text
+    assert bundle_text(["один"]) == "один"
+    assert bundle_text([]) == ""
+    out = bundle_text([f"{FORWARD_MARK}, автор — пользователь A. Текст репоста ниже:\n\nпривет",
+                       "", f"{FORWARD_MARK}, автор — пользователь B. Текст репоста ниже:\n\nответ"])
+    assert out.startswith(BUNDLE_MARK) and "2 сообщений" in out
+    assert "[1] " in out and "[2] " in out and "[3]" not in out
+    assert out.index("[1]") < out.index("[2]")
+    assert is_forward(out)
+
+
+@pytest.mark.asyncio
+async def test_bundler_collects_until_quiet() -> None:
+    import asyncio
+    from bot.forwards import Bundler
+    flushed: list[tuple[str, list[int]]] = []
+
+    async def flush(key, items):
+        flushed.append((key, list(items)))
+
+    b = Bundler(0.05, flush)
+    assert not b.is_open("k")
+    assert b.add("k", 1) == 1
+    await asyncio.sleep(0.02)
+    assert b.is_open("k")
+    assert b.add("k", 2) == 2          # таймер перезапущен
+    b.add("other", 9)
+    await asyncio.sleep(0.02)
+    assert flushed == []               # 0.05 с тишины ещё не прошло
+    await asyncio.sleep(0.08)
+    assert sorted(flushed) == [("k", [1, 2]), ("other", [9])]
+    assert not b.is_open("k") and not b.is_open("other")
+
+
+@pytest.mark.asyncio
+async def test_bundler_flush_error_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    import asyncio
+    from bot.forwards import Bundler
+
+    async def flush(key, items):
+        raise RuntimeError("boom")
+
+    b = Bundler(0.01, flush)
+    b.add("k", 1)
+    await asyncio.sleep(0.05)
+    assert not b.is_open("k")
+    assert any("bundle flush failed" in r.getMessage() for r in caplog.records)
