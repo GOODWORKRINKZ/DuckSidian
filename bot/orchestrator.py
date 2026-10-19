@@ -20,8 +20,10 @@ from dataclasses import dataclass
 
 from aiogram import Bot
 from aiogram.types import (
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
 )
 
 from .agent.deepseek import LLMClient
@@ -236,7 +238,7 @@ class Orchestrator:
 
     async def ask_private(
         self, question: str, options: list[str] | None, chat_id: int, thread_id: int | None,
-        timeout: float = 15 * 60,
+        timeout: float = 15 * 60, images: list[Path] | None = None,
     ) -> str:
         """Вопрос агента пользователю в его личный чат/тему: кнопки-варианты + можно
         ответить текстом. Ждём до timeout, потом агент решает сам."""
@@ -250,6 +252,18 @@ class Orchestrator:
                 [InlineKeyboardButton(text=opt[:60], callback_data=f"ans:{qid}:{i}")]
                 for i, opt in enumerate(options[:8])
             ])
+        if images:
+            # Картинки к вопросу (например, варианты логотипа): пользователь должен увидеть их
+            # ДО кнопок — в finish() они бы ушли только после ответа.
+            try:
+                media = [InputMediaPhoto(media=FSInputFile(p), caption=f"{i}" if len(images) > 1 else None)
+                         for i, p in enumerate(images[:5], 1)]
+                if len(media) == 1:
+                    await self.bot.send_photo(chat_id, media[0].media, message_thread_id=thread_id)
+                else:
+                    await self.bot.send_media_group(chat_id, media, message_thread_id=thread_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("ask_private: images failed: %s", exc)
         text = (
             f"❓ {md_to_tg_html(question)}\n\n"
             f"<i>Выбери вариант или просто напиши свой ответ. id={qid}.</i>"
@@ -425,8 +439,17 @@ class Orchestrator:
 
         choice_fn = None
         if chat_id is not None:
-            async def choice_fn(question: str, options: list[str] | None) -> str:
-                return await self.ask_private(question, options, chat_id, thread_id)
+            async def choice_fn(question: str, options: list[str] | None,
+                                images: list[str] | None = None) -> str:
+                paths: list[Path] = []
+                for rel in images or []:
+                    try:
+                        p = (space.root / rel).resolve()
+                        if p.is_file() and space.root.resolve() in p.parents:
+                            paths.append(p)
+                    except Exception:  # noqa: BLE001
+                        continue
+                return await self.ask_private(question, options, chat_id, thread_id, images=paths)
 
         executor = self._make_executor(
             space.wiki, space.cfg, team_wikis=self._team_wikis(), share_fn=share_fn,

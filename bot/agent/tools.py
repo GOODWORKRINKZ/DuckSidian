@@ -775,13 +775,21 @@ PERSONAL_EXTRA_TOOLS += [
                 "что и куда записать, или для подтверждения слияния/удаления. Варианты — "
                 "конкретные (цифры, имена, формулировки из материала), 2–5 шт. Последним можно "
                 "дать «Другое — напишу»: нажатие попросит у пользователя текст, ответом придёт "
-                "уже его текст. Не больше 4 вопросов за ход; если можно решить самому — не спрашивай."
+                "уже его текст. Не больше 4 вопросов за ход; если можно решить самому — не спрашивай. "
+                "Пользователь видит ТОЛЬКО question и кнопки — всё, из чего он выбирает (список "
+                "концептов, вариантов, цифр), должно быть в question целиком, а не «#7 + #1». "
+                "Вопрос про картинки (сгенерированные/скачанные) — передай их пути в images: бот "
+                "пришлёт их перед вопросом с номерами 1…N; иначе пользователь их ещё не видел."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "question": {"type": "string"},
                     "options": {"type": "array", "items": {"type": "string"}},
+                    "images": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Пути файлов из vault (raw/assets/...), до 5 — показать перед вопросом.",
+                    },
                 },
                 "required": ["question", "options"],
             },
@@ -1183,7 +1191,11 @@ class ToolExecutor:
                 opts = [str(o).strip() for o in (arguments.get("options") or []) if str(o).strip()]
                 if not question:
                     return "ERROR: missing 'question'"
-                ans = await self._choice_fn(question, opts[:8] or None)
+                images = [str(p).strip() for p in (arguments.get("images") or []) if str(p).strip()][:5]
+                if images:
+                    ans = await self._choice_fn(question, opts[:8] or None, images=images)
+                else:
+                    ans = await self._choice_fn(question, opts[:8] or None)
                 return f"Ответ пользователя: {ans}" if ans else "(нет ответа)"
             if name == "search_1688":
                 from ..config import settings  # noqa: PLC0415
