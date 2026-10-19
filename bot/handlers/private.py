@@ -1856,8 +1856,10 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         if not space:
             return
         args = (command.args or "").strip()
-        sub, _, rest = args.partition(" ")
-        sub = sub.lower()
+        # Разбиваем по любому пробельному символу: текст /ws prompt обычно начинается с новой строки.
+        _parts = args.split(maxsplit=1)
+        sub = (_parts[0] if _parts else "").lower()
+        rest = _parts[1] if len(_parts) > 1 else ""
         if sub in ("prompt", "instruction", "инструкция", "промпт"):
             tid = _thread_id(msg)
             ws = await _workspace(msg, space) if tid is not None else None
