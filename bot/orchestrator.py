@@ -536,7 +536,12 @@ class Orchestrator:
         self._record_run(f"personal/{space.user_id}", run)
         if settings.git_autocommit:
             commit_and_push(f"personal {space.user_id}: turn")
-        answer = run.summary or "Не понял, переформулируй."
+        answer = (run.summary or "").strip()
+        if not answer:
+            # Пустой finish (модель всё сказала в tool-call'ах) — иначе уйдёт один футер «Изменено».
+            log.warning("personal: empty answer from agent — space=%s writes=%s tools=%s",
+                        space.cfg.name, list(run.writes), run.tools_called)
+            answer = "Готово — записал (см. ниже, что изменилось)." if run.writes else "Не понял, переформулируй."
         if run.write_nudged or run.unconfirmed_write:
             log.warning(
                 "personal: answer claimed a write without write tools — user=%s (id=%s) "
