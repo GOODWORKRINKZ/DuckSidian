@@ -136,6 +136,55 @@ def append_to_section(text: str, heading: str, content: str) -> tuple[str, str]:
     return out + ("\n" if text.endswith("\n") or not text else ""), f"дописано в «{lines[start].strip()}»"
 
 
+def replace_section(text: str, heading: str, content: str) -> tuple[str, str]:
+    """Заменить тело секции `heading` на content (заголовок остаётся). Секции нет —
+    она создаётся сразу под H1 и вводной строкой (если есть), иначе в конце файла.
+    Возвращает (новый текст, пояснение)."""
+    want = _heading_key(heading)
+    lines = text.splitlines()
+    body = content.strip("\n").split("\n") if content.strip() else []
+    start = level = None
+    for i, ln in enumerate(lines):
+        m = _HEADING_RE.match(ln)
+        if m and _heading_key(m.group(2)) == want:
+            start, level = i, len(m.group(1))
+            break
+    if start is None:
+        name = re.sub(r"^#+\s*", "", heading).strip()
+        ins = len(lines)
+        for i, ln in enumerate(lines):
+            if re.match(r"^#\s+\S", ln):
+                ins = i + 1
+                while ins < len(lines) and not lines[ins].strip():
+                    ins += 1
+                # вводная строка под H1 — остаётся сверху, секция идёт после неё
+                if ins < len(lines) and not _HEADING_RE.match(lines[ins]):
+                    ins += 1
+                break
+        new_lines = lines[:ins] + ["", f"## {name}"] + body + [""] + lines[ins:]
+        out = re.sub(r"\n{3,}", "\n\n", "\n".join(new_lines)).strip("\n") + "\n"
+        return out, f"секция «{name}» создана"
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        m = _HEADING_RE.match(lines[j])
+        if m and len(m.group(1)) <= level:
+            end = j
+            break
+    new_lines = lines[:start + 1] + body + ([""] if end < len(lines) else []) + lines[end:]
+    out = re.sub(r"\n{3,}", "\n\n", "\n".join(new_lines)).strip("\n") + "\n"
+    return out, f"секция «{lines[start].strip()}» заменена"
+
+
+def instruction_body(section_text: str) -> str:
+    """Тело секции «Инструкция» без заголовка и без шаблонной подсказки (курсивный абзац
+    из _template.md). Пусто → '' (инструкции нет)."""
+    lines = [ln for ln in (section_text or "").splitlines() if not _HEADING_RE.match(ln)]
+    body = "\n".join(lines).strip()
+    # Шаблонная подсказка: один абзац целиком в _курсиве_ — не инструкция.
+    body = re.sub(r"\A_[^_]*?(?:set_workspace_instruction|/ws prompt)[^_]*?_\s*", "", body, flags=re.DOTALL)
+    return body.strip()
+
+
 def _heading_key(h: str) -> str:
     h = re.sub(r"^#+\s*", "", h).strip().lower()
     h = re.sub(r"^[^\w]+", "", h)  # эмодзи/символы в начале

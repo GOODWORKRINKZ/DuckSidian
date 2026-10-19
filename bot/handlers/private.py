@@ -31,6 +31,7 @@ from html import escape as _esc
 from typing import Any
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     CallbackQuery,
@@ -42,6 +43,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+from ..agent.wikitools import instruction_body, replace_section, sections
 from ..config import settings
 from ..db import DB
 from ..intake import FILE_URL_RE, IntakeResult, download_url_to_vault, process_attachment
@@ -129,7 +131,10 @@ HELP_TEXT = (
     "/voice on|off|auto — голосовые ответы; /voice set &lt;voice_id&gt;; /voices — список (/voices English, /voices legacy — старые голоса MiniMax)\n"
     "/imagine &lt;описание&gt; [16:9] — сгенерировать картинку\n"
     "/space — что лежит в пространстве · /log — операции · /chats — куда шарить\n"
-    "/stop — остановить текущий запрос · /skills — скилы (/grill, /tidy, /interview)\n"
+    "/stop [all] — остановить текущий запрос и снять очередь (all — во всех темах) · "
+    "/skills — скилы (/grill, /tidy, /interview, /workspace-setup, /make-skill)\n"
+    "/ws prompt [текст] — инструкция воркспейса: как агент ведёт эту тему (он закрепляет её сам, "
+    "когда просишь «всегда…/больше не…»)\n"
     "/login1688 — вход в 1688 по QR для поиска поставщиков <i>(admin)</i>\n"
     "/model — модель LLM <i>(admin)</i> · /allow /deny /users — доступ <i>(admin)</i>\n"
 )
@@ -297,13 +302,61 @@ def running_turn_in(chat_id: int, thread_id: int | None) -> RunningTurn | None:
     return None
 
 
-def stop_turns_in(chat_id: int, thread_id: int | None, user_id: int | None) -> int:
-    """/stop: остановить ходы этого пользователя в этой теме. Возвращает сколько."""
+def stop_turns_in(chat_id: int, thread_id: int | None, user_id: int | None, *,
+                  any_thread: bool = False) -> int:
+    """/stop: остановить ходы этого пользователя в этой теме (any_thread — во всех темах
+    чата). Возвращает сколько."""
     n = 0
     for token, rt in list(_running_turns.items()):
-        if rt.chat_id == chat_id and rt.thread_id == thread_id and request_stop(token, user_id) == "ok":
+        if rt.chat_id == chat_id and (any_thread or rt.thread_id == thread_id) \
+                and request_stop(token, user_id) == "ok":
             n += 1
     return n
+
+
+class QueuedEntry:
+    """Запрос, ждущий своей очереди (lock пользователя/воркспейса). Пока ход не начался
+    (started=False), /stop снимает его с очереди — иначе за одним длинным ходом стоят ещё
+    десять и «висят» по часу."""
+
+    def __init__(self, task: asyncio.Task | None, chat_id: int, thread_id: int | None,
+                 author_id: int | None) -> None:
+        self.task, self.chat_id, self.thread_id, self.author_id = task, chat_id, thread_id, author_id
+        self.started = False
+        self.dropped = False
+
+
+_queued: set[QueuedEntry] = set()
+
+
+def queued_count(chat_id: int | None = None) -> int:
+    return sum(1 for q in _queued if not q.started and (chat_id is None or q.chat_id == chat_id))
+
+
+def drop_queued(chat_id: int, thread_id: int | None, user_id: int | None, *, any_thread: bool = False) -> int:
+    """/stop: снять с очереди ещё не начатые запросы этого пользователя в теме (или во всех
+    темах чата). Возвращает сколько."""
+    n = 0
+    for q in list(_queued):
+        if q.started or q.chat_id != chat_id or (not any_thread and q.thread_id != thread_id):
+            continue
+        if q.author_id is not None and user_id is not None and q.author_id != user_id:
+            continue
+        if q.task is None or q.task.done():
+            continue
+        q.dropped = True
+        q.task.cancel()
+        n += 1
+    return n
+
+
+def _bundles(msg: Message) -> bool:
+    """Сообщение из тех, что обычно приходят пачкой: репост, альбом / несколько файлов
+    (media_group_id), документ или фото с подписью-просьбой. Голосовое или одиночный текст
+    — нет (их не задерживаем)."""
+    if _forward_header(msg) is not None or getattr(msg, "media_group_id", None):
+        return True
+    return bool(msg.document or msg.photo or msg.video or msg.animation)
 
 
 def _space_for(space: PersonalSpace, ws: dict[str, Any] | None) -> PersonalSpace:
@@ -471,6 +524,7 @@ def _split_share_args(args: str) -> tuple[str, str | None, str]:
 
 
 _STEP_LABELS = {
+    "set_workspace_instruction": "📜 закрепляю правило воркспейса",
     "search_wiki": "🔎 ищу в твоих записях",
     "search_team_wiki": "🔎 ищу в wiki команды",
     "web_search": "🌐 ищу в интернете",
@@ -739,15 +793,20 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
     async def cmd_stop(msg: Message) -> None:
         """Остановить идущий запрос агента в этой теме и/или фоновый разбор."""
         uid = msg.from_user.id if msg.from_user else 0
+        everywhere = (msg.text or "").split(maxsplit=1)[1:] == ["all"] or "все" in (msg.text or "").lower()
+        tid = None if everywhere else _thread_id(msg)
         stopped = []
-        if stop_turns_in(msg.chat.id, _thread_id(msg), uid):
+        if stop_turns_in(msg.chat.id, tid, uid, any_thread=everywhere):
             stopped.append("запрос")
+        n = drop_queued(msg.chat.id, tid, uid, any_thread=everywhere)
+        if n:
+            stopped.append(f"очередь ({n})")
         task = _ingest_tasks.get(uid)
         if task and not task.done():
             task.cancel()
             stopped.append("разбор")
         await msg.reply(f"⏹ Останавливаю: {', '.join(stopped)}…" if stopped
-                        else "Сейчас ничего не выполняется.")
+                        else "Сейчас ничего не выполняется. /stop all — остановить во всех темах.")
 
     async def _resolve_user_target(target: str) -> int | None:
         t = (target or "").strip()
@@ -1087,8 +1146,46 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                     return "ERROR: пустое имя"
                 slug = await _bind_workspace(space, msg.chat.id, tid, new_name)
                 return f"OK: воркспейс → «{new_name}» (wiki/projects/{slug}.md)"
+            if action == "set_workspace_instruction":
+                tid = _thread_id(msg)
+                row = await db.get_workspace(msg.chat.id, tid) if tid is not None else None
+                if not row or not row["project_slug"]:
+                    return "ERROR: разговор идёт не в теме-воркспейсе — инструкцию закреплять нечему (/ws <имя>)"
+                text_ = str(args.get("text") or "").strip()
+                if not text_:
+                    return "ERROR: пустой text"
+                mode = str(args.get("mode") or "append").lower()
+                rel, info = _set_instruction(tspace, _ws_slug(dict(row)), text_, mode)
+                return f"OK: {rel}: {info}. Инструкция будет в контексте каждого хода этой темы."
             return f"ERROR: unknown action {action}"
         return fn
+
+    def _instruction_path(tspace: PersonalSpace, slug: str) -> str:
+        return f"wiki/projects/{slug.rsplit('/', 1)[-1]}.md"
+
+    def _set_instruction(tspace: PersonalSpace, slug: str, text: str, mode: str = "append") -> tuple[str, str]:
+        """Записать мастер-промпт воркспейса в `## Инструкция` страницы проекта.
+        append — к существующим пунктам (шаблонная подсказка курсивом вытесняется),
+        replace — целиком. Возвращает (rel path, пояснение)."""
+        rel = _instruction_path(tspace, slug)
+        try:
+            page = tspace.wiki.read_file(rel, max_bytes=2_000_000)
+        except Exception:  # noqa: BLE001
+            page = f"# {slug}\n"
+        current = instruction_body(sections(page, ["Инструкция"], 20_000))
+        body = text.strip()
+        if mode != "replace" and current:
+            body = current.rstrip() + "\n" + body
+        updated, info = replace_section(page, "Инструкция", body)
+        tspace.wiki.write_file(rel, updated)
+        return rel, info
+
+    def _get_instruction(tspace: PersonalSpace, slug: str) -> str:
+        try:
+            page = tspace.wiki.read_file(_instruction_path(tspace, slug), max_bytes=2_000_000)
+        except Exception:  # noqa: BLE001
+            return ""
+        return instruction_body(sections(page, ["Инструкция"], 20_000))
 
     def _bind_kb(tid: int, name: str) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(inline_keyboard=[
@@ -1181,6 +1278,46 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
 
     async def _voice_id(user_id: int) -> str:
         return await db.get_state(f"voice_id_{user_id}", settings.minimax_tts_voice)
+
+    async def _topic_alive(chat_id: int, thread_id: int | None) -> bool:
+        """Тема ещё существует? Удалённая тема отвечает «message thread not found» на любой
+        вызов с message_thread_id — дешевле всего это проверить chat action."""
+        if thread_id is None:
+            return True
+        try:
+            await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
+        except TelegramBadRequest as exc:
+            if "thread not found" in str(exc).lower():
+                return False
+        except Exception as exc:  # noqa: BLE001
+            log.debug("topic probe %s/%s failed: %s", chat_id, thread_id, exc)
+        return True
+
+    async def _transcribe_reply(msg: Message, space: PersonalSpace) -> str | None:
+        """Расшифровать голосовое/аудио/кружок, присланное как ответ на вопрос агента."""
+        try:
+            media_type, media_path = await _download_media(bot, msg, settings.vault_path, space.cfg.name)
+            if not media_path:
+                return None
+            abs_path = space.root / media_path
+            if media_type == "video_note" or abs_path.suffix.lower() in VIDEO_EXTENSIONS:
+                text = await transcribe_video(abs_path)
+            else:
+                text = await extract_text_from_file(abs_path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("private: transcribe reply failed: %s", exc)
+            return None
+        text = (text or "").strip()
+        if not text or text.startswith("("):
+            return None
+        return text
+
+    def _voice_owner(msg: Message, space: PersonalSpace) -> int:
+        """Чьи настройки голоса применять. В совместном воркспейсе space.user_id == 0 (общий
+        vault), а голос и режим — личные настройки автора реплики."""
+        if space.is_shared and msg.from_user and not msg.from_user.is_bot:
+            return msg.from_user.id
+        return space.user_id
 
     _bot_user: dict[str, str] = {}
     _icons: dict[str, str] = {}  # emoji → custom_emoji_id
@@ -1424,7 +1561,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             speech = await orch.summarize_for_voice(text) if summarize else text[:_TTS_REPLY_MAX_CHARS]
             if not speech.strip():
                 return False
-            path = await ai.tts_to_file(speech, dst, voice_id=await _voice_id(space.user_id))
+            path = await ai.tts_to_file(speech, dst, voice_id=await _voice_id(_voice_owner(msg, space)))
             if path.suffix == ".ogg":
                 await msg.answer_voice(FSInputFile(path))
             else:
@@ -1721,6 +1858,31 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         args = (command.args or "").strip()
         sub, _, rest = args.partition(" ")
         sub = sub.lower()
+        if sub in ("prompt", "instruction", "инструкция", "промпт"):
+            tid = _thread_id(msg)
+            ws = await _workspace(msg, space) if tid is not None else None
+            if not ws:
+                await msg.reply("Команда /ws prompt работает внутри темы-воркспейса (сначала /ws <имя>).")
+                return
+            tspace = _space_for(space, ws)
+            slug = _ws_slug(ws)
+            new_text = rest.strip()
+            if new_text:
+                rel, info = _set_instruction(tspace, slug, new_text, "replace")
+                await msg.reply(f"✅ Инструкция воркспейса «{_esc(ws['name'])}» записана ({_esc(info)}).\n"
+                                f"<code>{_esc(rel)}</code>", parse_mode="HTML")
+                return
+            cur = _get_instruction(tspace, slug)
+            if not cur:
+                await msg.reply(
+                    f"У воркспейса «{_esc(ws['name'])}» пока нет инструкции (мастер-промпта).\n"
+                    "Задать: <code>/ws prompt &lt;текст правил&gt;</code> — или просто скажи агенту, как "
+                    "вести эту тему («этот воркспейс про…», «всегда делай…») — он закрепит сам.",
+                    parse_mode="HTML")
+                return
+            await _reply_html(msg, f"📜 **Инструкция «{ws['name']}»** (`{_instruction_path(tspace, slug)}`):\n\n"
+                                   f"{cur}\n\nПереписать целиком: `/ws prompt <текст>`; дополнить — просто скажи агенту.")
+            return
         if sub == "share":
             tid = _thread_id(msg)
             if tid is None:
@@ -1880,6 +2042,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             f"📌 Воркспейс <b>{_esc(ws['name'])}</b>{coop} → <code>{_esc(_ws_path(ws))}</code>\n"
             f"Связанных страниц: {pages}.\n"
             "/ws <имя> — переименовать · /show " + _esc(_ws_slug(ws)) + " — страница проекта\n"
+            "/ws prompt [текст] — инструкция воркспейса (мастер-промпт: как агент ведёт эту тему) · "
             "/ws share <чат> [topic] [комментарий] — выгрузить весь воркспейс "
             "(topic = в отдельную тему группы с тем же именем) · /ws share @user — человеку "
             "(снимок с кнопкой «принять») · /ws icon [эмодзи] — значок · "
@@ -2679,6 +2842,21 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             if await orch.deliver_answer(pq, msg.text):
                 await _react(bot, msg, "👌")
                 return
+        if pq and (msg.voice or msg.audio or msg.video_note):
+            # Голосовой ответ на вопрос агента: расшифровать и отдать как ответ. Иначе он
+            # встал бы в очередь ЗА ходом, который ждёт этого ответа, — тупик до таймаута.
+            transcript = await _transcribe_reply(msg, space)
+            if transcript and await orch.deliver_answer(pq, transcript):
+                await _react(bot, msg, "👌")
+                await msg.reply(f"🎤 <i>{_esc(transcript[:1500])}</i> — передал агенту как ответ.",
+                                parse_mode="HTML")
+                return
+        if pq and not (msg.text or "").startswith("/"):
+            try:
+                await msg.reply("⏳ Агент ждёт ответа на вопрос выше — ответь кнопкой, текстом или голосом. "
+                                "Это сообщение возьму в работу следом.")
+            except Exception:  # noqa: BLE001
+                pass
         # Идёт интерактивный ход (агент уже задавал вопросы), а вопрос сейчас не открыт —
         # реплика (уточнение, «не понял вопроса») уходит в этот ход, а не в очередь.
         if msg.text and not msg.text.startswith("/") and orch.turn_is_interactive(msg.chat.id, _thread_id(msg)):
@@ -2691,10 +2869,12 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         if ws_pre is not None and ws_pre["project_slug"] and await _foreign_shared(msg, dict(ws_pre), space):
             return
         lock_key: Any = ws_pre["project_slug"] if (ws_pre and shared_slug_of(ws_pre["project_slug"])) else space.user_id
-        # Пачка форвардов (несколько пересланных подряд) — один ход агента: копим
-        # FORWARD_BUNDLE_DELAY секунд; текст владельца, пришедший пока пачка открыта, — туда же.
+        # Пачка сообщений подряд (форварды, альбом/несколько файлов, текст + вложения) — один
+        # ход агента: копим FORWARD_BUNDLE_DELAY секунд тишины; всё, что приходит от того же
+        # автора в ту же тему, пока пачка открыта, — туда же. Иначе 1 текст + 6 файлов = 7 ходов
+        # по несколько минут, в очереди один за другим.
         bkey = (msg.chat.id, _thread_id(msg), msg.from_user.id if msg.from_user else 0)
-        if (_forward_header(msg) is not None or _bundler.is_open(bkey)) and not (msg.text or '').startswith('/'):
+        if (_bundles(msg) or _bundler.is_open(bkey)) and not (msg.text or '').startswith('/'):
             n = _bundler.add(bkey, (msg, space, lock_key))
             log.info("private: bundle %s/%s +1 (size %d)", msg.chat.id, msg.message_id, n)
             return
@@ -2894,6 +3074,13 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                     pass
 
         async def turn() -> None:
+            qe.started = True
+            # Тема могла быть удалена, пока запрос стоял в очереди: ход впустую (ответ некуда
+            # отправить, вопросы некому задать), а очередь за ним ждёт. Проверяем до агента.
+            if not await _topic_alive(msg.chat.id, _thread_id(msg)):
+                log.warning("private: topic %s/%s is gone — skipping queued turn (msg %s)",
+                            msg.chat.id, _thread_id(msg), msg.message_id)
+                return
             history = await _history(msg, SHARED_PREFIX + ws["project_slug"] if space.is_shared and ws else None)
             if not has_media:
                 await _react(bot, msg, "👀")
@@ -2969,17 +3156,29 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 stop.set()
                 typing.cancel()
                 typing_others.cancel()
-            mode = await _voice_mode(space.user_id)
+            mode = await _voice_mode(_voice_owner(msg, space))
             voice = mode == "on" or (mode == "auto" and spoke)
             title_hint = (text or transcript or "Ответ").splitlines()[0]
             await _send_agent_answer(msg, space, answer, title_hint=title_hint, ws_name=ws_name, voice=voice)
             await notice.finish(_strip_images_block(split_voice_block(answer)[0])[0])
 
+        qe = QueuedEntry(asyncio.current_task(), msg.chat.id, _thread_id(msg), author_id)
+        _queued.add(qe)
         try:
             await serialized_turn(lock_key, author=who, author_id=author_id,
                                   text=text or transcript or _media_label(msg),
                                   body=turn, on_queued=on_queued)
+        except asyncio.CancelledError:
+            if not qe.dropped:
+                raise
+            # Снят с очереди по /stop, ход ещё не начинался — сообщение уже в журнале.
+            log.info("private: queued request %s/%s dropped by /stop", msg.chat.id, msg.message_id)
+            try:
+                await _react(bot, msg, "⏹")
+            except Exception:  # noqa: BLE001
+                pass
         finally:
+            _queued.discard(qe)
             if queued:
                 _queue_depth[space.user_id] = max(0, _queue_depth.get(space.user_id, 1) - 1)
 

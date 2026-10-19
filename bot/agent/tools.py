@@ -708,6 +708,31 @@ PERSONAL_EXTRA_TOOLS += [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_workspace_instruction",
+            "description": (
+                "Записать/дополнить ИНСТРУКЦИЮ текущего воркспейса — его мастер-промпт (секция "
+                "`## Инструкция` страницы проекта; бот даёт её тебе в контексте каждого хода). "
+                "Вызывай, когда пользователь задаёт или меняет, КАК вести эту тему: что делать с "
+                "каждым сообщением, формат/язык/длина ответа, нужен ли голос и что озвучивать, что и "
+                "куда записывать, чего не делать («всегда…», «больше не…», «делай X отдельным "
+                "голосовым», «пиньинь пиши так»). mode=append — добавить правило(а) к существующим "
+                "(по умолчанию), mode=replace — переписать инструкцию целиком (при настройке "
+                "воркспейса или по просьбе «перепиши инструкцию»). Текст — короткие императивные "
+                "пункты markdown-списком, без воды. Работает только внутри темы-воркспейса."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Правила (markdown-список пунктов)."},
+                    "mode": {"type": "string", "enum": ["append", "replace"], "default": "append"},
+                },
+                "required": ["text"],
+            },
+        },
+    },
 ]
 
 PERSONAL_EXTRA_TOOLS.append({
@@ -735,7 +760,7 @@ PERSONAL_WRITE_TOOLS = frozenset({
     "write_file", "append_file", "append_to_section", "edit_file", "move_file", "delete_file",
     "fetch_file", "fetch_image", "extract_archive", "generate_image",
     "share_to_chat", "create_workspace", "share_workspace",
-    "set_workspace_icon", "rename_workspace",
+    "set_workspace_icon", "rename_workspace", "set_workspace_instruction",
 })
 
 
@@ -1352,7 +1377,7 @@ class ToolExecutor:
                 res = await process_attachment(self.wiki, rel)
                 return res.agent_block()
             if name in ("create_workspace", "list_workspaces", "rename_workspace", "set_workspace_icon",
-                        "share_workspace"):
+                        "share_workspace", "set_workspace_instruction"):
                 if self._workspace_fn is None:
                     return "ERROR: управление воркспейсами недоступно в этом режиме"
                 return await self._workspace_fn(name, dict(arguments or {}))

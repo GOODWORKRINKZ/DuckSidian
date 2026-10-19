@@ -39,7 +39,7 @@ from .agent.prompts import (
 )
 from .agent.loop import MEDIA_TOOLS, UNCONFIRMED_MEDIA_NOTE
 from .agent.tools import PERSONAL_WRITE_TOOLS, ToolExecutor, personal_tool_schemas
-from .agent.wikitools import sections
+from .agent.wikitools import instruction_body, sections
 from .skills import catalog, load_skills
 from .config import ChatConfig, settings
 from .db import DB
@@ -462,9 +462,22 @@ class Orchestrator:
                 + (f" → проект wiki/projects/{slug}.md" if slug else "")
                 + ". Всё ниже относится к нему, если не сказано иное.\n"
             )
+            instruction = self._project_instruction(space, slug)
+            if instruction:
+                pinned_block += (
+                    f"\n\n=== ИНСТРУКЦИЯ ВОРКСПЕЙСА «{workspace.get('name')}» (мастер-промпт владельца: "
+                    "выполняй КАЖДЫЙ ход, она главнее общих правил; менять — set_workspace_instruction) ===\n"
+                    f"{instruction}"
+                )
+            else:
+                pinned_block += (
+                    "\n\n(У воркспейса пока нет инструкции — работай по Цели. Если пользователь описывает, "
+                    "как вести эту тему, или просит что-то делать всегда/никогда — закрепи это через "
+                    "set_workspace_instruction.)"
+                )
             pinned = self._project_pinned(space, slug)
             if pinned:
-                pinned_block = (
+                pinned_block += (
                     f"\n\n=== ЗАКРЕПЛЕНО: wiki/projects/{slug.rsplit('/', 1)[-1]}.md "
                     "(Цель / Текущий статус / Решения — источник правды о проекте) ===\n"
                     f"{pinned}"
@@ -545,6 +558,19 @@ class Orchestrator:
         else:
             answer = add_footer(answer, writes_footer(run.writes))
         return answer
+
+    @staticmethod
+    def _project_instruction(space: Any, slug: str, cap: int = 3_000) -> str:
+        """Тело секции `## Инструкция` страницы проекта — мастер-промпт воркспейса.
+        Пустая секция или только шаблонная подсказка курсивом → ''."""
+        name = (slug or "").rsplit("/", 1)[-1]
+        if not name:
+            return ""
+        try:
+            text = space.wiki.read_file(f"wiki/projects/{name}.md", max_bytes=2_000_000)
+        except Exception:  # noqa: BLE001
+            return ""
+        return instruction_body(sections(text, ["Инструкция"], cap))
 
     @staticmethod
     def _project_pinned(space: Any, slug: str, cap: int = 4_000) -> str:
