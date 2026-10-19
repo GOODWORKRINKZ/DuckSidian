@@ -132,7 +132,7 @@ HELP_TEXT = (
     "/imagine &lt;описание&gt; [16:9] — сгенерировать картинку\n"
     "/space — что лежит в пространстве · /log — операции · /chats — куда шарить\n"
     "/stop [all] — остановить текущий запрос и снять очередь (all — во всех темах) · "
-    "/skills — скилы (/grill, /tidy, /interview, /workspace-setup, /make-skill)\n"
+    "/skills — скилы (/grill, /tidy, /interview, /workspace-setup, /make-skill, /logo)\n"
     "/ws prompt [текст] — инструкция воркспейса: как агент ведёт эту тему (он закрепляет её сам, "
     "когда просишь «всегда…/больше не…»)\n"
     "/login1688 — вход в 1688 по QR для поиска поставщиков <i>(admin)</i>\n"

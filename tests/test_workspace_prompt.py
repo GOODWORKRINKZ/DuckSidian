@@ -72,8 +72,9 @@ def test_set_workspace_instruction_is_a_personal_write_tool() -> None:
 
 def test_builtin_skills_include_workspace_setup_and_make_skill() -> None:
     sk = load_skills()
-    assert {"workspace-setup", "make-skill"} <= set(sk)
+    assert {"workspace-setup", "make-skill", "logo"} <= set(sk)
     assert "set_workspace_instruction" in sk["workspace-setup"].body
+    assert "generate_image" in sk["logo"].body and "no gradients" in sk["logo"].body
     assert "skills/<name>.md" in sk["make-skill"].body
 
 
