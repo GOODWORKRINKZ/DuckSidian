@@ -221,6 +221,9 @@ class Settings(BaseSettings):
     # Модель openai-whisper: tiny | base | small | medium | large. Для русского
     # рекомендуется минимум `small` (~460MB), `tiny` часто даёт мусор.
     whisper_model: str = "small"
+    # Не грузить модель Whisper, если свободной памяти (MemAvailable) меньше —
+    # загрузка под нехваткой памяти вешает машину. 0 — не проверять.
+    whisper_min_free_mb: int = 2500
 
     ingest_cron: str = "0 23 * * *"
     tz: str = "UTC"

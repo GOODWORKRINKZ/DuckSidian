@@ -32,6 +32,9 @@ tokens_log = logging.getLogger("bot.tokens")
 
 ASR_FORMATS = {".wav", ".aiff", ".flac", ".m4a", ".mp3", ".aac", ".opus", ".ogg", ".oga"}
 ASR_MAX_BYTES = 50 * 1024 * 1024
+ASR_ATTEMPTS = 3
+ASR_RETRY_DELAY = 1.5  # сек; пауза растёт: 1.5, 3.0
+ASR_RETRY_STATUSES = {429, 500, 502, 503, 504}
 TTS_MAX_CHARS = 9_000
 IMAGE_ASPECTS = {"1:1", "16:9", "4:3", "3:2", "2:3", "3:4", "9:16", "21:9"}
 
@@ -127,6 +130,16 @@ class MediaAI:
             self.base_url = self.base_url[:-3]
         tmo = httpx.Timeout(connect=15.0, read=600.0, write=120.0, pool=10.0)
         self._client = httpx.AsyncClient(timeout=tmo)
+        self._asr_sem: asyncio.Semaphore | None = None
+        self._asr_sem_loop: asyncio.AbstractEventLoop | None = None
+
+    def _asr_semaphore(self) -> asyncio.Semaphore:
+        """Один ASR-запрос за раз. Семафор привязан к event loop — пересоздаём при смене."""
+        loop = asyncio.get_running_loop()
+        if self._asr_sem is None or self._asr_sem_loop is not loop:
+            self._asr_sem = asyncio.Semaphore(1)
+            self._asr_sem_loop = loop
+        return self._asr_sem
 
     # ---- доступность ----
 
@@ -199,14 +212,31 @@ class MediaAI:
         if lang:
             headers["language"] = lang
         mime = "audio/ogg" if path.suffix.lower() in (".ogg", ".oga", ".opus") else "application/octet-stream"
-        resp = await self._client.post(
-            f"{self.base_url}/v1/speech_to_text",
-            headers=headers,
-            data={"model": settings.minimax_asr_model, "response_format": "json"},
-            files={"file": (path.name, path.read_bytes(), mime)},
-        )
-        if resp.status_code >= 400:
-            raise MediaAIError(f"ASR HTTP {resp.status_code}: {resp.text[:300]}")
+        body = path.read_bytes()
+        # Голосовые по одному: пачка одновременных запросов упирается в «conn limit»
+        # (HTTP 429), а фолбэк на локальный Whisper на слабой машине вешает её
+        # (инцидент 2026-10-21). Временные ошибки — повторяем с паузой.
+        async with self._asr_semaphore():
+            for attempt in range(1, ASR_ATTEMPTS + 1):
+                try:
+                    resp = await self._client.post(
+                        f"{self.base_url}/v1/speech_to_text",
+                        headers=headers,
+                        data={"model": settings.minimax_asr_model, "response_format": "json"},
+                        files={"file": (path.name, body, mime)},
+                    )
+                except httpx.TransportError as exc:
+                    if attempt == ASR_ATTEMPTS:
+                        raise MediaAIError(f"ASR сеть: {exc!r}") from exc
+                    log.warning("minimax asr: %s attempt %d: %r, retrying", path.name, attempt, exc)
+                else:
+                    if resp.status_code < 400:
+                        break
+                    err = f"ASR HTTP {resp.status_code}: {resp.text[:300]}"
+                    if resp.status_code not in ASR_RETRY_STATUSES or attempt == ASR_ATTEMPTS:
+                        raise MediaAIError(err)
+                    log.warning("minimax asr: %s attempt %d: %s, retrying", path.name, attempt, err[:120])
+                await asyncio.sleep(ASR_RETRY_DELAY * attempt)
         d = resp.json()
         text = (d.get("text") or "").strip()
         dur = d.get("duration")

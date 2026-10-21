@@ -16,6 +16,7 @@ import asyncio
 import base64
 import logging
 import tempfile
+import threading
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -141,6 +142,13 @@ def _extract_text(path: Path, limit: int | None = None) -> str:
 
 _WHISPER_MODEL = None
 _WHISPER_MODEL_NAME = ""
+# Загрузка и транскрипция — строго по одной: два голосовых сразу грузили бы
+# две копии модели и вдвое больше памяти (инцидент 2026-10-21).
+_WHISPER_LOCK = threading.Lock()
+
+
+class WhisperLowMemory(RuntimeError):
+    pass
 
 
 def _whisper_model_name() -> str:
@@ -151,13 +159,39 @@ def _whisper_model_name() -> str:
         return "small"
 
 
+def _whisper_min_free_mb() -> int:
+    try:
+        from .config import settings  # noqa: PLC0415
+        return int(settings.whisper_min_free_mb or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _mem_available_mb() -> int | None:
+    """MemAvailable из /proc/meminfo в МБ; None — не Linux / не прочитать."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def _get_whisper_model():
-    """Лениво загрузить и закэшировать модель whisper (загрузка — секунды)."""
+    """Лениво загрузить и закэшировать модель whisper (загрузка — секунды).
+    Вызывать под _WHISPER_LOCK. WhisperLowMemory — если памяти на загрузку мало."""
     global _WHISPER_MODEL, _WHISPER_MODEL_NAME
     import whisper  # type: ignore[import]
     name = _whisper_model_name()
     if _WHISPER_MODEL is None or _WHISPER_MODEL_NAME != name:
-        log.info("loading whisper model %r", name)
+        need = _whisper_min_free_mb()
+        avail = _mem_available_mb()
+        if need and avail is not None and avail < need:
+            raise WhisperLowMemory(f"свободно {avail}MB < {need}MB")
+        log.info("loading whisper model %r (MemAvailable=%sMB)", name, avail)
+        _WHISPER_MODEL = None  # отпустить старую модель до загрузки новой
         _WHISPER_MODEL = whisper.load_model(name)
         _WHISPER_MODEL_NAME = name
     return _WHISPER_MODEL
@@ -169,8 +203,21 @@ def _transcribe_audio_sync(path: Path) -> str:
         import whisper  # type: ignore[import]  # noqa: F401
     except ImportError:
         return "(openai-whisper не установлен — pip install openai-whisper)"
+    with _WHISPER_LOCK:
+        return _transcribe_locked(path)
+
+
+def _transcribe_locked(path: Path) -> str:
     try:
         model = _get_whisper_model()
+    except WhisperLowMemory as exc:
+        log.warning("whisper skipped for %s: low memory (%s)", path.name, exc)
+        return ("(голосовое не распознано: мало памяти для локального Whisper — "
+                "аудио сохранено, можно распознать позже)")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("STT failed for %s: %s", path, exc)
+        return f"(ошибка STT: {exc})"
+    try:
         result = model.transcribe(str(path))
         text = (result.get("text") or "").strip()
         lang = result.get("language", "?")
