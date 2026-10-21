@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Перезапуск бота (ручной запуск без systemd, как на стенде) только когда он простаивает:
+# Перезапуск бота (systemd-сервис ducksidian, если установлен, иначе ручной запуск) только когда он простаивает:
 # ждём GET /busy == 0 (идущие ходы агента + очередь + фоновые разборы), потом SIGTERM и старт.
 # Несколько ходов идут параллельно в разных темах, поэтому строки лога для этого не годятся.
 #   scripts/restart_when_idle.sh [max_wait_sec=1800]   — FORCE=1 перезапустит и по таймауту.
@@ -21,13 +21,18 @@ while :; do
     echo "busy=$b, жду…"; sleep 10; waited=$((waited + 10))
 done
 
-PID="$(pgrep -f '^\.venv/bin/python -m bot\.main' || true)"
-if [ -n "$PID" ]; then
-    kill -TERM $PID
-    for _ in $(seq 1 30); do kill -0 $PID 2>/dev/null || break; sleep 1; done
-    kill -0 $PID 2>/dev/null && kill -9 $PID
+if systemctl --user is-enabled ducksidian >/dev/null 2>&1; then
+    # Установлен сервис (deploy/ducksidian.service) — перезапуск через systemd.
+    systemctl --user restart ducksidian
+else
+    PID="$(pgrep -f '^\.venv/bin/python -m bot\.main' || true)"
+    if [ -n "$PID" ]; then
+        kill -TERM $PID
+        for _ in $(seq 1 30); do kill -0 $PID 2>/dev/null || break; sleep 1; done
+        kill -0 $PID 2>/dev/null && kill -9 $PID
+    fi
+    nohup setsid .venv/bin/python -m bot.main >> bot.log 2>&1 < /dev/null &
 fi
-nohup setsid .venv/bin/python -m bot.main >> bot.log 2>&1 < /dev/null &
 for _ in $(seq 1 30); do
     if curl -fs http://127.0.0.1:8080/healthz >/dev/null 2>&1; then echo "bot up"; exit 0; fi
     sleep 2

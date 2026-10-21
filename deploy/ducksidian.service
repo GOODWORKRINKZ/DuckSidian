@@ -1,0 +1,33 @@
+# Бот как пользовательский сервис systemd (без docker, как на стенде builder).
+# Чекаут — ~/DuckSidian с .venv и .env. Нужен linger, чтобы стартовал после перезагрузки
+# без входа в систему:
+#   loginctl enable-linger "$USER"
+#   mkdir -p ~/.config/systemd/user && cp deploy/ducksidian.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now ducksidian
+# Логи — в ~/DuckSidian/bot.log, как при ручном запуске. Перезапуск без обрыва
+# идущих ходов — scripts/restart_when_idle.sh.
+
+[Unit]
+Description=DuckSidian Telegram bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/DuckSidian
+ExecStart=%h/DuckSidian/.venv/bin/python -m bot.main
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=40
+StandardOutput=append:%h/DuckSidian/bot.log
+StandardError=inherit
+# Бот ~150MB, локальный Whisper small — ещё ~2.5GB. Выше лимита ядро убьёт только
+# бота (systemd перезапустит), а не повесит всю машину, как 2026-10-21.
+MemoryHigh=3G
+MemoryMax=4G
+
+[Install]
+WantedBy=default.target
