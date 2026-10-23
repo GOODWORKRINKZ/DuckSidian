@@ -417,6 +417,32 @@ def test_looks_auto_topic() -> None:
     assert not _looks_auto_topic("Личное", "")
 
 
+def test_wrapped_topic_name() -> None:
+    # Темы, которые Telegram открывает сам под сообщение из корня чата.
+    from bot.handlers.private import _wrapped_topic_name
+    assert _wrapped_topic_name("1399 руб штаны К...")
+    assert _wrapped_topic_name("Да, запили. Сего…")
+    assert _wrapped_topic_name("Медиафайлы")
+    assert not _wrapped_topic_name("Семейные траты")
+    assert not _wrapped_topic_name("Личное")
+
+
+def test_history_strips_footers() -> None:
+    from bot.handlers.private import history_messages
+    rows = [
+        {"chat_id": 1, "message_id": 1, "user_id": 5, "text": "70 руб тетради",
+         "full_name": "Таня", "username": None},
+        {"chat_id": 1, "message_id": 2, "user_id": 999, "full_name": "bot", "username": "bot",
+         "text": "Записала 70 ₽\n\n✍️ Изменено: `a.md`\n\n✍️ Изменено: `a.md`"},
+        {"chat_id": 1, "message_id": 3, "user_id": 999, "full_name": "bot", "username": "bot",
+         "text": "✍️ Изменено: `a.md`"},
+    ]
+    assert history_messages(rows, bot_id=999, limit=10) == [
+        {"role": "user", "content": "70 руб тетради"},
+        {"role": "assistant", "content": "Записала 70 ₽"},
+    ]
+
+
 def test_md_to_telegraph_nodes() -> None:
     from bot.telegraph import md_to_nodes, page_title
     md = ("---\ntype: note\ntitle: \"Заметка\"\n---\n# Заметка\n\nАбзац с **жирным**, `кодом`, "

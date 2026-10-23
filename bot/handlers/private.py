@@ -43,6 +43,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+from ..agent.deepseek import ModerationRejected
 from ..agent.wikitools import instruction_body, replace_section, sections
 from ..config import settings
 from ..db import DB
@@ -56,7 +57,7 @@ from ..media_parser import (
 )
 from ..media_refs import missing_note, split_voice_block, strip_images_block
 from ..forwards import Bundler, bundle_text, forward_header as _forward_header  # noqa: F401  (тесты импортируют _forward_header отсюда)
-from ..orchestrator import Orchestrator
+from ..orchestrator import Orchestrator, strip_footers
 from ..skills import load_skills, match_command
 from ..personal import (
     ARTIFACT_KINDS,
@@ -116,7 +117,8 @@ HELP_TEXT = (
     "• «покажи / удали / отправь в чат / нарисуй …» → управляю артефактами, рисую.\n\n"
     "<b>Воркспейсы</b> — создай тему (topic) в этом чате: тема = проект. "
     "Всё, что пишешь в теме, ложится в её страницу проекта. "
-    "/ws — текущий воркспейс, /ws new &lt;имя&gt; — создать, /ws list — все.\n\n"
+    "/ws — текущий воркспейс, /ws new &lt;имя&gt; — создать, /ws list — все, "
+    "/ws default — куда класть сообщения вне тем.\n\n"
     "<b>Команды</b>\n"
     "/ask &lt;вопрос&gt; — вопрос к твоему личному vault\n"
     "/note &lt;текст&gt; — быстрая заметка без агента\n"
@@ -166,6 +168,7 @@ _AUTO_TOPIC_NAMES = {
     "media", "медиа", "voice message", "голосовое сообщение", "photo", "фото", "video", "видео",
     "document", "файл", "документ", "sticker", "стикер", "gif", "video message", "видеосообщение",
     "audio", "аудио", "new topic", "новая тема", "new chat", "новый чат", "chat", "чат",
+    "медиафайлы", "media files",
 }
 
 # Подбор значка темы по смыслу: ключевые слова → эмодзи из набора Telegram
@@ -422,7 +425,10 @@ def history_messages(rows: list[Any], *, bot_id: int, skip: tuple[int, int] | No
         if not text:
             continue
         if r["user_id"] == bot_id:
-            out.append({"role": "assistant", "content": text[:2000]})
+            # Без футеров «✍️ Изменено» — иначе модель копирует их в новые ответы сама.
+            text = strip_footers(text)
+            if text:
+                out.append({"role": "assistant", "content": text[:2000]})
             continue
         if label_authors:
             author = r["full_name"] or (f"@{r['username']}" if r["username"] else str(r["user_id"]))
@@ -443,6 +449,25 @@ def _media_label(msg: Message) -> str:
 
 def _thread_id(msg: Message) -> int | None:
     return msg.message_thread_id if (msg.is_topic_message and msg.message_thread_id) else None
+
+
+# (chat_id, message_id) → тема воркспейса по умолчанию (/ws default), куда отнесли
+# сообщение вне воркспейса. Его и ответ бота журналим под этой темой — так они попадают
+# в историю воркспейса (и у партнёров по совместному воркспейсу).
+_routed: dict[tuple[int, int], int] = {}
+
+
+def _log_tid(msg: Message) -> int | None:
+    """Тема для журнала и истории: тема воркспейса по умолчанию, если сообщение туда
+    отнесено, иначе своя."""
+    return _routed.get((msg.chat.id, msg.message_id)) or _thread_id(msg)
+
+
+def _wrapped_topic_name(name: str) -> bool:
+    """Имя темы, которую Telegram открыл сам, завернув сообщение из корня чата:
+    первые слова текста с «...» на конце или служебное «Медиафайлы»/«Фото»."""
+    n = (name or "").strip()
+    return n.endswith(("...", "…")) or _looks_auto_topic(n, "")
 
 
 async def _typing_loop(bot: Bot, chat_id: int, stop: asyncio.Event,
@@ -1203,6 +1228,34 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             return row["name"]
         return f"тема {tid}"
 
+    def _default_ws_key(chat_id: int) -> str:
+        return f"default_ws_{chat_id}"
+
+    async def _default_ws(msg: Message, space: PersonalSpace) -> dict[str, Any] | None:
+        """Воркспейс по умолчанию (/ws default) для сообщения вне воркспейса: из корня
+        чата или из темы, которую Telegram сам открыл под такое сообщение. Без этого оно
+        уходит в личный vault — и, например, траты расползаются по двум журналам.
+        Темы, которые пользователь открыл и назвал сам, и команды не трогаем."""
+        if (msg.text or "").startswith("/"):
+            return None
+        raw = await db.get_state(_default_ws_key(msg.chat.id), "")
+        if not raw.isdigit():
+            return None
+        tid = _thread_id(msg)
+        if tid is not None:
+            if tid == int(raw):
+                return None
+            row = await db.get_workspace(msg.chat.id, tid)
+            if row is None or row["project_slug"] or not _wrapped_topic_name(row["name"] or ""):
+                return None
+        row = await db.get_workspace(msg.chat.id, int(raw))
+        if row is None or not row["project_slug"]:
+            return None
+        sslug = shared_slug_of(row["project_slug"])
+        if sslug and not space.is_shared and await shared_role(db, sslug, space.user_id) == "none":
+            return None
+        return dict(row)
+
     async def _workspace(msg: Message, space: PersonalSpace,
                          name_hint: str | None = None) -> dict[str, Any] | None:
         """Воркспейс для сообщения в теме.
@@ -1213,6 +1266,11 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         такие темы остаются обычным чатом, пока пользователь не решит иначе.
         Для незнакомой темы один раз показываем подсказку с кнопками.
         """
+        dflt = await _default_ws(msg, space)
+        if dflt is not None:
+            _routed[(msg.chat.id, msg.message_id)] = int(dflt["topic_id"])
+            _trim(_routed)
+            return dflt
         tid = _thread_id(msg)
         if tid is None:
             return None
@@ -1583,7 +1641,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         mid = sent_ids[0] if sent_ids else -int(now.timestamp() * 1000)
         try:
             await db.save_message(
-                chat_id=msg.chat.id, message_id=mid, topic_id=_thread_id(msg),
+                chat_id=msg.chat.id, message_id=mid, topic_id=_log_tid(msg),
                 user_id=bot.id, username="bot", full_name="DuckSidian",
                 text=text, media_type=None, media_path=None,
                 reply_to_message_id=None, ts=now,
@@ -1681,7 +1739,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         if shared_project_slug:
             rows = await db.fetch_last_messages_in_workspace(shared_project_slug, n + 1)
         else:
-            rows = await db.fetch_last_messages_in_topic(msg.chat.id, _thread_id(msg), n + 1)
+            rows = await db.fetch_last_messages_in_topic(msg.chat.id, _log_tid(msg), n + 1)
         return history_messages(rows, bot_id=bot.id, skip=(msg.chat.id, msg.message_id),
                                 limit=n, label_authors=bool(shared_project_slug))
 
@@ -1850,6 +1908,39 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
 
     # ---- workspaces (темы)
 
+    async def _ws_default_cmd(msg: Message, arg: str) -> None:
+        """/ws default — эта тема-воркспейс по умолчанию; /ws default <имя>; /ws default off."""
+        key = _default_ws_key(msg.chat.id)
+        rows = [r for r in await db.list_workspaces(msg.chat.id) if r["project_slug"]]
+        if arg.lower() in ("off", "нет", "выкл", "сброс"):
+            await db.set_state(key, "")
+            await msg.reply("✅ Воркспейс по умолчанию снят: сообщения вне тем — снова в личное пространство.")
+            return
+        row = None
+        if arg:
+            row = next((r for r in rows if (r["name"] or "").strip().lower() == arg.lower()), None)
+            if row is None:
+                names = ", ".join(f"«{_esc(r['name'])}»" for r in rows) or "нет"
+                await msg.reply(f"Не нашёл воркспейс «{_esc(arg)}». Есть: {names}.", parse_mode="HTML")
+                return
+        elif _thread_id(msg) is not None:
+            row = next((r for r in rows if r["topic_id"] == _thread_id(msg)), None)
+        if row is None:
+            cur_raw = await db.get_state(key, "")
+            cur = next((r for r in rows if cur_raw.isdigit() and r["topic_id"] == int(cur_raw)), None)
+            await msg.reply(
+                (f"Сейчас по умолчанию: <b>{_esc(cur['name'])}</b>.\n" if cur else
+                 "Воркспейс по умолчанию не задан.\n")
+                + "Сообщения, отправленные не в тему-воркспейс (из списка тем Telegram заворачивает "
+                "их в новую тему), уйдут в него.\n"
+                "<code>/ws default</code> внутри темы-воркспейса, <code>/ws default &lt;имя&gt;</code> "
+                "или <code>/ws default off</code>.",
+                parse_mode="HTML")
+            return
+        await db.set_state(key, str(row["topic_id"]))
+        await msg.reply(f"✅ По умолчанию — <b>{_esc(row['name'])}</b>: сообщения вне тем-воркспейсов "
+                        "пойдут туда (ответ придёт с пометкой 📌).", parse_mode="HTML")
+
     @router.message(Command("ws", "workspace"))
     async def cmd_ws(msg: Message, command: CommandObject) -> None:
         space = await _guard(msg)
@@ -2005,6 +2096,9 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 pass
             await msg.reply(f"✅ {_esc(await db.user_label(uid_))} исключён из «{_esc(ws['name'])}».",
                             parse_mode="HTML")
+            return
+        if sub in ("default", "дефолт", "умолчание"):
+            await _ws_default_cmd(msg, rest.strip())
             return
         if sub == "new":
             name = rest.strip()
@@ -2868,6 +2962,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
                 await _react(bot, msg, "👌")
                 return
         ws_pre = await db.get_workspace(msg.chat.id, _thread_id(msg)) if _thread_id(msg) else None
+        if ws_pre is None or not ws_pre["project_slug"]:
+            ws_pre = await _default_ws(msg, space) or ws_pre
         if ws_pre is not None and ws_pre["project_slug"] and await _foreign_shared(msg, dict(ws_pre), space):
             return
         lock_key: Any = ws_pre["project_slug"] if (ws_pre and shared_slug_of(ws_pre["project_slug"])) else space.user_id
@@ -2989,7 +3085,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         who = _display_name(msg)
         try:
             await db.save_message(
-                chat_id=msg.chat.id, message_id=msg.message_id, topic_id=_thread_id(msg),
+                chat_id=msg.chat.id, message_id=msg.message_id, topic_id=_log_tid(msg),
                 user_id=msg.from_user.id if msg.from_user else None,
                 username=msg.from_user.username if msg.from_user else None,
                 full_name=who, text=it.full_text or None,
@@ -3015,6 +3111,12 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
         who = _display_name(msg)
         ws = await _workspace(msg, space)
         ws_name = ws["name"] if ws else None
+        routed_tid = _routed.get((msg.chat.id, msg.message_id))
+        if routed_tid is not None:
+            for m in msgs:
+                _routed[(m.chat.id, m.message_id)] = routed_tid
+            log.info("private: %s/%s outside a workspace → default workspace «%s»",
+                     msg.chat.id, msg.message_id, ws_name)
         pspace = space                      # личное пространство (для create_workspace и т.п.)
         space = _space_for(space, ws)        # рабочее: общий vault, если тема совместная
         if ws and shared_slug_of(ws.get("project_slug")):
@@ -3134,7 +3236,10 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             except Exception as exc:  # noqa: BLE001
                 log.exception("personal_turn failed")
                 await _react(bot, msg, REACT_ERROR)
-                await msg.reply(f"⚠️ Ошибка агента: {type(exc).__name__}. Попробуй ещё раз.")
+                if isinstance(exc, ModerationRejected):
+                    await msg.reply(f"⚠️ Не получилось: {exc}")
+                else:
+                    await msg.reply(f"⚠️ Ошибка агента: {type(exc).__name__}. Попробуй ещё раз.")
                 await notice.fail(type(exc).__name__)
                 return
             finally:
@@ -3161,6 +3266,8 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             mode = await _voice_mode(_voice_owner(msg, space))
             voice = mode == "on" or (mode == "auto" and spoke)
             title_hint = (text or transcript or "Ответ").splitlines()[0]
+            if routed_tid is not None and ws_name:
+                answer = f"📌 {ws_name} (воркспейс по умолчанию)\n\n{answer}"
             await _send_agent_answer(msg, space, answer, title_hint=title_hint, ws_name=ws_name, voice=voice)
             await notice.finish(_strip_images_block(split_voice_block(answer)[0])[0])
 

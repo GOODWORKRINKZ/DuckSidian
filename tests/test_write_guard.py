@@ -172,3 +172,32 @@ async def test_personal_turn_recovered_after_nudge(space: PersonalSpace,
         answer = await _orch(client).personal_turn(space, "z", message_id=8)
     assert answer == "Записал в wiki/notes/z.md\n\n✍️ Изменено: `wiki/notes/z.md`"
     assert any("recovered=True" in r.getMessage() for r in caplog.records)
+
+
+def test_strip_footers() -> None:
+    from bot.orchestrator import strip_footers
+    text = ("Записала: 21.10 · 70 ₽\n\n✍️ Изменено: `wiki/projects/Траты.md`\n\n"
+            "✍ Изменено: `log.md`\n\n⚠️ в vault ничего не записано")
+    assert strip_footers(text) == "Записала: 21.10 · 70 ₽"
+    assert strip_footers("Изменено расписание — без футера") == "Изменено расписание — без футера"
+
+
+@pytest.mark.asyncio
+async def test_personal_turn_single_real_footer(space: PersonalSpace) -> None:
+    # Модель копирует футер из истории — в ответе остаётся только футер от кода.
+    client = _FakeClient([
+        _call("append_file", {"path": "wiki/notes/z.md", "content": "z"}, "c1"),
+        _call("finish", {"summary": "Записал z\n\n✍️ Изменено: `wiki/notes/z.md`\n\n"
+                                    "✍️ Изменено: `wiki/notes/z.md`"}, "c2"),
+    ])
+    answer = await _orch(client).personal_turn(space, "z", message_id=9)
+    assert answer == "Записал z\n\n✍️ Изменено: `wiki/notes/z.md`"
+
+
+@pytest.mark.asyncio
+async def test_personal_turn_drops_fake_footer(space: PersonalSpace) -> None:
+    # Ничего не записано, а модель приписала «Изменено» — футер убираем.
+    client = _FakeClient([_text("Не разобрал картинку, напиши сумму.\n\n"
+                                "✍️ Изменено: `wiki/projects/Семейные-траты.md`")])
+    answer = await _orch(client).personal_turn(space, "фото", message_id=10)
+    assert answer == "Не разобрал картинку, напиши сумму."

@@ -36,6 +36,29 @@ def extract_usage(resp: dict) -> tuple[int, int, int]:
     return prompt, completion, cached
 
 
+# Признаки отказа модерации в теле 400-ответа (Qwen/DashScope: data_inspection_failed,
+# OpenAI/Azure: content_filter / content_policy_violation).
+_MODERATION_MARKERS = ("data_inspection_failed", "inappropriate content",
+                       "content_filter", "content_policy")
+
+
+class ModerationRejected(RuntimeError):
+    """Провайдер отказался обрабатывать запрос из-за модерации содержимого."""
+
+
+def is_moderation_error(exc: BaseException) -> bool:
+    """400 от провайдера из-за модерации входа (а не из-за ошибки в запросе)."""
+    if not isinstance(exc, httpx.HTTPStatusError) or exc.response is None:
+        return False
+    if exc.response.status_code != 400:
+        return False
+    try:
+        body = exc.response.text.lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return any(m in body for m in _MODERATION_MARKERS)
+
+
 def _completions_url(base_url: str) -> str:
     """Собрать URL chat/completions из базового.
 
