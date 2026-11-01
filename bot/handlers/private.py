@@ -44,7 +44,7 @@ from aiogram.types import (
 )
 
 from ..agent.deepseek import ModerationRejected
-from ..agent.wikitools import instruction_body, replace_section, sections
+from ..agent.wikitools import instruction_body, instruction_overflow_note, replace_section, sections
 from ..config import settings
 from ..db import DB
 from ..intake import FILE_URL_RE, IntakeResult, download_url_to_vault, process_attachment
@@ -1203,7 +1203,7 @@ def setup(db: DB, orch: Orchestrator, bot: Bot) -> Router:
             body = current.rstrip() + "\n" + body
         updated, info = replace_section(page, "Инструкция", body)
         tspace.wiki.write_file(rel, updated)
-        return rel, info
+        return rel, info + instruction_overflow_note(body)
 
     def _get_instruction(tspace: PersonalSpace, slug: str) -> str:
         try:

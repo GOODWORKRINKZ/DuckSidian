@@ -106,6 +106,21 @@ def test_project_instruction_from_page(vault: Path) -> None:
     assert "отвечай по-китайски" not in Orchestrator._project_pinned(space, slug)
 
 
+def test_long_instruction_kept_whole_and_overflow_warned(vault: Path) -> None:
+    # Регресс: инструкция «Учим китайский» доросла до ~3100 символов, а в контекст шли 3000 —
+    # правила про VOICE и «Статистику» в конце молча пропадали.
+    from bot.agent.wikitools import INSTRUCTION_CAP, instruction_overflow_note
+    space = PersonalSpace(7, "Денис")
+    slug = space.ensure_project("Учим китайский")
+    path = space.root / f"wiki/projects/{slug}.md"
+    rules = "\n".join(f"- правило {i}: " + "х" * 60 for i in range(60)) + "\n- ПОСЛЕДНЕЕ правило"
+    assert 3_000 < len(rules) < INSTRUCTION_CAP
+    path.write_text(replace_section(path.read_text(encoding="utf-8"), "Инструкция", rules)[0], encoding="utf-8")
+    assert Orchestrator._project_instruction(space, slug).endswith("ПОСЛЕДНЕЕ правило")
+    assert instruction_overflow_note(rules) == ""
+    assert "⚠️" in instruction_overflow_note("х" * (INSTRUCTION_CAP + 1))
+
+
 # ---------------------------------------------------------------- пачка сообщений
 
 def test_bundle_text_batch_vs_forward_bundle() -> None:
