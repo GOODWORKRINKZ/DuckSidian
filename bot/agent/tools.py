@@ -854,6 +854,7 @@ class ToolExecutor:
         # Внешние вызовы этого хода (ключ → результат): повтор не ходит наружу снова.
         self._seen_calls: dict[str, str] = {}
         self.repeat_hits = 0
+        self._grep_streak: tuple[str, int] = ("", 0)
         self._media_index = MediaIndex(wiki.root)
         # Кэш содержимого файлов в рамках run_agent (или прокинутый снаружи —
         # тогда живёт между несколькими run_agent одного дня). Ключ — rel path.
@@ -929,7 +930,52 @@ class ToolExecutor:
             args = {"url": f"1688:{m.group(1)}" if m else url.split("#", 1)[0]}
         return name + json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
 
+    # Длинная строка (минифицированный JSON/JS в выгрузке) целиком не влезает в лимит
+    # результата инструмента: совпадение в середине обрезалось, и агент раздувал regex
+    # `"家".{0,N}` до 40 шагов (2026-10-30). Показываем окна вокруг совпадений.
+    GREP_LONG_LINE = 600
+    GREP_WINDOW_BEFORE = 150
+    GREP_WINDOW_AFTER = 450
+    GREP_WINDOWS_PER_LINE = 5
+    # Больше стольких grep_file подряд по одному файлу — перебор шаблонов, а не поиск.
+    # Серию прерывает любой вызов, кроме grep_file/read_lines того же файла.
+    GREP_STREAK_LIMIT = 8
+    GREP_LIMIT_NOTE = (
+        "[СТОП: это {n}-й grep_file подряд по {path}. Перебор шаблонов не поможет — "
+        "работай с тем, что уже нашёл (read_lines по номерам строк из прошлых результатов), "
+        "или ответь пользователю, чего не хватает.]"
+    )
+
+    @classmethod
+    def _grep_line_view(cls, line: str, rx: Any) -> str:
+        if len(line) <= cls.GREP_LONG_LINE:
+            return line
+        parts: list[str] = []
+        shown_to = 0
+        for m in rx.finditer(line):
+            if len(parts) >= cls.GREP_WINDOWS_PER_LINE:
+                break
+            a = max(shown_to, m.start() - cls.GREP_WINDOW_BEFORE)
+            b = min(len(line), m.start() + cls.GREP_WINDOW_AFTER)
+            if b <= shown_to:
+                continue
+            parts.append(f"[симв. {a}–{b}] {'…' if a else ''}{line[a:b]}{'…' if b < len(line) else ''}")
+            shown_to = b
+        if not parts:  # совпадение на соседней строке (context) — только начало
+            parts.append(line[: cls.GREP_WINDOW_AFTER] + "…")
+        return f"[длинная строка, {len(line)} симв.] " + " ‖ ".join(parts)
+
     async def call(self, name: str, arguments: dict[str, Any]) -> str:
+        path = str((arguments or {}).get("path") or "")
+        streak_path, streak = self._grep_streak
+        if name == "grep_file":
+            streak = streak + 1 if path == streak_path else 1
+            self._grep_streak = (path, streak)
+            if streak > self.GREP_STREAK_LIMIT:
+                log.info("grep_file streak limit: %s (n=%d)", path, streak)
+                return self.GREP_LIMIT_NOTE.format(n=streak, path=path)
+        elif not (name == "read_lines" and path == streak_path):
+            self._grep_streak = ("", 0)
         if name not in self.NO_REPEAT_TOOLS:
             return await self._call_impl(name, arguments)
         key = self.call_key(name, arguments)
@@ -1028,7 +1074,9 @@ class ToolExecutor:
                         ranges.append((a, b))
                 blocks = []
                 for a, b in ranges:
-                    block = "\n".join(f"{i + 1:>5}: {lines[i]}" for i in range(a, b + 1))
+                    block = "\n".join(
+                        f"{i + 1:>5}: {self._grep_line_view(lines[i], rx)}" for i in range(a, b + 1)
+                    )
                     blocks.append(block)
                 tail = f"\n[срезано до {limit} матчей]" if truncated else ""
                 return (
