@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
@@ -1765,7 +1766,8 @@ class ToolExecutor:
             soup = BeautifulSoup(html, "html.parser")
             for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
                 tag.decompose()
-            title = soup.title.string.strip() if soup.title else ""
+            # <title> с вложенными тегами даёт .string == None (AliExpress).
+            title = soup.title.get_text(strip=True) if soup.title else ""
             body = soup.find("article") or soup.find("main") or soup.body
             text = body.get_text(separator="\n", strip=True) if body else soup.get_text()
         except ImportError:
