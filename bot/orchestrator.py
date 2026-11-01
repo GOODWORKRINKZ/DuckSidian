@@ -41,7 +41,7 @@ from .agent.prompts import (
 )
 from .agent.loop import MEDIA_TOOLS, UNCONFIRMED_MEDIA_NOTE
 from .agent.tools import PERSONAL_WRITE_TOOLS, ToolExecutor, personal_tool_schemas
-from .agent.wikitools import instruction_body, sections
+from .agent.wikitools import INSTRUCTION_CAP, instruction_body, sections
 from .skills import catalog, load_skills
 from .config import ChatConfig, settings
 from .db import DB
@@ -606,7 +606,7 @@ class Orchestrator:
         return answer
 
     @staticmethod
-    def _project_instruction(space: Any, slug: str, cap: int = 3_000) -> str:
+    def _project_instruction(space: Any, slug: str, cap: int = INSTRUCTION_CAP) -> str:
         """Тело секции `## Инструкция` страницы проекта — мастер-промпт воркспейса.
         Пустая секция или только шаблонная подсказка курсивом → ''."""
         name = (slug or "").rsplit("/", 1)[-1]
@@ -616,7 +616,10 @@ class Orchestrator:
             text = space.wiki.read_file(f"wiki/projects/{name}.md", max_bytes=2_000_000)
         except Exception:  # noqa: BLE001
             return ""
-        return instruction_body(sections(text, ["Инструкция"], cap))
+        body = instruction_body(sections(text, ["Инструкция"], cap))
+        if body.endswith("[обрезано — полностью в файле проекта]"):
+            log.warning("workspace instruction truncated at %d chars: wiki/projects/%s.md", cap, name)
+        return body
 
     @staticmethod
     def _project_pinned(space: Any, slug: str, cap: int = 4_000) -> str:
@@ -643,7 +646,9 @@ class Orchestrator:
             "Ты озвучиваешь ответ ассистента голосом. Перескажи СУТЬ ответа в 1–3 коротких "
             f"разговорных фразах (до {limit} символов), по-русски, от первого лица, как сказал бы "
             "человек вслух. Без markdown, без ссылок, без путей к файлам, без списков и цифр "
-            "в скобках. Если в ответе был вопрос пользователю — обязательно задай его. "
+            "в скобках. Даты, суммы и числа — словами, как говорят вслух (01.11 → «первое ноября», "
+            "1 049,11 ₽ → «тысяча сорок девять рублей одиннадцать копеек»). "
+            "Если в ответе был вопрос пользователю — обязательно задай его. "
             "Верни только текст для озвучки."
         )
         try:

@@ -175,6 +175,18 @@ def replace_section(text: str, heading: str, content: str) -> tuple[str, str]:
     return out, f"секция «{lines[start].strip()}» заменена"
 
 
+# Сколько символов инструкции воркспейса агент видит в каждом ходе; хвост сверх — обрезается.
+INSTRUCTION_CAP = 6_000
+
+
+def instruction_overflow_note(body: str) -> str:
+    """Предупреждение для агента, если инструкция не влезает в INSTRUCTION_CAP, иначе ''."""
+    if len(body) <= INSTRUCTION_CAP:
+        return ""
+    return (f" ⚠️ Инструкция {len(body)} символов > {INSTRUCTION_CAP}: хвост не попадёт в контекст. "
+            "Сожми её (mode=\"replace\"): убери повторы и устаревшие пункты.")
+
+
 def instruction_body(section_text: str) -> str:
     """Тело секции «Инструкция» без заголовка и без шаблонной подсказки (курсивный абзац
     из _template.md). Пусто → '' (инструкции нет)."""

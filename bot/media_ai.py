@@ -26,6 +26,7 @@ import httpx
 
 from .config import settings
 from .media_refs import split_voice_block, strip_images_block
+from .speech_ru import normalize_numbers
 
 log = logging.getLogger(__name__)
 tokens_log = logging.getLogger("bot.tokens")
@@ -65,6 +66,9 @@ def _md_for_tts(text: str) -> str:
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
+
+# Голоса других языков, которые показываем и в русском списке /voices (по-русски — с акцентом).
+EXTRA_RUSSIAN_VOICES = ("English_Jovialman",)
 
 # Старые («legacy») системные голоса MiniMax. В /v1/get_voice их нет, но voice_id
 # принимается синтезом. Первая часть — название в терминах MiniMax, вторая — описание.
@@ -312,7 +316,7 @@ class MediaAI:
         """Синтез речи → байты аудио (mp3 по умолчанию)."""
         if not self.configured:
             raise MediaAIError("MINIMAX_API_KEY не задан")
-        clean = _md_for_tts(text)
+        clean = normalize_numbers(_md_for_tts(text))
         if not clean:
             raise MediaAIError("нечего озвучивать")
         if len(clean) > TTS_MAX_CHARS:
@@ -395,7 +399,8 @@ class MediaAI:
         out: list[dict[str, str]] = []
         for v in d.get("system_voice") or []:
             vid = str(v.get("voice_id") or "")
-            if lang_prefix and not vid.lower().startswith(lang_prefix.lower()):
+            extra = lang_prefix.lower() == "russian" and vid in EXTRA_RUSSIAN_VOICES
+            if lang_prefix and not vid.lower().startswith(lang_prefix.lower()) and not extra:
                 continue
             desc = v.get("description")
             if isinstance(desc, list):
