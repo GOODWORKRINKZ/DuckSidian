@@ -264,9 +264,11 @@ class MediaAI:
                     "url": f"data:{mime};base64,{b64}", "detail": settings.minimax_vision_detail,
                 }},
             ]}],
-            "max_tokens": 700,
+            "max_tokens": settings.minimax_vision_max_tokens,
             "temperature": 0.2,
         }
+        if not settings.minimax_vision_thinking:
+            body["thinking"] = {"type": "disabled"}
         resp = await self._client.post(
             f"{self.base_url}/v1/chat/completions",
             headers=self._headers(**{"Content-Type": "application/json"}),
@@ -277,7 +279,8 @@ class MediaAI:
         d = resp.json()
         self._check_base_resp(d, "vision")
         try:
-            msg = d["choices"][0]["message"]
+            choice = d["choices"][0]
+            msg = choice["message"]
         except (KeyError, IndexError) as exc:
             raise MediaAIError(f"vision: bad response {str(d)[:200]}") from exc
         text = _strip_think(msg.get("content") or "")
@@ -285,7 +288,13 @@ class MediaAI:
         tokens_log.info("media vision model=%s prompt=%s compl=%s",
                         settings.minimax_vision_model,
                         usage.get("prompt_tokens"), usage.get("completion_tokens"))
-        return text or "(пустое описание)"
+        if not text:
+            # Пустота — сбой, а не описание: не даём ей попасть в кэш и sidecar.
+            raise MediaAIError(
+                f"vision: пустой ответ (finish={choice.get('finish_reason')}, "
+                f"compl={usage.get('completion_tokens')})"
+            )
+        return text
 
     async def describe_image_file(self, path: Path, prompt: str | None = None) -> str:
         mime = {

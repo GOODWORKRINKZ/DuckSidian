@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..media_refs import find_voice_marker, has_images_block, mentioned_media, resolve_in_vault
-from .deepseek import LLMClient, extract_usage
+from .deepseek import LLMClient, ModerationRejected, extract_usage, is_moderation_error
 from .tools import TOOL_SCHEMAS, ToolExecutor
 
 log = logging.getLogger(__name__)
@@ -64,6 +64,52 @@ WRITE_NUDGE = (
     "Пиши финальный ответ так, будто это твой первый ответ: не упоминай эту проверку, "
     "прошлый вариант ответа, «теперь по-настоящему», «в прошлом ходу» и т.п."
 )
+
+
+# Подставляется вместо результата инструмента, на котором провайдер LLM отказал
+# модерацией (поисковая выдача со спамом и т.п.) — иначе падает весь ход.
+MODERATION_HIDDEN = (
+    "[Результат скрыт ботом: провайдер LLM отклонил его модерацией — в нём, похоже, "
+    "спам или недопустимый контент (частое дело для web_search). Не повторяй этот запрос "
+    "дословно: переформулируй, возьми другой источник или ответь по тому, что уже знаешь.]"
+)
+# Сколько результатов инструментов (с конца) можно скрыть за один вызов модели.
+MODERATION_MAX_HIDDEN = 4
+
+
+def hide_last_tool_result(messages: list[dict[str, Any]]) -> str | None:
+    """Скрыть самый свежий ещё не скрытый результат инструмента (не трогая finish «OK»).
+    Возвращает имя инструмента или None, если скрывать нечего."""
+    for m in reversed(messages):
+        if m.get("role") != "tool" or m.get("content") in (MODERATION_HIDDEN, "OK"):
+            continue
+        m["content"] = MODERATION_HIDDEN
+        return str(m.get("name") or "?")
+    return None
+
+
+async def chat_surviving_moderation(client: Any, messages: list[dict[str, Any]],
+                                    tool_schemas: Any, step: int) -> dict:
+    """client.chat, но отказ модерации (400 data_inspection_failed у Qwen) не роняет ход:
+    скрываем свежие результаты инструментов по одному и повторяем. Если виноват сам
+    запрос пользователя/история — ModerationRejected с понятным текстом."""
+    hidden = 0
+    while True:
+        try:
+            return await client.chat(messages=messages, tools=tool_schemas)
+        except Exception as exc:  # noqa: BLE001
+            if not is_moderation_error(exc):
+                raise
+            name = hide_last_tool_result(messages) if hidden < MODERATION_MAX_HIDDEN else None
+            if name is None:
+                log.warning("agent step %d: LLM moderation rejected the request, nothing to hide", step)
+                raise ModerationRejected(
+                    "провайдер модели отклонил запрос модерацией (счёл содержимое недопустимым). "
+                    "Переформулируй или смени модель: /model"
+                ) from exc
+            hidden += 1
+            log.warning("agent step %d: LLM moderation rejected the request — hid tool result "
+                        "of %s (%d) and retrying", step, name, hidden)
 
 
 # finish(summary=«Ответ готов для озвучки» / «Прикольный ответ на подборку: …») — модель
@@ -356,7 +402,7 @@ async def run_agent(
             "tokens": run.tokens_prompt + run.tokens_completion,
             "tokens_cached": run.tokens_cached,
         })
-        resp = await client.chat(messages=messages, tools=tool_schemas)
+        resp = await chat_surviving_moderation(client, messages, tool_schemas, step)
         _p, _c, _ca = extract_usage(resp)
         run.tokens_prompt += _p
         run.tokens_completion += _c
@@ -498,7 +544,7 @@ async def run_agent(
                     "что уже собрано: кратко, по делу, на русском."
                 ),
             })
-            final = await client.chat(messages=messages, tools=None)
+            final = await chat_surviving_moderation(client, messages, None, max_steps)
             _p, _c, _ca = extract_usage(final)
             run.tokens_prompt += _p
             run.tokens_completion += _c

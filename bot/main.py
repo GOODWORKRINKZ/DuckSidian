@@ -72,7 +72,7 @@ async def _run_health_server() -> None:
 
 PRIVATE_COMMANDS = [
     ("help", "что я умею в личке"),
-    ("ws", "воркспейс (тема): /ws, /ws new <имя>, /ws list, /ws share <чат>"),
+    ("ws", "воркспейс (тема): /ws, /ws new <имя>, /ws list, /ws default, /ws share <чат>"),
     ("ask", "вопрос к моему личному vault"),
     ("note", "быстрая заметка без агента"),
     ("list", "мои артефакты"),

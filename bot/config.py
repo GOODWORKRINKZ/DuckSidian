@@ -185,6 +185,10 @@ class Settings(BaseSettings):
     minimax_asr_model: str = "asr-1.0"
     minimax_vision_model: str = "MiniMax-M3"
     minimax_vision_detail: str = "default"   # low | default | high
+    # M3 — рассуждающая модель: с thinking на фото чека/страницы она тратит весь
+    # бюджет на <think> и не доходит до ответа (finish=length, пустой content).
+    minimax_vision_thinking: bool = False
+    minimax_vision_max_tokens: int = 3000
     minimax_tts_model: str = "speech-2.8-hd"
     minimax_tts_voice: str = "Russian_ReliableMan"   # см. /voices — другие голоса
     minimax_tts_speed: float = 1.0

@@ -75,6 +75,23 @@ def writes_footer(writes: dict[str, str], limit: int = 8) -> str:
     return "✍️ Изменено: " + ", ".join(items) + more
 
 
+# Строки-футеры, которые пишет только код. Модель видит их в своих прошлых ответах
+# (история диалога) и начинает дописывать сама — отсюда дубли и «Изменено» без записи.
+_FOOTER_LINE_RE = re.compile(
+    r"^[ \t]*(?:✍️?[ \t]*Изменено:|⚠️?[ \t]*в vault ничего не записано)[^\n]*\n?",
+    re.MULTILINE,
+)
+
+
+def strip_footers(text: str) -> str:
+    """Убрать футеры «✍️ Изменено: …» / «⚠️ в vault ничего не записано» из текста модели
+    (настоящий футер код добавит сам по логу инструментов) и из истории диалога."""
+    if not text:
+        return text
+    out = _FOOTER_LINE_RE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", out).strip()
+
+
 def add_footer(answer: str, footer: str) -> str:
     """Добавить строку до блоков IMAGES:/VOICE: (их хвост бот отрезает перед отправкой)."""
     if not footer:
@@ -559,7 +576,7 @@ class Orchestrator:
         self._record_run(f"personal/{space.user_id}", run)
         if settings.git_autocommit:
             commit_and_push(f"personal {space.user_id}: turn")
-        answer = (run.summary or "").strip()
+        answer = strip_footers((run.summary or "").strip())
         if not answer:
             # Пустой finish (модель всё сказала в tool-call'ах) — иначе уйдёт один футер «Изменено».
             log.warning("personal: empty answer from agent — space=%s writes=%s tools=%s",
