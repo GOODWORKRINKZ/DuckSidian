@@ -1451,6 +1451,9 @@ class ToolExecutor:
             b64 = base64.b64encode(raw).decode()
             description = await self._ds.describe_image(b64, mime)
             result = f"[изображение {ext}, {size_kb} KB]\n{description}"
+            if description.startswith("("):
+                # «(vision error …)» и т.п. — не кэшируем, чтобы повтор пошёл в API.
+                return result
 
         elif ext in VIDEO_EXTENSIONS:
             # Видео — STT + keyframes
