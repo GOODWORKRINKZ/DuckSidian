@@ -78,6 +78,15 @@ def test_builtin_skills_include_workspace_setup_and_make_skill() -> None:
     assert "skills/<name>.md" in sk["make-skill"].body
 
 
+def test_last_reply_beats_stale_pinned_status() -> None:
+    # Регресс: статус «следующий индекс: 二» отстал на ход, бот показал 一, а ответ «yi один»
+    # проверил по 二 — закреплённый блок перевешивал последнюю реплику в истории.
+    from bot.agent.prompts import PERSONAL_SYSTEM
+    assert "источник\n  правды" not in PERSONAL_SYSTEM
+    assert "ПОСЛЕДНЮЮ реплику в истории" in PERSONAL_SYSTEM
+    assert "верна реплика" in PERSONAL_SYSTEM
+
+
 @pytest.fixture
 def vault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "vault_path", tmp_path)
